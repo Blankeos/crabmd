@@ -13,10 +13,12 @@ If `path.md` does not exist, crabmd creates an empty markdown file and opens it.
 ## What it is
 
 - A GPUI app (Rust, no browser shell)
-- Block document: unfocused blocks stay rendered GFM
-- Helix / Vim: the focused block is always a raw-GFM textarea. Normal uses a block caret; Insert (and Notion) use a thin caret
-- Notion: WYSIWYG — every block stays rendered; you edit visible text, GFM is written on commit
+- Block document: you type in the rendered page (WYSIWYG). GFM is only on disk.
+- Helix / Vim: modal keys walk the **visible** text. Normal uses a block caret; Insert uses a thin caret
+- Notion: always-on insert. `# ` / `- ` / `**bold**` convert; syntax stays hidden
 - Slash menu: type `/` at the start of a block to insert GFM
+- Bubble toolbar on selection: bold / italic / strike / code / link
+- Tables are a cell grid (Tab between cells, slash inserts 3×3)
 - GitHub Flavored Markdown, including GitHub alerts (`> [!NOTE]` and friends)
 - OpenCode-compatible themes as JSON (default: `opencode`)
 - Drop or paste images next to the markdown file
@@ -58,12 +60,11 @@ Settings → Editor, or `editor =` in `~/.config/crabmd/config.toml`
 (`keymap =` is still read for older files). Status bar: `NOR` / `INS` /
 `SEL` (Helix) / `VIS` / `V-LINE` (Vim) / `NOTION`.
 
-Helix/Vim treat the file as **one markdown buffer** (`source`). Motions,
-visual, join, replace, backspace, and search run on that string. Paint is
-secondary: ranges that touch the caret or selection render as a raw GFM
-**Editor**; everything else is wrapped preview. Normal uses a **block caret**;
-Insert and Notion use a thin caret. Insertable keys in Normal are swallowed
-unless bound.
+Helix/Vim still treat the file as one buffer, but motions, visual, search,
+join, and replace run on the **visible** projection (no `# ` / `**` under the
+caret). GFM is rewritten on disk. Normal uses a **block caret**; Insert and
+Notion use a thin caret. Insertable keys in Normal are swallowed unless bound.
+There is no raw textarea — focused and unfocused blocks share the same paint.
 
 `h`/`l` stay on the current **logical line** (no whichwrap). `w` / `b` / `e` /
 `W` / `B` / `E` / `j` / `k` / `gg` / `G` walk the file. `j`/`k` count wrapped

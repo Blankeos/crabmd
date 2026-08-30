@@ -1,47 +1,44 @@
-//! One markdown buffer. Paint ranges are a reaction to `source`.
-//!
-//! Unfocused ranges render as GFM. The contiguous span that intersects the
-//! caret or selection is one raw Editor. Motions, search, join, replace,
-//! backspace, and undo operate on `source` + caret/sel only.
+//! One markdown buffer. GFM `source` is truth; paint and the caret walk a
+//! visible projection. No textarea — WYSIWYG overlay on every block.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    actions, div, img, point, prelude::FluentBuilder as _, px, rems, rgb, AnyElement, App,
-    AppContext as _, ClipboardEntry, Context, Entity, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
-    Subscription, Window,
+    actions, div, img, point, prelude::FluentBuilder as _, px, rgb, AnyElement, App,
+    AppContext as _, ClipboardEntry, Context, Entity, EntityInputHandler,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
+    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled, UTF16Selection, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Editor, EditorState, InputEvent},
     menu::{DropdownMenu as _, PopupMenuItem},
     radio::Radio,
     switch::Switch,
-    text::{TextView, TextViewStyle},
     v_flex, Icon, Sizable as _, Theme, ThemeMode, ThemeTokens,
 };
 
 use crate::config::{self, Config, EditorKind, FONT_FAMILIES, FONT_SIZES};
-use crate::coords::backspace_join_doc;
-use crate::document::{
-    alert_icon_name, extract_links, has_task_line, parse_ranges, raw_span, slash_query_at,
-    sole_image, split_task_line, splice, toggle_task_line, Block, BlockKind, PaintRange,
+use crate::display::{
+    project, wrap_cols_for, Affinity, BlockExtra, CODE_LANGS, COLUMN_PX, Projection,
 };
+use crate::document::{
+    alert_icon_name, extract_links, parse_ranges, splice, toggle_task_line, BlockKind, PaintRange,
+};
+use crate::surface::{self, Hit};
+use crate::wysiwyg::{self, Mark};
 use crate::images;
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
     after_caret, apply_motion, block_caret_range, delete_char_at, delete_range, extend_visual_line,
-    find_char, first_non_blank_in, heading_jump, join_next_lines, join_range, last_line_start,
+    find_char, first_non_blank_in, join_next_lines, join_range, last_line_start,
     line_start_n, logical_line_delete_range, logical_line_range, open_line_above, open_line_below,
     paragraph_jump, push_count, replace_chars, replace_selection, search_next, search_prev,
-    take_count, visual_line_range, visual_rows, FindKind, Motion,
+    take_count, visual_line_range, FindKind, Motion,
 };
-use crate::notion;
 use crate::slash::{self, SlashItem};
 use crate::theme::{self, Appearance, Palette};
 use crate::undo::{Snapshot, UndoStack};
@@ -111,6 +108,15 @@ actions!(
         ReverseFind,
         BracketOpen,
         BracketClose,
+        InsertNewline,
+        InsertHardBreak,
+        IndentTab,
+        OutdentTab,
+        ToggleBold,
+        ToggleItalic,
+        ToggleStrike,
+        ToggleCode,
+        ToggleLink,
     ]
 );
 
@@ -186,6 +192,21 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(",", ReverseFind, Some("Normal")),
         KeyBinding::new("[", BracketOpen, Some("Normal")),
         KeyBinding::new("]", BracketClose, Some("Normal")),
+        KeyBinding::new("enter", InsertNewline, Some("Workspace")),
+        KeyBinding::new("shift-enter", InsertHardBreak, Some("Workspace")),
+        KeyBinding::new("tab", IndentTab, Some("Workspace")),
+        KeyBinding::new("shift-tab", OutdentTab, Some("Workspace")),
+        KeyBinding::new("cmd-b", ToggleBold, Some("Workspace")),
+        KeyBinding::new("ctrl-b", ToggleBold, Some("Workspace")),
+        KeyBinding::new("cmd-i", ToggleItalic, Some("Workspace")),
+        KeyBinding::new("ctrl-i", ToggleItalic, Some("Workspace")),
+        KeyBinding::new("cmd-e", ToggleCode, Some("Workspace")),
+        KeyBinding::new("ctrl-e", ToggleCode, Some("Workspace")),
+        KeyBinding::new("cmd-shift-s", ToggleStrike, Some("Workspace")),
+        KeyBinding::new("cmd-k", ToggleLink, Some("Workspace")),
+        KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
+        KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
+        KeyBinding::new("shift-backspace", BlockBackspace, Some("Workspace")),
     ]);
 }
 
@@ -209,16 +230,19 @@ pub struct Workspace {
     visual_anchor: Option<usize>,
     slash_index: usize,
     last_slash_query: String,
-    textarea: Entity<EditorState>,
     focus: FocusHandle,
     palette: Palette,
     dirty: bool,
     status: SharedString,
-    _subscriptions: Vec<Subscription>,
     command: Option<String>,
     search: Option<(String, bool)>,
     last_search: Option<(String, bool)>,
-    raw: Range<usize>,
+    affinity: Affinity,
+    marked: Option<Range<usize>>,
+    sticky: crate::display::Marks,
+    link_open: bool,
+    link_draft: String,
+    hits: Vec<Hit>,
     pending_replace: Option<usize>,
     pending_find: Option<(FindKind, usize)>,
     last_find: Option<(FindKind, char)>,
@@ -247,30 +271,6 @@ impl Workspace {
         apply_palette(&palette, cx);
 
         let empty_doc = source.trim().is_empty();
-        let wrap = config.wrap_motions;
-        let textarea = cx.new(|cx| {
-            EditorState::new(window, cx)
-                .language("markdown")
-                .line_number(false)
-                .folding(false)
-                .searchable(false)
-                .soft_wrap(wrap)
-                .submit_on_enter(true)
-                .placeholder("Write, or type / for blocks")
-        });
-
-        let _subscriptions = vec![cx.subscribe_in(
-            &textarea,
-            window,
-            |this: &mut Self, input, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.on_input_change(input, window, cx),
-                InputEvent::PressEnter { shift, .. } if !shift => {
-                    this.on_press_enter(window, cx);
-                }
-                _ => {}
-            },
-        )];
-
         let mut this = Self {
             path,
             source,
@@ -283,16 +283,19 @@ impl Workspace {
             visual_anchor: None,
             slash_index: 0,
             last_slash_query: String::new(),
-            textarea,
             focus: cx.focus_handle(),
             palette,
             dirty: false,
             status: "ready".into(),
-            _subscriptions,
             command: None,
             search: None,
             last_search: None,
-            raw: 0..0,
+            affinity: Affinity::Inside,
+            marked: None,
+            sticky: crate::display::Marks::default(),
+            link_open: false,
+            link_draft: String::new(),
+            hits: Vec::new(),
             pending_replace: None,
             pending_find: None,
             last_find: None,
@@ -354,11 +357,11 @@ impl Workspace {
     }
 
     fn wrap_cols(&self) -> Option<usize> {
-        if self.config.wrap_motions {
-            Some(80)
-        } else {
-            None
-        }
+        wrap_cols_for(self.config.font_size, self.config.wrap_motions)
+    }
+
+    fn proj(&self) -> Projection {
+        project(&self.source)
     }
 
     fn font_px(&self) -> gpui::Pixels {
@@ -370,12 +373,7 @@ impl Workspace {
     }
 
     fn compute_raw(&self) -> Range<usize> {
-        raw_span(
-            &self.paint_ranges(),
-            self.source.len(),
-            self.caret,
-            self.sel.clone(),
-        )
+        0..0
     }
 
     fn clamp_caret(&mut self) {
@@ -399,41 +397,17 @@ impl Workspace {
         self.undo.push(self.snapshot());
     }
 
-    fn notion_range(&self) -> Option<PaintRange> {
-        if !self.is_notion() {
-            return None;
-        }
-        let ranges = self.paint_ranges();
-        let raw = raw_span(&ranges, self.source.len(), self.caret, self.sel.clone());
-        let hits: Vec<_> = ranges
-            .into_iter()
-            .filter(|r| r.range.start >= raw.start && r.range.end <= raw.end && !r.range.is_empty() || r.range == raw)
-            .collect();
-        if hits.len() == 1 && !notion::uses_raw_exception(hits[0].kind) {
-            Some(hits[0].clone())
-        } else {
-            None
-        }
-    }
-
-    fn display_for_raw(&self) -> String {
-        if let Some(range) = self.notion_range() {
-            let block = Block::with_kind(range.kind, range.slice(&self.source));
-            return notion::edit_text(&block);
-        }
-        let start = self.raw.start.min(self.source.len());
-        let end = self.raw.end.min(self.source.len()).max(start);
-        self.source[start..end].to_string()
-    }
-
     fn refresh_raw(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh(window, cx);
+    }
+
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clamp_caret();
         if self.mode.extends_selection() {
             self.snap_visual_sel();
         }
-        self.raw = self.compute_raw();
-        self.load_textarea(window, cx);
         self.scroll_caret_into_view();
+        self.focus.focus(window, cx);
         cx.notify();
     }
 
@@ -441,75 +415,27 @@ impl Workspace {
         let Some(anchor) = self.visual_anchor else {
             return;
         };
+        let p = self.proj();
+        let da = p.to_display(anchor);
+        let dc = p.to_display(self.caret);
         if self.mode == Mode::VisualLine {
-            let a = anchor.min(self.caret);
-            let b = anchor.max(self.caret);
-            let start = logical_line_range(&self.source, a).start;
-            let mut end = logical_line_range(&self.source, b).end;
-            if end < self.source.len() && self.source.as_bytes()[end] == b'\n' {
+            let a = da.min(dc);
+            let b = da.max(dc);
+            let start = logical_line_range(&p.display, a).start;
+            let mut end = logical_line_range(&p.display, b).end;
+            if end < p.display.len() && p.display.as_bytes()[end] == b'\n' {
                 end += 1;
             }
-            self.sel = Some(start..end);
+            let s = p.display_range_to_source(start..end, Affinity::Inside);
+            self.sel = Some(s);
         } else {
-            let a = anchor.min(self.caret);
-            let b = anchor.max(self.caret);
-            self.sel = if a == b { None } else { Some(a..b) };
-        }
-    }
-
-    fn load_textarea(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.loading = true;
-        let source = self.display_for_raw();
-        let wrap = self.config.wrap_motions;
-        let block_caret = self.uses_block_caret();
-        let origin = self.raw.start;
-        let local = self.caret.saturating_sub(origin).min(source.len());
-        let sel_local = self.sel.as_ref().map(|s| {
-            s.start.saturating_sub(origin).min(source.len())
-                ..s.end.saturating_sub(origin).min(source.len())
-        });
-        self.textarea.update(cx, |state, cx| {
-            state.set_soft_wrap(wrap, window, cx);
-            state.set_value(source.clone(), window, cx);
-            let len = state.value().len();
-            let range = if let Some(sel) = sel_local {
-                sel.start.min(len)..sel.end.min(len)
-            } else if block_caret {
-                block_caret_range(&source, local.min(len))
+            let a = da.min(dc);
+            let b = da.max(dc);
+            if a == b {
+                self.sel = None;
             } else {
-                let pos = local.min(len);
-                pos..pos
-            };
-            state.set_selected_range(range, cx);
-            state.focus(window, cx);
-        });
-        self.loading = false;
-    }
-
-    fn sync_from_textarea(&mut self, cx: &App) {
-        if self.loading {
-            return;
-        }
-        let value = self.textarea.read(cx).value().to_string();
-        let local = self.textarea.read(cx).selected_range();
-        if let Some(range) = self.notion_range() {
-            let block = Block::with_kind(range.kind, range.slice(&self.source));
-            let gfm = notion::commit(&block, &value);
-            let start = range.range.start;
-            self.source = splice(&self.source, range.range.clone(), &gfm);
-            self.raw = start..start + gfm.len();
-            self.caret = (start + local.start).min(self.source.len());
-            return;
-        }
-        let start = self.raw.start.min(self.source.len());
-        let end = self.raw.end.min(self.source.len()).max(start);
-        self.source = splice(&self.source, start..end, &value);
-        self.raw = start..start + value.len();
-        self.caret = (start + local.start).min(self.source.len());
-        if local.start != local.end {
-            self.sel = Some(start + local.start..start + local.end);
-        } else if !self.mode.extends_selection() {
-            self.sel = None;
+                self.sel = Some(p.display_range_to_source(a..b, Affinity::Inside));
+            }
         }
     }
 
@@ -570,14 +496,6 @@ impl Workspace {
         self.config.editor.is_modal() && !self.mode.is_insert() && !self.mode.is_visual()
     }
 
-    fn textarea_source(&self, cx: &App) -> String {
-        self.textarea.read(cx).value().to_string()
-    }
-
-    fn caret_offset_local(&self, cx: &App) -> usize {
-        self.textarea.read(cx).selected_range().start
-    }
-
     fn finish_insert_undo(&mut self) {
         let Some(origin) = self.insert_origin.take() else {
             return;
@@ -617,64 +535,113 @@ impl Workspace {
         self.pending_bracket = None;
     }
 
-    fn on_input_change(
-        &mut self,
-        _input: &Entity<EditorState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.loading {
-            return;
-        }
-        if self.config.editor.is_modal() && !self.mode.is_insert() {
-            self.sync_editor_sel(cx);
-            return;
-        }
-        self.sync_from_textarea(cx);
-        let q = slash_query_at(&self.source, self.caret)
-            .unwrap_or("")
-            .to_string();
-        if q != self.last_slash_query {
-            self.last_slash_query = q;
-            self.slash_index = 0;
-        }
-        self.dirty = true;
-        self.status = "unsaved".into();
-        self.sync_title(window);
-        cx.notify();
-    }
-
-    fn sync_editor_sel(&mut self, cx: &App) {
-        let local = self.textarea.read(cx).selected_range();
-        let start = self.raw.start + local.start;
-        let end = self.raw.start + local.end;
-        self.caret = end.min(self.source.len());
-        if local.start != local.end {
-            self.sel = Some(start.min(self.source.len())..end.min(self.source.len()));
-        }
-    }
-
     fn on_press_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_newline(false, window, cx);
+    }
+
+    fn insert_newline(&mut self, hard: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.config.editor.is_modal() && !self.mode.is_insert() {
+            return;
+        }
+        if self.link_open {
+            self.commit_link(window, cx);
             return;
         }
         if let Some(item) = self.current_slash_pick() {
             self.apply_slash(item, window, cx);
             return;
         }
-        self.textarea.update(cx, |state, cx| {
-            state.insert("\n", window, cx);
-        });
+        self.push_doc_undo();
+        let (next, caret) = wysiwyg::enter(&self.source, self.caret, self.affinity, hard);
+        self.source = next;
+        self.caret = caret.min(self.source.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
+    pub fn click_display(&mut self, d: usize, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.proj();
+        let src = p.to_source(d, Affinity::Inside);
+        if shift {
+            if self.visual_anchor.is_none() {
+                self.visual_anchor = Some(self.caret);
+            }
+            self.caret = src;
+            self.mode = if self.config.editor == EditorKind::Helix {
+                Mode::Select
+            } else if self.config.editor.is_modal() {
+                Mode::Visual
+            } else {
+                self.mode
+            };
+            self.snap_visual_sel();
+        } else {
+            self.caret = src;
+            self.mouse_anchor = Some(src);
+            self.affinity = Affinity::Inside;
+            if !self.mode.is_insert() && self.config.editor.is_modal() {
+                self.mode = Mode::Normal;
+                self.sel = None;
+                self.visual_anchor = None;
+            } else {
+                self.sel = None;
+            }
+        }
+        self.mouse_dragging = true;
+        self.refresh(window, cx);
+    }
+
+    pub fn drag_display(&mut self, d: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.mouse_dragging {
+            return;
+        }
+        let p = self.proj();
+        let src = p.to_source(d, Affinity::Inside);
+        let anchor = self.mouse_anchor.unwrap_or(self.caret);
+        self.visual_anchor = Some(anchor);
+        self.caret = src;
+        if self.config.editor.is_modal() && !self.mode.is_insert() {
+            self.mode = if self.config.editor == EditorKind::Helix {
+                Mode::Select
+            } else {
+                Mode::Visual
+            };
+        }
+        self.snap_visual_sel();
+        self.refresh(window, cx);
+    }
+
+    fn commit_edit(&mut self, source: String, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.source = source;
+        self.caret = caret.min(self.source.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
+    fn slash_query(&self) -> Option<String> {
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let block = p.block_at_display(d)?;
+        let body = &p.display[block.display.clone()];
+        let local = d.saturating_sub(block.display.start).min(body.len());
+        let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        crate::document::slash_query(&body[line_start..local]).map(|s| s.to_string())
     }
 
     fn slash_items(&self) -> Vec<&'static SlashItem> {
-        let q = slash_query_at(&self.source, self.caret).unwrap_or("");
-        slash::filter(q)
+        let q = self.slash_query().unwrap_or_default();
+        slash::filter(&q)
     }
 
     fn slash_is_open(&self) -> bool {
-        self.mode.is_insert()
-            && slash_query_at(&self.source, self.caret).is_some()
+        (self.mode.is_insert() || self.is_notion())
+            && self.slash_query().is_some()
             && !self.slash_items().is_empty()
     }
 
@@ -715,7 +682,6 @@ impl Workspace {
 
     fn leave_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_notion() {
-            self.sync_from_textarea(cx);
             self.scroll_caret_into_view();
             cx.notify();
             return;
@@ -724,19 +690,18 @@ impl Workspace {
             self.mode = Mode::Normal;
             self.sel = None;
             self.visual_anchor = None;
-            self.refresh_raw(window, cx);
+            self.refresh(window, cx);
             return;
         }
         if !self.mode.is_insert() {
             return;
         }
-        self.sync_from_textarea(cx);
         self.finish_insert_undo();
         self.mode = Mode::Normal;
         self.clear_pending();
         self.visual_anchor = None;
         self.sel = None;
-        self.refresh_raw(window, cx);
+        self.refresh(window, cx);
     }
 
     fn enter_insert(&mut self, caret: Caret, window: &mut Window, cx: &mut Context<Self>) {
@@ -748,17 +713,11 @@ impl Workspace {
         self.visual_anchor = None;
         self.clear_pending();
         match caret {
-            Caret::Start => self.caret = self.raw.start,
-            Caret::End => self.caret = self.raw.end.min(self.source.len()),
-            Caret::Offset(n) => {
-                if n <= self.source.len() {
-                    self.caret = n;
-                } else {
-                    self.caret = (self.raw.start + n).min(self.source.len());
-                }
-            }
+            Caret::Start => self.caret = 0,
+            Caret::End => self.caret = self.source.len(),
+            Caret::Offset(n) => self.caret = n.min(self.source.len()),
         }
-        self.refresh_raw(window, cx);
+        self.refresh(window, cx);
     }
 
     fn apply_buffer_motion(
@@ -767,22 +726,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_notion() && matches!(motion, Motion::Down | Motion::Up) {
-            self.pending_count = None;
-            let next = apply_motion(&self.source, self.caret, motion, 1, None);
-            self.land(next, window, cx);
-            return;
-        }
-        if !self.is_modal_nav() {
+        if !self.is_modal_nav() && !(self.is_notion() && matches!(motion, Motion::Down | Motion::Up)) {
             cx.propagate();
             return;
         }
         window.prevent_default();
         let count = take_count(&mut self.pending_count);
         self.pending_g = false;
+        let p = self.proj();
+        let d = p.to_display(self.caret);
         let wrap = self.wrap_cols();
-        let next = apply_motion(&self.source, self.caret, motion, count, wrap);
-        self.land(next, window, cx);
+        let next_d = apply_motion(&p.display, d, motion, count, wrap);
+        if motion == Motion::Right {
+            let at_mark_end = p.marks_at(d, Affinity::Inside).any()
+                && !p.marks_at(next_d, Affinity::Inside).any();
+            self.affinity = if at_mark_end {
+                Affinity::Outside
+            } else {
+                Affinity::Inside
+            };
+        } else {
+            self.affinity = Affinity::Inside;
+        }
+        self.caret = p.to_source(next_d, self.affinity);
+        self.land(self.caret, window, cx);
         self.pending_d = false;
     }
 
@@ -894,7 +861,12 @@ impl Workspace {
             return;
         }
         window.prevent_default();
-        let off = after_caret(&self.source, self.caret);
+        let off = {
+            let p = self.proj();
+            let d = p.to_display(self.caret);
+            let d2 = after_caret(&p.display, d);
+            p.to_source(d2, Affinity::Inside)
+        };
         self.enter_insert(Caret::Offset(off), window, cx);
     }
 
@@ -902,8 +874,11 @@ impl Workspace {
         if !self.is_modal_nav() {
             return;
         }
-        let range = logical_line_range(&self.source, self.caret);
-        let off = first_non_blank_in(&self.source, range);
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let range = logical_line_range(&p.display, d);
+        let off = first_non_blank_in(&p.display, range);
+        let off = p.to_source(off, Affinity::Inside);
         self.enter_insert(Caret::Offset(off), window, cx);
     }
 
@@ -911,8 +886,11 @@ impl Workspace {
         if !self.is_modal_nav() {
             return;
         }
-        let end = logical_line_range(&self.source, self.caret).end;
-        self.enter_insert(Caret::Offset(end), window, cx);
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let end = logical_line_range(&p.display, d).end;
+        let off = p.to_source(end, Affinity::Inside);
+        self.enter_insert(Caret::Offset(off), window, cx);
     }
 
     fn open_line(&mut self, above: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1262,18 +1240,30 @@ impl Workspace {
             cx.propagate();
             return;
         }
-        let range = self.textarea.read(cx).selected_range();
-        if range.start != range.end {
-            cx.propagate();
+        window.prevent_default();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            self.push_doc_undo();
+            let p = self.proj();
+            let d0 = p.to_display(sel.start);
+            let d1 = p.to_display(sel.end);
+            let (next, caret) = wysiwyg::delete_display_range(&self.source, d0..d1);
+            self.commit_edit(next, caret, window, cx);
             return;
         }
-        self.sync_from_textarea(cx);
-        if let Some((next, caret)) = backspace_join_doc(&self.source, self.caret) {
-            window.prevent_default();
-            self.apply_source(next, caret, window, cx);
+        if let Some((next, caret)) = wysiwyg::backspace(&self.source, self.caret, self.affinity) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
             return;
         }
-        cx.propagate();
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        if d == 0 {
+            return;
+        }
+        self.push_doc_undo();
+        let prev = p.display[..d].chars().next_back().map(|c| d - c.len_utf8()).unwrap_or(0);
+        let (next, caret) = wysiwyg::delete_display_range(&self.source, prev..d);
+        self.commit_edit(next, caret, window, cx);
     }
 
     fn on_open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -1296,12 +1286,12 @@ impl Workspace {
     }
     fn cancel_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search = None;
-        self.textarea.focus_handle(cx).focus(window, cx);
+        self.focus.focus(window, cx);
         cx.notify();
     }
     fn submit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((query, backward)) = self.search.take() else { return };
-        self.textarea.focus_handle(cx).focus(window, cx);
+        self.focus.focus(window, cx);
         let q = if query.is_empty() {
             match &self.last_search {
                 Some((prev, _)) => prev.clone(),
@@ -1325,20 +1315,21 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some((query, _)) = self.last_search.clone() else { return };
-        let from = self.caret;
+        let p = self.proj();
+        let from = p.to_display(self.caret);
         let found = if forward {
-            let start = if from < self.source.len() { from + 1 } else { 0 };
-            search_next(&self.source, start, &query, wrap)
-                .or_else(|| search_next(&self.source, 0, &query, false))
+            let start = if from < p.display.len() { from + 1 } else { 0 };
+            search_next(&p.display, start, &query, wrap)
+                .or_else(|| search_next(&p.display, 0, &query, false))
         } else {
-            search_prev(&self.source, from, &query, wrap)
+            search_prev(&p.display, from, &query, wrap)
         };
         if let Some(range) = found {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
             self.sel = None;
-            self.caret = range.start;
-            self.refresh_raw(window, cx);
+            self.caret = p.to_source(range.start, Affinity::Inside);
+            self.refresh(window, cx);
         } else {
             self.status = format!("no match: {query}").into();
         }
@@ -1496,15 +1487,44 @@ impl Workspace {
     fn commit_bracket(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dir) = self.pending_bracket.take() else { return };
         let count = take_count(&mut self.pending_count);
-        let next = match key {
-            "p" => paragraph_jump(&self.source, self.caret, dir, count),
-            "h" => heading_jump(&self.source, self.caret, dir, count),
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let next_d = match key {
+            "p" => {
+                let src_next = paragraph_jump(&p.display, d, dir, count);
+                src_next
+            }
+            "h" => {
+                let mut ix = p
+                    .blocks
+                    .iter()
+                    .position(|b| d >= b.display.start && d <= b.display.end)
+                    .unwrap_or(0);
+                let mut left = count.max(1);
+                if dir >= 0 {
+                    while left > 0 && ix + 1 < p.blocks.len() {
+                        ix += 1;
+                        if matches!(p.blocks[ix].kind, BlockKind::Heading(_)) {
+                            left -= 1;
+                        }
+                    }
+                } else {
+                    while left > 0 && ix > 0 {
+                        ix -= 1;
+                        if matches!(p.blocks[ix].kind, BlockKind::Heading(_)) {
+                            left -= 1;
+                        }
+                    }
+                }
+                p.blocks.get(ix).map(|b| b.display.start).unwrap_or(d)
+            }
             _ => {
                 self.pending_count = None;
                 cx.notify();
                 return;
             }
         };
+        let next = p.to_source(next_d, Affinity::Inside);
         self.land(next, window, cx);
     }
 
@@ -1524,7 +1544,7 @@ impl Workspace {
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if !self.settings_open {
-            self.textarea.focus_handle(cx).focus(window, cx);
+            self.focus.focus(window, cx);
         }
         cx.notify();
     }
@@ -1539,12 +1559,9 @@ impl Workspace {
         }
         cx.notify();
     }
-    fn set_wrap_motions(&mut self, wrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_wrap_motions(&mut self, wrap: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.config.wrap_motions = wrap;
         self.persist_config(cx);
-        self.textarea.update(cx, |state, cx| {
-            state.set_soft_wrap(wrap, window, cx);
-        });
         cx.notify();
     }
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
@@ -1554,7 +1571,6 @@ impl Workspace {
         self.sync_title(window);
     }
     fn write_to_disk(&mut self, cx: &mut Context<Self>) -> bool {
-        self.sync_from_textarea(cx);
         let ok = match std::fs::write(&self.path, self.source.as_bytes()) {
             Ok(()) => {
                 self.dirty = false;
@@ -1581,12 +1597,12 @@ impl Workspace {
     }
     fn cancel_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command = None;
-        self.textarea.focus_handle(cx).focus(window, cx);
+        self.focus.focus(window, cx);
         cx.notify();
     }
     fn submit_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(input) = self.command.take() else { return };
-        self.textarea.focus_handle(cx).focus(window, cx);
+        self.focus.focus(window, cx);
         match mode::parse_ex(&input) {
             ExCommand::Cancel => {}
             ExCommand::Write => {
@@ -1659,28 +1675,18 @@ impl Workspace {
             .and_then(|s| s.to_str())
             .unwrap_or("image");
         let line = images::gfm_image(alt, filename);
-        if self.mode.is_insert() || self.is_notion() {
-            self.textarea.update(cx, |state, cx| {
-                let current = state.value().to_string();
-                if !current.is_empty() && !current.ends_with('\n') {
-                    state.insert("\n", window, cx);
-                }
-                state.insert(&line, window, cx);
-            });
+        self.push_doc_undo();
+        let at = self.caret.min(self.source.len());
+        let insert = if at > 0 && !self.source[..at].ends_with('\n') {
+            format!("\n{line}\n")
         } else {
-            self.push_doc_undo();
-            let at = self.caret.min(self.source.len());
-            let insert = if at > 0 && !self.source[..at].ends_with('\n') {
-                format!("\n{line}\n")
-            } else {
-                format!("{line}\n")
-            };
-            self.source = splice(&self.source, at..at, &insert);
-            self.caret = at + insert.len();
-            self.dirty = true;
-            self.status = "unsaved".into();
-            self.refresh_raw(window, cx);
-        }
+            format!("{line}\n")
+        };
+        self.source = splice(&self.source, at..at, &insert);
+        self.caret = at + insert.len();
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
         cx.notify();
     }
 
@@ -1729,6 +1735,36 @@ impl Workspace {
     ) -> bool {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
+
+        if self.link_open {
+            window.prevent_default();
+            match key {
+                "escape" => {
+                    self.link_open = false;
+                    self.link_draft.clear();
+                    cx.notify();
+                }
+                "enter" => self.commit_link(window, cx),
+                "backspace" => {
+                    self.link_draft.pop();
+                    cx.notify();
+                }
+                "space" => {
+                    self.link_draft.push(' ');
+                    cx.notify();
+                }
+                k if k.chars().count() == 1 && !mods.control && !mods.platform => {
+                    if let Some(ch) = k.chars().next() {
+                        if !ch.is_control() {
+                            self.link_draft.push(ch);
+                            cx.notify();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
 
         if self.pending_replace.is_some() && self.is_modal_nav() {
             window.prevent_default();
@@ -1874,26 +1910,6 @@ impl Workspace {
             }
         }
         false
-    }
-
-    fn text_view_style(&self) -> TextViewStyle {
-        let mut style = TextViewStyle::default()
-            .paragraph_gap(rems(0.2))
-            .heading_font_size(|level, base| match level {
-                1 => base * 2.05,
-                2 => base * 1.6,
-                3 => base * 1.3,
-                4 => base * 1.12,
-                _ => base,
-            })
-            .inline_code(HighlightStyle {
-                color: Some(self.palette.markdown_code),
-                background_color: Some(self.palette.background_element),
-                ..Default::default()
-            });
-        style.heading_base_font_size = px(16.);
-        style.is_dark = self.palette.appearance == Appearance::Dark;
-        style
     }
 
     fn render_slash_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2289,7 +2305,7 @@ impl Workspace {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
                     this.settings_open = false;
-                    this.textarea.focus_handle(cx).focus(window, cx);
+                    this.focus.focus(window, cx);
                     cx.notify();
                 }),
             )
@@ -2352,187 +2368,103 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn raw_editor_height(&self, cx: &App) -> gpui::Pixels {
-        let value = self.textarea.read(cx).value().to_string();
-        let n = visual_rows(&value, self.wrap_cols()).len().max(1);
-        let line = self.config.font_size.clamp(13, 20) as f32 * 1.5;
-        px(line * n as f32)
-    }
-
-    fn render_textarea(&self, kind: BlockKind, readonly: bool, cx: &App) -> AnyElement {
-        let p = &self.palette;
-        let family = self.config.font_family.clone();
-        let size = self.font_px();
-        let height = self.raw_editor_height(cx);
-        Editor::new(&self.textarea)
-            .appearance(false)
-            .bordered(false)
-            .readonly(readonly)
-            .w_full()
-            .min_w_0()
-            .max_w_full()
-            .h(height)
-            .overflow_hidden()
-            .font_family(family)
-            .text_size(size)
-            .when(self.is_notion() && matches!(kind, BlockKind::Heading(_)), |el| {
-                el.font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.markdown_heading)
-            })
-            .into_any_element()
-    }
-
-    fn focused_kind(&self) -> BlockKind {
-        self.notion_range()
-            .map(|r| r.kind)
-            .or_else(|| {
-                self.paint_ranges()
-                    .into_iter()
-                    .find(|r| r.range.start == self.raw.start)
-                    .map(|r| r.kind)
-            })
-            .unwrap_or(BlockKind::Paragraph)
-    }
-
-    fn render_focused(&self, cx: &mut Context<Self>) -> AnyElement {
-        let kind = self.focused_kind();
-        let readonly = self.config.editor.is_modal() && !self.mode.is_insert();
-        if self.is_notion() && !notion::uses_raw_exception(kind) {
-            return self.render_notion_focused(kind, cx);
-        }
-        let source_slice = if self.raw.end <= self.source.len() {
-            &self.source[self.raw.start.min(self.source.len())..self.raw.end.min(self.source.len())]
+    fn render_edit(
+        &mut self,
+        display: std::ops::Range<usize>,
+        text: &str,
+        heading: bool,
+        placeholder: Option<&str>,
+        wrap: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
+        let d_caret = p.to_display(self.caret);
+        let d_sel = self.sel.as_ref().map(|s| {
+            p.to_display(s.start.min(s.end))..p.to_display(s.end.max(s.start))
+        });
+        let d_marked = self.marked.clone();
+        let local_caret = if d_caret >= display.start && d_caret <= display.end {
+            Some(d_caret - display.start)
         } else {
-            ""
+            None
         };
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .max_w_full()
-            .child(self.render_textarea(kind, readonly, cx))
-            .when(slash_query_at(&self.source, self.caret).is_some(), |el| {
-                el.child(self.render_slash_menu(cx))
-            })
-            .child(self.render_link_chips(source_slice, cx))
-            .into_any_element()
+        let local_sel = surface::clip_range(d_sel, display.clone());
+        let local_marked = surface::clip_range(d_marked, display.clone());
+        let runs = surface::mark_runs(&p, display.clone());
+        let hs = surface::highlights(
+            text.len(),
+            &runs,
+            local_sel,
+            local_marked,
+            &pal,
+            heading,
+        );
+        let ime = local_caret.is_some() && (self.mode.is_insert() || self.is_notion());
+        let block_caret = self.uses_block_caret();
+        let view = cx.entity();
+        let focus = self.focus.clone();
+        surface::edit_text(
+            view.clone(),
+            focus,
+            &mut self.hits,
+            display.start,
+            text.to_string(),
+            hs,
+            local_caret,
+            block_caret,
+            wrap,
+            ime,
+            &pal,
+            placeholder,
+            {
+                let view = view.clone();
+                move |d, shift, window, cx| {
+                    view.update(cx, |this, cx| this.click_display(d, shift, window, cx));
+                }
+            },
+            {
+                let view = view.clone();
+                move |d, window, cx| {
+                    view.update(cx, |this, cx| this.drag_display(d, window, cx));
+                }
+            },
+        )
     }
 
-    fn render_notion_focused(&self, kind: BlockKind, cx: &mut Context<Self>) -> AnyElement {
-        let p = &self.palette;
-        let ta = self.render_textarea(kind, false, cx);
-        match kind {
-            BlockKind::Alert(akind) => {
-                let color = p.alert_color(akind);
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .rounded(px(6.))
-                    .border_l_4()
-                    .border_color(color)
-                    .bg(p.background_element)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(icon_el(alert_icon_name(akind), color))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(color)
-                                    .child(akind.as_str().to_string()),
-                            ),
-                    )
-                    .child(ta)
-                    .into_any_element()
-            }
-            BlockKind::Quote => div()
-                .w_full()
-                .min_w_0()
-                .border_l_2()
-                .border_color(p.markdown_block_quote)
-                .px_3()
-                .child(ta)
-                .into_any_element(),
-            BlockKind::Code => div()
-                .w_full()
-                .min_w_0()
-                .rounded(px(6.))
-                .bg(p.background_element)
-                .px_3()
-                .py_2()
-                .child(ta)
-                .into_any_element(),
-            BlockKind::Rule => div()
-                .w_full()
-                .h(px(1.))
-                .my_3()
-                .bg(p.markdown_horizontal_rule)
-                .into_any_element(),
-            _ => v_flex()
-                .w_full()
-                .min_w_0()
-                .child(ta)
-                .when(slash_query_at(&self.source, self.caret).is_some(), |el| {
-                    el.child(self.render_slash_menu(cx))
-                })
-                .into_any_element(),
-        }
-    }
-
-    fn range_in_raw(&self, range: &Range<usize>) -> bool {
-        if self.raw.start == self.raw.end && self.source.is_empty() {
-            return true;
-        }
-        range.start >= self.raw.start && range.end <= self.raw.end && self.raw.start < self.raw.end
-            || (range.start == self.raw.start && range.end == self.raw.end)
-    }
-
-    fn render_unfocused(&self, range: &PaintRange, cx: &mut Context<Self>) -> AnyElement {
-        let p = &self.palette;
-        let style = self.text_view_style();
-        let src = range.slice(&self.source);
+    fn render_block(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
         let wrap = self.config.wrap_motions;
-        let id = range.range.start;
-
-        if range.is_blank(&self.source) {
-            return div()
-                .w_full()
-                .min_w_0()
-                .h(px(8.))
-                .into_any_element();
-        }
-
-        if let Some((alt, img_src)) = sole_image(src) {
-            return self.render_image_block(&alt, &img_src);
-        }
-
-        if matches!(range.kind, BlockKind::List { .. }) && has_task_line(src) {
-            return self.render_task_list(range, cx);
-        }
-
-        match range.kind {
-            BlockKind::Alert(kind) => {
-                let color = p.alert_color(kind);
+        let block = p.blocks[ix].clone();
+        let text = p.display.get(block.display.clone()).unwrap_or("").to_string();
+        let empty = text.trim().is_empty() && !block.extra.is_atomic();
+        let placeholder = if empty {
+            Some("Type to write, or / for blocks")
+        } else {
+            None
+        };
+        let heading = matches!(block.kind, BlockKind::Heading(_));
+        let body = self.render_edit(block.display.clone(), &text, heading, placeholder, wrap && !matches!(block.kind, BlockKind::Code | BlockKind::Html), cx);
+        let slash = self.slash_is_open() && p.block_at_display(p.to_display(self.caret)).map(|b| b.source == block.source).unwrap_or(false);
+        match &block.extra {
+            BlockExtra::Alert(kind) => {
+                let color = pal.alert_color(*kind);
                 v_flex()
                     .w_full()
                     .min_w_0()
-                    .max_w_full()
                     .gap_1()
                     .px_3()
                     .py_2()
                     .rounded(px(6.))
                     .border_l_4()
                     .border_color(color)
-                    .bg(p.background_element)
+                    .bg(pal.background_element)
                     .child(
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(icon_el(alert_icon_name(kind), color))
+                            .child(icon_el(alert_icon_name(*kind), color))
                             .child(
                                 div()
                                     .text_xs()
@@ -2541,254 +2473,488 @@ impl Workspace {
                                     .child(kind.as_str().to_string()),
                             ),
                     )
-                    .child(markdown_view(
-                        ("alert-body", id),
-                        alert_body(src),
-                        style,
-                        p,
-                        wrap,
-                        false,
-                    ))
+                    .child(body)
                     .into_any_element()
             }
-            BlockKind::Rule => div()
-                .w_full()
-                .h(px(1.))
-                .my_3()
-                .bg(p.markdown_horizontal_rule)
-                .into_any_element(),
-            BlockKind::Heading(_) => div()
+            BlockExtra::Quote => div()
                 .w_full()
                 .min_w_0()
-                .max_w_full()
-                .text_color(p.markdown_heading)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(markdown_view(("md", id), src.to_string(), style, p, wrap, false))
-                .into_any_element(),
-            BlockKind::Quote => div()
-                .w_full()
-                .min_w_0()
-                .max_w_full()
                 .border_l_2()
-                .border_color(p.markdown_block_quote)
+                .border_color(pal.markdown_block_quote)
                 .px_3()
-                .text_color(p.markdown_block_quote)
-                .child(markdown_view(("md", id), src.to_string(), style, p, wrap, false))
+                .child(body)
                 .into_any_element(),
-            BlockKind::Code => div()
+            BlockExtra::Code { lang } => {
+                let caret = self.caret;
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .rounded(px(6.))
+                    .bg(pal.background_element)
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .child(self.render_lang_chip(lang, caret, cx))
+                    .child(body)
+                    .into_any_element()
+            }
+            BlockExtra::Rule => div()
                 .w_full()
-                .min_w_0()
-                .max_w_full()
-                .rounded(px(6.))
-                .bg(p.background_element)
-                .px_3()
-                .py_2()
-                .text_color(p.markdown_code_block)
-                .child(markdown_view(("md", id), src.to_string(), style, p, wrap, true))
+                .h(px(2.))
+                .my_3()
+                .bg(pal.markdown_horizontal_rule)
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, {
+                    let start = block.display.start;
+                    let view = cx.entity();
+                    move |ev: &MouseDownEvent, window, cx| {
+                        view.update(cx, |this, cx| this.click_display(start, ev.modifiers.shift, window, cx));
+                    }
+                })
                 .into_any_element(),
-            _ => markdown_view(("md", id), src.to_string(), style, p, wrap, false),
+            BlockExtra::Image { alt, src } => self.render_image_hit(alt, src, block.display.start, cx),
+            BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
+            BlockExtra::Table { .. } => self.render_table_block(ix, cx),
+            BlockExtra::Heading(_) | BlockExtra::Text | BlockExtra::Html => {
+                let mut el = v_flex().w_full().min_w_0().child(body);
+                if slash {
+                    el = el.child(self.render_slash_menu(cx));
+                }
+                el.into_any_element()
+            }
         }
     }
 
-    fn render_image_block(&self, alt: &str, src: &str) -> AnyElement {
-        let p = &self.palette;
+    fn render_image_hit(&self, alt: &str, src: &str, display_start: usize, cx: &mut Context<Self>) -> AnyElement {
+        let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         v_flex()
             .w_full()
             .min_w_0()
             .gap_1()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, {
+                let view = cx.entity();
+                move |ev: &MouseDownEvent, window, cx| {
+                    view.update(cx, |this, cx| this.click_display(display_start, ev.modifiers.shift, window, cx));
+                }
+            })
             .when(path.exists(), |el| {
-                el.child(
-                    img(path.clone())
-                        .max_w_full()
-                        .max_h(px(480.))
-                        .rounded(px(6.)),
-                )
+                el.child(img(path.clone()).max_w_full().max_h(px(480.)).rounded(px(6.)))
             })
             .when(!path.exists(), |el| {
-                el.child(
-                    div()
-                        .text_color(p.text_muted)
-                        .child(format!("missing image: {src}")),
-                )
+                el.child(div().text_color(pal.text_muted).child(format!("missing image: {src}")))
             })
             .when(!alt.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(p.text_muted)
-                        .child(alt.to_string()),
-                )
+                el.child(div().text_xs().text_color(pal.text_muted).child(alt.to_string()))
             })
             .into_any_element()
     }
 
-    fn render_task_list(&self, range: &PaintRange, cx: &mut Context<Self>) -> AnyElement {
-        let p = &self.palette;
-        let src = range.slice(&self.source).to_string();
-        let range_bytes = range.range.clone();
+    fn render_lang_chip(&self, lang: &str, caret: usize, cx: &mut Context<Self>) -> AnyElement {
+        let label = if lang.is_empty() { "plain" } else { lang };
+        Button::new(("lang", caret))
+            .ghost()
+            .xsmall()
+            .label(label.to_string())
+            .dropdown_menu({
+                let entity = cx.entity();
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    for lang in CODE_LANGS {
+                        let entity = entity.clone();
+                        let label = if lang.is_empty() { "plain" } else { *lang };
+                        let lang = lang.to_string();
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                if let Some((next, caret)) = wysiwyg::set_code_lang(&this.source, this.caret, &lang) {
+                                    this.commit_edit(next, caret, window, cx);
+                                }
+                            });
+                        }));
+                    }
+                    menu
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_list(
+        &mut self,
+        ix: usize,
+        items: &[crate::display::ListItem],
+        ordered: bool,
+        _body: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
+        let block = p.blocks[ix].clone();
+        let wrap = self.config.wrap_motions;
         v_flex()
             .w_full()
             .min_w_0()
             .gap_1()
-            .children(src.lines().enumerate().map(|(line_ix, line)| {
-                let range_bytes = range_bytes.clone();
-                if let Some((_, checked, rest)) = split_task_line(line) {
-                    let icon_name = if checked { "square-check" } else { "square" };
-                    let color = if checked { p.success } else { p.text_muted };
-                    h_flex()
-                        .id(("task", range_bytes.start * 1000 + line_ix))
-                        .w_full()
-                        .min_w_0()
-                        .items_start()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .id(("task-box", range_bytes.start * 1000 + line_ix))
-                                .w(px(16.))
-                                .h(px(20.))
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_task(range_bytes.clone(), line_ix, window, cx);
-                                    }),
-                                )
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                }))
-                                .child(icon_el(icon_name, color)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_color(p.markdown_text)
-                                .when(checked, |el| el.text_color(p.text_muted))
-                                .child(rest.trim().to_string()),
-                        )
-                        .into_any_element()
+            .children(items.iter().enumerate().map(|(i, item)| {
+                let text = p.display.get(item.display.clone()).unwrap_or("").to_string();
+                let bullet = if let Some(checked) = item.checked {
+                    if checked { "☑".to_string() } else { "☐".to_string() }
+                } else if ordered {
+                    format!("{}.", i + 1)
                 } else {
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .text_color(p.markdown_text)
-                        .child(line.to_string())
-                        .into_any_element()
-                }
+                    "•".to_string()
+                };
+                let indent = px((item.indent as f32) * 16.);
+                let edit = self.render_edit(item.display.clone(), &text, false, None, wrap, cx);
+                let src_range = block.source.clone();
+                h_flex()
+                    .id(("li", item.display.start))
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_2()
+                    .pl(indent)
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .pt(px(2.))
+                            .text_color(pal.markdown_list_item)
+                            .when(item.checked.is_some(), |el| {
+                                el.cursor_pointer().on_mouse_down(MouseButton::Left, {
+                                    let view = cx.entity();
+                                    let src_range = src_range.clone();
+                                    move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.toggle_task(src_range.clone(), i, window, cx);
+                                        });
+                                    }
+                                })
+                            })
+                            .child(bullet),
+                    )
+                    .child(div().flex_1().min_w_0().child(edit))
+                    .into_any_element()
             }))
             .into_any_element()
     }
 
-    fn render_surface(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let ranges = self.paint_ranges();
-        let p = &self.palette;
-        let editing = self.mode.is_insert() || self.is_notion();
-        let mut kids = Vec::new();
-        let mut i = 0usize;
-        let mut painted_raw = false;
-        while i < ranges.len() {
-            let r = &ranges[i];
-            let in_raw = self.range_in_raw(&r.range) || (self.source.is_empty() && !painted_raw);
-            if in_raw {
-                if !painted_raw {
-                    painted_raw = true;
-                    let body = self.render_focused(cx);
-                    kids.push(
-                        div()
-                            .id("raw-span")
-                            .w(px(740.))
-                            .max_w_full()
-                            .min_w_0()
-                            .mx_auto()
-                            .px_8()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .py_1()
-                                    .pl_2()
-                                    .rounded(px(6.))
-                                    .border_l_4()
-                                    .border_color(p.primary)
-                                    .when(editing, |el| el.bg(p.background_element))
-                                    .when(!editing, |el| el.bg(p.background_element.opacity(0.45)))
-                                    .child(body),
-                            )
-                            .into_any_element(),
-                    );
-                }
-                i += 1;
-                continue;
+    fn render_table_block(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
+        let wrap = self.config.wrap_motions;
+        let BlockExtra::Table { cells, rows, cols } = &p.blocks[ix].extra else {
+            return div().into_any_element();
+        };
+        let cols = (*cols).max(1);
+        let rows = (*rows).max(1);
+        let mut grid: Vec<Vec<Option<crate::display::TableCell>>> = vec![vec![None; cols]; rows];
+        for c in cells {
+            if c.row < rows && c.col < cols {
+                grid[c.row][c.col] = Some(c.clone());
             }
-            let range = r.range.clone();
-            let empty = r.is_blank(&self.source);
-            let body = if empty {
-                div()
-                    .text_color(p.text_muted)
-                    .child("Type to write, or / for blocks")
-                    .into_any_element()
-            } else {
-                self.render_unfocused(r, cx)
-            };
-            kids.push(
-                div()
-                    .id(("range", range.start))
-                    .w(px(740.))
-                    .max_w_full()
-                    .min_w_0()
-                    .mx_auto()
-                    .px_8()
-                    .child(
+        }
+        let in_table = p.table_cell_at(p.to_display(self.caret)).is_some();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .border_1()
+            .border_color(pal.border)
+            .rounded(px(8.))
+            .overflow_hidden()
+            .children(grid.into_iter().enumerate().map(|(r, row)| {
+                h_flex()
+                    .w_full()
+                    .children(row.into_iter().enumerate().map(|(c, cell)| {
+                        let (disp, header) = if let Some(cell) = cell {
+                            (cell.display, cell.header)
+                        } else {
+                            (0..0, r == 0)
+                        };
+                        let text = p.display.get(disp.clone()).unwrap_or("").replace('\t', "").to_string();
+                        let edit = self.render_edit(disp, &text, header, None, wrap, cx);
                         div()
-                            .w_full()
+                            .id(("td", r * 100 + c))
+                            .flex_1()
                             .min_w_0()
-                            .max_w_full()
+                            .px_2()
                             .py_1()
-                            .pl_2()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                {
-                                    let range = range.clone();
-                                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.click_range(range.clone(), ev.modifiers.shift, window, cx);
-                                    })
-                                },
-                            )
-                            .on_mouse_move({
-                                let range = range.clone();
-                                cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                                    if this.mouse_dragging && ev.dragging() {
-                                        this.drag_to_range(range.clone(), window, cx);
-                                    }
-                                })
-                            })
-                            .child(body),
-                    )
-                    .into_any_element(),
-            );
-            i += 1;
+                            .border_r_1()
+                            .border_b_1()
+                            .border_color(pal.border)
+                            .when(header, |el| el.bg(pal.background_element).font_weight(FontWeight::SEMIBOLD))
+                            .child(edit)
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            }))
+            .when(in_table, |el| el.child(self.render_table_menu(cx)))
+            .into_any_element()
+    }
+
+    fn render_table_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .p_1()
+            .child(self.table_btn("row-above", "Row ↑", false, true, cx))
+            .child(self.table_btn("row-below", "Row ↓", false, false, cx))
+            .child(self.table_btn("col-left", "Col ←", true, true, cx))
+            .child(self.table_btn("col-right", "Col →", true, false, cx))
+            .child(
+                Button::new("tbl-del")
+                    .ghost()
+                    .xsmall()
+                    .label("Delete")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.delete_current_table(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn table_btn(&self, id: &'static str, label: &'static str, col: bool, before: bool, cx: &mut Context<Self>) -> AnyElement {
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .label(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.table_insert(col, before, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn table_insert(&mut self, col: bool, before: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let Some((block, cell)) = p.table_cell_at(d) else { return };
+        let BlockExtra::Table { cells, cols, .. } = &block.extra else { return };
+        let cols = *cols;
+        let (mut headers, mut rows) = {
+            // rebuild from display
+            let mut headers = vec![String::new(); cols.max(1)];
+            let mut body: Vec<Vec<String>> = Vec::new();
+            for c in cells {
+                let text = p.display.get(c.display.clone()).unwrap_or("").replace('\t', "").to_string();
+                if c.header {
+                    if c.col < headers.len() { headers[c.col] = text; }
+                } else {
+                    let br = c.row.saturating_sub(1);
+                    while body.len() <= br { body.push(vec![String::new(); cols.max(1)]); }
+                    if c.col < body[br].len() { body[br][c.col] = text; }
+                }
+            }
+            (headers, body)
+        };
+        if col {
+            let at = if before { cell.col } else { cell.col + 1 };
+            headers.insert(at.min(headers.len()), String::new());
+            for row in &mut rows {
+                row.insert(at.min(row.len()), String::new());
+            }
+        } else {
+            let body_row = if cell.header { 0 } else { cell.row.saturating_sub(1) };
+            let at = if before { body_row } else { body_row + 1 };
+            rows.insert(at.min(rows.len()), vec![String::new(); headers.len().max(1)]);
         }
-        if kids.is_empty() {
+        let gfm = crate::display::serialize_table(&headers, &rows);
+        self.push_doc_undo();
+        let next = splice(&self.source, block.source.clone(), &gfm);
+        self.commit_edit(next, block.source.start, window, cx);
+    }
+
+    fn delete_current_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let Some(block) = p.block_at_display(d) else { return };
+        if !matches!(block.kind, BlockKind::Table) { return; }
+        self.push_doc_undo();
+        let next = splice(&self.source, block.source.clone(), "");
+        self.commit_edit(next, block.source.start, window, cx);
+    }
+
+    fn render_bubble(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(_sel) = self.sel.clone().filter(|s| s.start != s.end) else {
+            if self.link_open {
+                return self.render_link_field(cx);
+            }
+            return div().into_any_element();
+        };
+        let p = &self.palette;
+        h_flex()
+            .absolute()
+            .top(px(8.))
+            .left(px(80.))
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.background_panel)
+            .shadow_sm()
+            .child(self.mark_btn("B", Mark::Bold, cx))
+            .child(self.mark_btn("I", Mark::Italic, cx))
+            .child(self.mark_btn("S", Mark::Strike, cx))
+            .child(self.mark_btn("<>", Mark::Code, cx))
+            .child(
+                Button::new("mk-link")
+                    .ghost()
+                    .xsmall()
+                    .label("Link")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_link(&ToggleLink, window, cx);
+                    })),
+            )
+            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
+            .into_any_element()
+    }
+
+    fn mark_btn(&self, label: &'static str, mark: Mark, cx: &mut Context<Self>) -> AnyElement {
+        Button::new(("mk", label.len()))
+            .ghost()
+            .xsmall()
+            .label(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_mark_action(mark, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_link_field(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.palette;
+        h_flex()
+            .items_center()
+            .gap_1()
+            .child(div().text_xs().text_color(p.text_muted).child("url"))
+            .child(div().text_sm().text_color(p.markdown_text).child(format!("{}▌", self.link_draft)))
+            .into_any_element()
+    }
+
+    fn on_insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_newline(false, window, cx);
+    }
+    fn on_insert_hard_break(&mut self, _: &InsertHardBreak, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_newline(true, window, cx);
+    }
+    fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.editor.is_modal() && !self.mode.is_insert() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, false) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+        }
+    }
+    fn on_outdent_tab(&mut self, _: &OutdentTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.editor.is_modal() && !self.mode.is_insert() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, true) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+        }
+    }
+    fn on_toggle_bold(&mut self, _: &ToggleBold, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark_action(Mark::Bold, window, cx);
+    }
+    fn on_toggle_italic(&mut self, _: &ToggleItalic, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark_action(Mark::Italic, window, cx);
+    }
+    fn on_toggle_strike(&mut self, _: &ToggleStrike, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark_action(Mark::Strike, window, cx);
+    }
+    fn on_toggle_code(&mut self, _: &ToggleCode, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_mark_action(Mark::Code, window, cx);
+    }
+    fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sel.as_ref().is_none_or(|s| s.start == s.end) && !self.link_open {
+            return;
+        }
+        self.link_open = true;
+        self.link_draft.clear();
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn render_surface(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.hits.clear();
+        let p = self.proj();
+        let n = p.blocks.len();
+        let mut kids = Vec::new();
+        for i in 0..n {
             kids.push(
                 div()
-                    .id("raw-span")
-                    .w(px(740.))
+                    .id(("blk", i))
+                    .w(px(COLUMN_PX))
                     .max_w_full()
                     .min_w_0()
                     .mx_auto()
                     .px_8()
-                    .child(self.render_focused(cx))
+                    .py_1()
+                    .child(self.render_block(i, cx))
                     .into_any_element(),
             );
         }
+        kids.push(self.render_bubble(cx));
         kids
+    }
+
+    fn toggle_mark_action(&mut self, mark: Mark, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            if let Some((next, range)) = wysiwyg::toggle_mark(&self.source, sel, mark) {
+                self.push_doc_undo();
+                self.source = next;
+                self.caret = range.end;
+                self.sel = Some(range);
+                self.dirty = true;
+                self.status = "unsaved".into();
+                self.refresh(window, cx);
+                self.sync_title(window);
+            }
+        } else {
+            match mark {
+                Mark::Bold => self.sticky.bold = !self.sticky.bold,
+                Mark::Italic => self.sticky.italic = !self.sticky.italic,
+                Mark::Strike => self.sticky.strike = !self.sticky.strike,
+                Mark::Code => self.sticky.code = !self.sticky.code,
+            }
+            cx.notify();
+        }
+    }
+
+    fn commit_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.link_draft.clone();
+        self.link_open = false;
+        self.link_draft.clear();
+        let sel = self.sel.clone().unwrap_or(self.caret..self.caret);
+        self.push_doc_undo();
+        let (next, caret) = wysiwyg::apply_link(&self.source, sel, &url);
+        self.commit_edit(next, caret, window, cx);
+    }
+
+    fn offset_from_utf16(text: &str, offset: usize) -> usize {
+        let mut utf8 = 0;
+        let mut utf16 = 0;
+        for ch in text.chars() {
+            if utf16 >= offset { break; }
+            utf16 += ch.len_utf16();
+            utf8 += ch.len_utf8();
+        }
+        utf8
+    }
+
+    fn offset_to_utf16(text: &str, offset: usize) -> usize {
+        let mut utf16 = 0;
+        let mut utf8 = 0;
+        for ch in text.chars() {
+            if utf8 >= offset { break; }
+            utf8 += ch.len_utf8();
+            utf16 += ch.len_utf16();
+        }
+        utf16
     }
 }
 
@@ -2800,45 +2966,6 @@ fn icon_el(name: &str, color: gpui::Hsla) -> Icon {
         .h(px(16.))
 }
 
-
-fn markdown_view(
-    id: (&'static str, usize),
-    source: impl Into<SharedString>,
-    style: TextViewStyle,
-    p: &Palette,
-    wrap: bool,
-    code: bool,
-) -> AnyElement {
-    let view = TextView::markdown(id, source)
-        .selectable(false)
-        .style(style)
-        .on_link_click(move |url, _ev, _window, cx| {
-            cx.open_url(url);
-            cx.stop_propagation();
-        })
-        .text_color(p.markdown_text)
-        .w_full()
-        .min_w_0()
-        .max_w_full()
-        .when(wrap && !code, |el| el.whitespace_normal())
-        .when(!wrap, |el| el.whitespace_nowrap());
-    let wrap_box = div()
-        .id(("md-wrap", id.1 + if code { 1_000_000 } else { 0 }))
-        .w_full()
-        .min_w_0()
-        .max_w_full();
-    if code {
-        wrap_box.overflow_x_scroll().child(view).into_any_element()
-    } else if wrap {
-        wrap_box.overflow_x_hidden().child(view).into_any_element()
-    } else {
-        wrap_box.child(view).into_any_element()
-    }
-}
-
-fn alert_body(source: &str) -> String {
-    crate::notion::strip_alert_body(source)
-}
 
 pub fn window_title(path: &Path, dirty: bool) -> String {
     let name = path
@@ -2903,8 +3030,181 @@ pub fn apply_palette(palette: &Palette, cx: &mut App) {
 }
 
 impl Focusable for Workspace {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.textarea.focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl EntityInputHandler for Workspace {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let p = self.proj();
+        let start = Self::offset_from_utf16(&p.display, range_utf16.start);
+        let end = Self::offset_from_utf16(&p.display, range_utf16.end);
+        *adjusted = Some(
+            Self::offset_to_utf16(&p.display, start)..Self::offset_to_utf16(&p.display, end),
+        );
+        Some(p.display.get(start..end).unwrap_or("").to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if !ignore_disabled && self.is_modal_nav() {
+            return None;
+        }
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let range = if let Some(sel) = &self.sel {
+            let a = p.to_display(sel.start.min(sel.end));
+            let b = p.to_display(sel.end.max(sel.start));
+            Self::offset_to_utf16(&p.display, a)..Self::offset_to_utf16(&p.display, b)
+        } else {
+            let u = Self::offset_to_utf16(&p.display, d);
+            u..u
+        };
+        Some(UTF16Selection {
+            range,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        let marked = self.marked.as_ref()?;
+        let p = self.proj();
+        Some(
+            Self::offset_to_utf16(&p.display, marked.start)
+                ..Self::offset_to_utf16(&p.display, marked.end),
+        )
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_modal_nav() {
+            return;
+        }
+        if text == "\n" || text == "\r\n" {
+            self.insert_newline(false, window, cx);
+            return;
+        }
+        let p = self.proj();
+        let display_range = if let Some(r) = range_utf16 {
+            Self::offset_from_utf16(&p.display, r.start)..Self::offset_from_utf16(&p.display, r.end)
+        } else if let Some(sel) = &self.sel {
+            p.to_display(sel.start.min(sel.end))..p.to_display(sel.end.max(sel.start))
+        } else if let Some(m) = &self.marked {
+            m.clone()
+        } else {
+            let d = p.to_display(self.caret);
+            d..d
+        };
+        let mut insert = text.to_string();
+        if self.sticky.bold && !insert.contains("**") {
+            insert = format!("**{insert}**");
+        } else if self.sticky.italic && !insert.contains('*') {
+            insert = format!("*{insert}*");
+        } else if self.sticky.strike {
+            insert = format!("~~{insert}~~");
+        } else if self.sticky.code {
+            insert = format!("`{insert}`");
+        }
+        let src_range = p.display_range_to_source(display_range, self.affinity);
+        if self.insert_origin.is_none() {
+            self.insert_origin = Some(self.snapshot());
+        }
+        let next = splice(&self.source, src_range.clone(), &insert);
+        let caret = src_range.start + insert.len();
+        self.source = next;
+        self.caret = caret.min(self.source.len());
+        self.sel = None;
+        self.marked = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        let q = self.slash_query().unwrap_or_default();
+        if q != self.last_slash_query {
+            self.last_slash_query = q;
+            self.slash_index = 0;
+        }
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let start = d.saturating_sub(new_text.len());
+        self.marked = if new_text.is_empty() {
+            None
+        } else {
+            Some(start..d)
+        };
+        if let Some(sel) = new_selected_range {
+            let a = start + Self::offset_from_utf16(new_text, sel.start);
+            let b = start + Self::offset_from_utf16(new_text, sel.end);
+            self.caret = p.to_source(b.min(p.display.len()), self.affinity);
+            let _ = a;
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let p = self.proj();
+        let start = Self::offset_from_utf16(&p.display, range_utf16.start);
+        for hit in &self.hits {
+            let local = start.saturating_sub(hit.display_start);
+            if start >= hit.display_start && start <= hit.display_start + hit.layout.len() {
+                let pos = hit.layout.position_for_index(local)?;
+                let h = hit.layout.line_height();
+                return Some(gpui::Bounds::new(pos, gpui::size(px(2.), h)));
+            }
+        }
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let p = self.proj();
+        let d = surface::index_for_point(&self.hits, point)?;
+        Some(Self::offset_to_utf16(&p.display, d))
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.is_modal_nav() && self.command.is_none() && self.search.is_none() && !self.link_open
     }
 }
 
@@ -2993,6 +3293,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_reverse_find))
             .on_action(cx.listener(Self::on_bracket_open))
             .on_action(cx.listener(Self::on_bracket_close))
+            .on_action(cx.listener(Self::on_insert_newline))
+            .on_action(cx.listener(Self::on_insert_hard_break))
+            .on_action(cx.listener(Self::on_indent_tab))
+            .on_action(cx.listener(Self::on_outdent_tab))
+            .on_action(cx.listener(Self::on_toggle_bold))
+            .on_action(cx.listener(Self::on_toggle_italic))
+            .on_action(cx.listener(Self::on_toggle_strike))
+            .on_action(cx.listener(Self::on_toggle_code))
+            .on_action(cx.listener(Self::on_toggle_link))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {
                     cx.stop_propagation();
@@ -3003,7 +3312,6 @@ impl Render for Workspace {
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     if this.mouse_dragging {
                         this.mouse_dragging = false;
-                        this.sync_editor_sel(cx);
                         if this.sel.as_ref().is_some_and(|s| s.start != s.end)
                             && this.config.editor.is_modal()
                             && !this.mode.is_insert()

@@ -73,7 +73,7 @@ pub const ITEMS: &[SlashItem] = &[
         keys: &["table"],
         label: "Table",
         hint: "| |",
-        template: "| Column 1 | Column 2 |\n| --- | --- |\n|  |  |",
+        template: "| Column 1 | Column 2 | Column 3 |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |",
         kind: BlockKind::Table,
         icon: "table",
     },

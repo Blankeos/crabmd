@@ -1,6 +1,7 @@
 mod assets;
 mod config;
 mod coords;
+mod display;
 mod document;
 mod editor;
 mod images;
@@ -8,8 +9,10 @@ mod mode;
 mod motion;
 mod notion;
 mod slash;
+mod surface;
 mod theme;
 mod undo;
+mod wysiwyg;
 
 use std::path::PathBuf;
 
