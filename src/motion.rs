@@ -129,13 +129,26 @@ pub fn visual_rows(source: &str, wrap_cols: Option<usize>) -> Vec<Range<usize>> 
 }
 
 fn row_index(rows: &[Range<usize>], offset: usize) -> usize {
-    rows.iter()
-        .position(|r| offset < r.end || (offset == r.end && offset == r.start))
-        .or_else(|| {
-            rows.iter()
-                .position(|r| offset >= r.start && offset <= r.end)
-        })
-        .unwrap_or(rows.len().saturating_sub(1))
+    // Caret at `row.end` is EOL of that row (the `\n` offset), except at a
+    // soft-wrap boundary where `row.end == next.start` — that offset is the
+    // first column of the next visual row.
+    for (i, r) in rows.iter().enumerate() {
+        if offset < r.start {
+            return i.saturating_sub(1);
+        }
+        if offset < r.end {
+            return i;
+        }
+        if offset == r.end {
+            if let Some(next) = rows.get(i + 1) {
+                if next.start == r.end {
+                    continue;
+                }
+            }
+            return i;
+        }
+    }
+    rows.len().saturating_sub(1)
 }
 
 fn col_in_row(source: &str, row: &Range<usize>, offset: usize) -> usize {
@@ -1022,6 +1035,45 @@ mod tests {
     }
 
     #[test]
+    fn down_from_eol_does_not_skip_next_line() {
+        // Caret at the `\n` (EOL of "aa") must stay on that row so j/Down
+        // lands on "bb", not the line after.
+        let s = "aa\nbb\ncc";
+        assert_eq!(off(s, Motion::Down, 2, 1), 5);
+        assert_eq!(off(s, Motion::Down, 2, 2), 8);
+        let trailing = "hello world\nhello\n";
+        let at = "hello world".len();
+        let next = off(trailing, Motion::Down, at, 1);
+        assert_eq!(
+            next,
+            "hello world\nhello".len(),
+            "EOL of a long line clamps onto the shorter line, not the trailing empty, got {next}"
+        );
+        assert_eq!(off(trailing, Motion::Down, 0, 1), "hello world\n".len());
+    }
+
+    #[test]
+    fn down_from_end_of_paragraph_lands_in_next_paragraph() {
+        use crate::display::project;
+        let src = "hello world\n\nhello\n";
+        let p = project(src);
+        assert!(p.blocks.len() >= 2, "blocks={}", p.blocks.len());
+        let at = p.blocks[0].display.end;
+        let next = apply_motion(&p.display, at, Motion::Down, 1, None);
+        let second = p
+            .blocks
+            .iter()
+            .find(|b| b.display.start != b.display.end && b.display.start >= at)
+            .expect("second paragraph");
+        assert!(
+            next >= second.display.start && next <= second.display.end,
+            "down from {at} landed at {next}, second={:?}, display={:?}",
+            second.display,
+            p.display
+        );
+    }
+
+    #[test]
     fn jk_stops_at_buffer_edges() {
         let s = "aa\nbb";
         assert_eq!(apply_motion(s, 0, Motion::Up, 1, None), 0);
@@ -1035,6 +1087,7 @@ mod tests {
     fn wrap_jk_walks_visual_rows() {
         let s = "abcdefghij";
         assert_eq!(apply_motion(s, 0, Motion::Down, 1, Some(4)), 4);
+        assert_eq!(apply_motion(s, 3, Motion::Down, 1, Some(4)), 7);
         assert_eq!(apply_motion(s, 4, Motion::Down, 1, Some(4)), 8);
         assert_eq!(apply_motion(s, 8, Motion::Down, 1, Some(4)), 8);
         assert_eq!(apply_motion(s, 0, Motion::Up, 1, Some(4)), 0);

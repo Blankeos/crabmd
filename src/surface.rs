@@ -473,6 +473,38 @@ pub fn index_for_point(hits: &[Hit], point: Point<Pixels>) -> Option<usize> {
     best.map(|(_, d)| d)
 }
 
+/// Window-space Y of the caret and its line height, after text layouts have
+/// been prepainted into `hits`.
+pub fn caret_screen_y(hits: &[Hit], display: usize) -> Option<(Pixels, Pixels)> {
+    let mut fallback: Option<&Hit> = None;
+    for hit in hits {
+        if display < hit.display_start {
+            break;
+        }
+        fallback = Some(hit);
+        let Some(len) = layout_len(&hit.layout) else {
+            continue;
+        };
+        if display <= hit.display_start + len {
+            return caret_y(hit, display);
+        }
+    }
+    fallback.and_then(|hit| caret_y(hit, display))
+}
+
+fn caret_y(hit: &Hit, display: usize) -> Option<(Pixels, Pixels)> {
+    let len = layout_len(&hit.layout)?;
+    let local = display.saturating_sub(hit.display_start).min(len);
+    let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hit.layout.position_for_index(local)
+    }))
+    .ok()
+    .flatten()?;
+    let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.line_height()))
+        .unwrap_or(px(16.));
+    Some((pos.y, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

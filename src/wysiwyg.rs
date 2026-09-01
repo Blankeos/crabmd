@@ -1,5 +1,9 @@
 //! Notion enter / backspace / tab / mark toggle. Operates on GFM `source`
 //! via the display projection.
+//!
+//! Caret arguments and return values are **display** offsets
+//! (`project(src).display`), never GFM source bytes. Source is only used
+//! to splice. Mapping a caret through source is lossy at empty slots.
 
 use std::ops::Range;
 
@@ -37,6 +41,31 @@ impl Mark {
     }
 }
 
+fn block_ix(p: &Projection, d: usize) -> usize {
+    p.block_at_display(d)
+        .and_then(|b| {
+            p.blocks
+                .iter()
+                .position(|x| x.display.start == b.display.start && x.display.end == b.display.end)
+        })
+        .unwrap_or(0)
+}
+
+/// Display caret on block `ix` at `local` (clamped). `usize::MAX` = end.
+fn after(next: &str, ix: usize, local: usize) -> usize {
+    let p = project(next);
+    let Some(b) = p.blocks.get(ix.min(p.blocks.len().saturating_sub(1))) else {
+        return 0;
+    };
+    let len = b.display.end.saturating_sub(b.display.start);
+    b.display.start + local.min(len)
+}
+
+fn finish(next: String, ix: usize, local: usize) -> (String, usize) {
+    let caret = after(&next, ix, local);
+    (next, caret)
+}
+
 pub fn insert_text(
     src: &str,
     caret: usize,
@@ -46,13 +75,17 @@ pub fn insert_text(
 ) -> (String, usize) {
     let p = project(src);
     if let Some(sel) = sel.filter(|s| s.start != s.end) {
-        let d0 = p.to_display(sel.start.min(sel.end));
-        let d1 = p.to_display(sel.end.max(sel.start));
+        let d0 = sel.start.min(sel.end).min(p.display.len());
+        let d1 = sel.end.max(sel.start).min(p.display.len());
         let range = p.display_range_to_source(d0..d1, affinity);
         let next = splice(src, range.clone(), text);
-        return (next, range.start + text.len());
+        let ix = block_ix(&p, d0);
+        let local = d0.saturating_sub(p.blocks.get(ix).map(|b| b.display.start).unwrap_or(0));
+        return finish(next, ix, local + text.len());
     }
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
+    let ix = block_ix(&p, d);
+    let local = d.saturating_sub(p.blocks.get(ix).map(|b| b.display.start).unwrap_or(0));
     // Typing into a visible empty paragraph must replace that blank slot.
     // A raw point insert at `empty_insert_point` collapses the surrounding
     // `\n\n` separator and merges with the following block (Notion-breaking).
@@ -60,7 +93,7 @@ pub fn insert_text(
         if block.display.start == block.display.end
             && matches!(block.kind, BlockKind::Paragraph | BlockKind::Raw)
         {
-            return fill_empty_paragraph(src, block.source.clone(), text);
+            return fill_empty_paragraph(src, block.source.clone(), text, ix);
         }
         // Empty list item: insert after the marker (`- ` / `1. `), never before it.
         if matches!(block.kind, BlockKind::List { .. }) {
@@ -72,17 +105,17 @@ pub fn insert_text(
                     if item.display.start == item.display.end
                         || p.display[item.display.clone()].trim().is_empty()
                     {
-                        return fill_empty_list_item(src, item, text);
+                        return fill_empty_list_item(src, item, text, ix);
                     }
                     // At visual EOL: append after the item's raw body (keeps spaces).
                     if d == item.display.end {
-                        return append_at_item_body_end(src, item, text);
+                        return append_at_item_body_end(src, item, text, ix);
                     }
                 }
             }
         }
         if matches!(block.kind, BlockKind::Heading(_)) && d == block.display.end {
-            return append_at_heading_body_end(src, block.source.clone(), text);
+            return append_at_heading_body_end(src, block.source.clone(), text, ix, local);
         }
         if matches!(block.kind, BlockKind::Quote | BlockKind::Alert(_)) {
             let raw = src.get(block.source.clone()).unwrap_or("");
@@ -91,16 +124,16 @@ pub fn insert_text(
                 _ => notion::strip_quote(raw),
             };
             if body.trim().is_empty() {
-                return fill_empty_quote_or_alert(src, block, text);
+                return fill_empty_quote_or_alert(src, block, text, ix);
             }
         }
     }
     let s = p.to_source(d, affinity);
     let next = splice(src, s..s, text);
-    (next, s + text.len())
+    confirm_list_shortcut(&next, after(&next, ix, local + text.len()), ix)
 }
 
-fn append_at_item_body_end(src: &str, item: &ListItem, text: &str) -> (String, usize) {
+fn append_at_item_body_end(src: &str, item: &ListItem, text: &str, ix: usize) -> (String, usize) {
     let slice = src.get(item.source.clone()).unwrap_or("");
     let core = slice.trim_end_matches('\n');
     let marker_end = list_item_marker_end(core);
@@ -112,22 +145,29 @@ fn append_at_item_body_end(src: &str, item: &ListItem, text: &str) -> (String, u
         rep.push('\n');
     }
     let next = splice(src, item.source.clone(), &rep);
-    let caret = (item.source.start + rep.trim_end_matches('\n').len()).min(next.len());
-    (next, caret)
+    let local = (item.display.end - item.display.start) + text.len();
+    finish(next, ix, local)
 }
 
-fn append_at_heading_body_end(src: &str, block: Range<usize>, text: &str) -> (String, usize) {
+fn append_at_heading_body_end(
+    src: &str,
+    block: Range<usize>,
+    text: &str,
+    ix: usize,
+    local: usize,
+) -> (String, usize) {
     let slice = src.get(block.clone()).unwrap_or("");
     let line = slice.trim_end_matches(['\n', '\r']);
     let at = (block.start + line.len()).min(src.len());
     let next = splice(src, at..at, text);
-    (next, at + text.len())
+    finish(next, ix, local + text.len())
 }
 
 fn fill_empty_quote_or_alert(
     src: &str,
     block: &crate::display::ProjBlock,
     text: &str,
+    ix: usize,
 ) -> (String, usize) {
     let slice = src.get(block.source.clone()).unwrap_or("");
     let mut gfm = match block.kind {
@@ -139,11 +179,10 @@ fn fill_empty_quote_or_alert(
         gfm.push('\n');
     }
     let next = splice(src, block.source.clone(), &gfm);
-    let caret = (block.source.start + gfm.trim_end_matches('\n').len()).min(next.len());
-    (next, caret)
+    finish(next, ix, text.len())
 }
 
-fn fill_empty_list_item(src: &str, item: &ListItem, text: &str) -> (String, usize) {
+fn fill_empty_list_item(src: &str, item: &ListItem, text: &str, ix: usize) -> (String, usize) {
     let slice = src.get(item.source.clone()).unwrap_or("");
     let core = slice.trim_end_matches('\n');
     let marker_end = list_item_marker_end(core);
@@ -157,8 +196,7 @@ fn fill_empty_list_item(src: &str, item: &ListItem, text: &str) -> (String, usiz
         rep.push('\n');
     }
     let next = splice(src, item.source.clone(), &rep);
-    let caret = (item.source.start + rep.trim_end_matches('\n').len()).min(next.len());
-    (next, caret)
+    finish(next, ix, text.len())
 }
 
 /// Escape list-item bodies that cmark would reparse as nested lists / HRs.
@@ -222,10 +260,19 @@ fn unescape_md_punct(s: &str) -> String {
 
 /// Replace one empty-paragraph blank slot with `text`, preserving paragraph
 /// breaks and any sibling empty slots in the same blank run.
-fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str) -> (String, usize) {
+fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str, ix: usize) -> (String, usize) {
     if text.is_empty() {
         return (src.to_string(), slot.start.min(src.len()));
     }
+    // Adjacent lists swallow a raw `-` / `1.` as another item. Escape until
+    // the user types the trailing space that confirms a Notion list shortcut.
+    let escaped;
+    let text = if crate::document::is_incomplete_list_marker(text) {
+        escaped = safe_list_item_body(text);
+        escaped.as_str()
+    } else {
+        text
+    };
     let start = slot.start.min(src.len());
     let end = slot.end.min(src.len()).max(start);
 
@@ -268,6 +315,7 @@ fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str) -> (String, u
         }
     }
     let caret = content_end + rep.len() + text.len();
+    let _ = caret;
     rep.push_str(text);
     if has_next {
         for _ in 0..(empties_below + 2) {
@@ -283,12 +331,43 @@ fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str) -> (String, u
     }
 
     let next = splice(src, content_end..next_content, &rep);
-    let caret = caret.min(next.len());
-    (next, caret)
+    confirm_list_shortcut(&next, after(&next, ix, text.len()), ix)
+}
+
+/// After typing the confirming space (`- ` / `1. `), rewrite an escaped
+/// paragraph (`\-`) into a real list marker so it doesn't stay literal.
+fn confirm_list_shortcut(src: &str, caret_d: usize, ix: usize) -> (String, usize) {
+    let p = project(src);
+    let d = caret_d.min(p.display.len());
+    let Some(block) = p.block_at_display(d) else {
+        return (src.to_string(), d);
+    };
+    if !matches!(block.kind, BlockKind::Paragraph | BlockKind::Raw) {
+        return (src.to_string(), d);
+    }
+    let body = &p.display[block.display.clone()];
+    if !is_confirmed_list_shortcut(body) {
+        return (src.to_string(), d);
+    }
+    let slice = src.get(block.source.clone()).unwrap_or("");
+    let mut gfm = body.to_string();
+    if slice.ends_with('\n') && !gfm.ends_with('\n') {
+        gfm.push('\n');
+    }
+    let next = splice(src, block.source.clone(), &gfm);
+    finish(next, ix, usize::MAX)
+}
+
+fn is_confirmed_list_shortcut(body: &str) -> bool {
+    matches!(body, "- " | "* " | "+ ")
+        || {
+            let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
+            digits > 0 && (&body[digits..] == ". " || &body[digits..] == ") ")
+        }
 }
 
 fn slash_query_display(p: &Projection, caret: usize) -> Option<(Range<usize>, Range<usize>)> {
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let block = p.block_at_display(d)?;
     let body = p.display.get(block.display.clone())?;
     let local = d.saturating_sub(block.display.start).min(body.len());
@@ -330,28 +409,35 @@ pub fn apply_slash(src: &str, caret: usize, template: &str) -> (String, usize) {
                 gfm.push('\n');
             }
             let next = splice(src, block.source.clone(), &gfm);
-            let caret = (block.source.start + gfm.trim_end_matches('\n').len()).min(next.len());
-            return (next, caret);
+            let ix = block_ix(&p, display.start);
+            return finish(next, ix, usize::MAX);
         }
     }
+    let ix = block_ix(&p, display.start);
     let range = p.display_range_to_source(display, Affinity::Inside);
     let next = splice(src, range.clone(), template);
-    let caret = (range.start + template.len()).min(next.len());
-    (next, caret)
+    finish(next, ix, usize::MAX)
 }
 
 pub fn delete_display_range(src: &str, display: Range<usize>) -> (String, usize) {
     let p = project(src);
+    let ix = block_ix(&p, display.start);
+    let local = display.start.saturating_sub(
+        p.blocks
+            .get(ix)
+            .map(|b| b.display.start)
+            .unwrap_or(0),
+    );
     let range = p.display_range_to_source(display, Affinity::Inside);
     let next = splice(src, range.clone(), "");
-    (next, range.start)
+    finish(next, ix, local)
 }
 
 /// Delete the display character before `caret`. If that empties the block,
 /// leave a single empty slot (do not invent extra blank lines).
 pub fn delete_char(src: &str, caret: usize, _affinity: Affinity) -> (String, usize) {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     if d == 0 {
         return (src.to_string(), 0);
     }
@@ -377,7 +463,8 @@ pub fn delete_char(src: &str, caret: usize, _affinity: Affinity) -> (String, usi
             (prev >= it.display.start && prev < it.display.end) || d == it.display.end
         }) {
             if prev <= item.display.start && d >= item.display.end {
-                return fill_empty_list_item(src, item, "");
+                let ix = block_ix(&p, prev);
+                return fill_empty_list_item(src, item, "", ix);
             }
         }
     }
@@ -388,10 +475,11 @@ pub fn delete_char(src: &str, caret: usize, _affinity: Affinity) -> (String, usi
 /// the caret. Leaves a single empty block (does not invent an extra blank line).
 pub fn delete_to_line_start(src: &str, caret: usize) -> (String, usize) {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let Some(block) = p.block_at_display(d) else {
-        return (src.to_string(), caret.min(src.len()));
+        return (src.to_string(), d);
     };
+    let ix = block_ix(&p, d);
 
     // List item: clear item body only (keep marker), or full-clear empty.
     if let BlockExtra::List { items, .. } = &block.extra {
@@ -401,11 +489,11 @@ pub fn delete_to_line_start(src: &str, caret: usize) -> (String, usize) {
         {
             let start_d = item.display.start;
             if start_d >= d {
-                return (src.to_string(), caret.min(src.len()));
+                return (src.to_string(), d);
             }
             if start_d == item.display.start && d >= item.display.end {
                 // Cleared whole item body → empty item (marker only).
-                let body = "";
+                let _body = "";
                 // Replace item source with just its marker line.
                 let slice = src.get(item.source.clone()).unwrap_or("");
                 let core = slice.trim_end_matches('\n');
@@ -418,8 +506,7 @@ pub fn delete_to_line_start(src: &str, caret: usize) -> (String, usize) {
                     rep.push('\n');
                 }
                 let next = splice(src, item.source.clone(), &rep);
-                let caret = (item.source.start + marker_end.min(rep.len())).min(next.len());
-                return (next, caret);
+                return finish(next, ix, 0);
             }
             return delete_display_range(src, start_d..d);
         }
@@ -433,7 +520,7 @@ pub fn delete_to_line_start(src: &str, caret: usize) -> (String, usize) {
     };
 
     if start_d >= d {
-        return (src.to_string(), caret.min(src.len()));
+        return (src.to_string(), d);
     }
 
     // Full clear of a non-list block → one empty slot, no extra blank line.
@@ -511,22 +598,6 @@ fn clear_block_leave_empty(
     };
 
     let next = splice(src, del_start..del_end, replacement);
-    let p2 = project(&next);
-    let caret = p2
-        .blocks
-        .iter()
-        .find(|b| {
-            b.display.start == b.display.end
-                && b.source.start >= del_start.saturating_sub(1)
-                && b.source.start <= del_start + replacement.len() + 1
-        })
-        .or_else(|| {
-            p2.blocks.iter().rev().find(|b| {
-                b.display.start == b.display.end && b.source.start <= del_start
-            })
-        })
-        .map(|b| p2.to_source(b.display.start, Affinity::Inside))
-        .unwrap_or(del_start.min(next.len()));
 
     if !has_prev_content && !has_next_content {
         return collapse_all_empty_doc(&next, 0);
@@ -534,6 +605,7 @@ fn clear_block_leave_empty(
 
     // Collapse accidental double empties between neighbors.
     if has_prev_content && has_next_content {
+        let p2 = project(&next);
         let empties = p2
             .blocks
             .iter()
@@ -541,19 +613,11 @@ fn clear_block_leave_empty(
             .count();
         if empties >= 2 {
             if let Some(collapsed) = collapse_extra_blank(&next) {
-                let p3 = project(&collapsed);
-                let caret = p3
-                    .blocks
-                    .iter()
-                    .find(|b| b.display.start == b.display.end)
-                    .map(|b| p3.to_source(b.display.start, Affinity::Inside))
-                    .unwrap_or(caret.min(collapsed.len()));
-                return (collapsed, caret);
+                return finish(collapsed, ix, 0);
             }
         }
     }
-    let caret = caret.min(next.len());
-    (next, caret)
+    finish(next, ix, 0)
 }
 
 fn collapse_extra_blank(src: &str) -> Option<String> {
@@ -569,21 +633,22 @@ fn collapse_extra_blank(src: &str) -> Option<String> {
 fn collapse_all_empty_doc(src: &str, caret: usize) -> (String, usize) {
     let p = project(src);
     if !p.display.trim().is_empty() {
-        return (src.to_string(), caret.min(src.len()));
+        return (src.to_string(), caret.min(p.display.len()));
     }
     if p.blocks.iter().all(|b| {
         b.display.start == b.display.end || p.display[b.display.clone()].trim().is_empty()
     }) {
         return ("\n".to_string(), 0);
     }
-    (src.to_string(), caret.min(src.len()))
+    (src.to_string(), caret.min(p.display.len()))
 }
 
 /// Backspace. `None` = delete one display char (caller). `Some` = structural.
 pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String, usize)> {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let block = p.block_at_display(d)?;
+    let bix = block_ix(&p, d);
 
     // List items must be handled at item-start even when the caret is not at
     // the start of the whole list block (second+ items have local > 0).
@@ -606,11 +671,11 @@ pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String
                         ));
                     }
                     let has_following = ix + 1 < items.len();
-                    return Some(exit_empty_list_item(src, item, has_following));
+                    return Some(exit_empty_list_item(src, item, has_following, bix));
                 }
                 let body = p.display[item.display.clone()].to_string();
                 let next = splice(src, item.source.clone(), &body);
-                return Some((next, item.source.start));
+                return Some(finish(next, bix, 0));
             }
         }
     }
@@ -626,7 +691,7 @@ pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String
             if block.source.start == 0 {
                 let body = p.display[block.display.clone()].to_string();
                 let next = splice(src, block.source.clone(), &body);
-                return Some((next, block.source.start));
+                return Some(finish(next, bix, 0));
             }
             Some(join_prev(&p, src, block.source.clone()))
         }
@@ -636,7 +701,7 @@ pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String
             }
             let body = p.display[block.display.clone()].to_string();
             let next = splice(src, block.source.clone(), &body);
-            Some((next, block.source.start))
+            Some(finish(next, bix, 0))
         }
         BlockKind::List { .. } => {
             if empty {
@@ -652,11 +717,11 @@ pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String
                 };
                 let _ = lang_body;
                 let next = splice(src, block.source.clone(), &body);
-                Some((next, block.source.start))
+                Some(finish(next, bix, 0))
             } else if local == 0 {
                 let body = p.display[block.display.clone()].to_string();
                 let next = splice(src, block.source.clone(), &body);
-                Some((next, block.source.start))
+                Some(finish(next, bix, 0))
             } else {
                 None
             }
@@ -677,44 +742,28 @@ pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String
 
 /// Notion: Enter/Backspace on an empty list item exits the list into a
 /// paragraph break (splits the list when items remain below).
-fn exit_empty_list_item(src: &str, item: &ListItem, has_following: bool) -> (String, usize) {
+fn exit_empty_list_item(
+    src: &str,
+    item: &ListItem,
+    has_following: bool,
+    bix: usize,
+) -> (String, usize) {
     let del = item.source.clone();
     if has_following {
-        // A lone NBSP paragraph breaks a CommonMark list (blank lines alone don't)
-        // and projects as an empty block once we treat blank Paragraphs as slots.
-        let replacement = "\n\n\u{00A0}\n\n";
+        // A lone NBSP paragraph breaks a CommonMark list (blank lines alone
+        // don't). One `\n` on each side is enough: extra blank lines project
+        // as additional empty slots.
+        let replacement = "\n\u{00A0}\n";
         let next = splice(src, del.clone(), replacement);
-        let inserted = del.start..del.start + replacement.len();
-        let p2 = project(&next);
-        let caret = p2
-            .blocks
-            .iter()
-            .find(|b| {
-                matches!(b.kind, BlockKind::Paragraph | BlockKind::Raw)
-                    && b.display.start == b.display.end
-                    && b.source.start < inserted.end
-                    && b.source.end > inserted.start
-            })
-            .or_else(|| {
-                p2.blocks.iter().find(|b| {
-                    b.display.start == b.display.end
-                        && b.source.start >= del.start.saturating_sub(1)
-                })
-            })
-            .map(|b| p2.to_source(b.display.start, Affinity::Inside))
-            .unwrap_or_else(|| del.start.min(next.len()));
-        return (next, caret);
+        return finish(next, bix + 1, 0);
     }
 
     // Last empty item: remove it without inventing an extra blank.
     // `Hello\n\n- ` must become `Hello\n\n` (not `Hello\n\n\n`).
     let removed = splice(src, del.clone(), "");
     let p2 = project(&removed);
-    if let Some(empty) = p2.blocks.iter().find(|b| {
-        b.display.start == b.display.end && b.source.start >= del.start.saturating_sub(1)
-    }) {
-        let caret = p2.to_source(empty.display.start, Affinity::Inside);
-        return (removed, caret);
+    if let Some(empty_ix) = p2.blocks.iter().position(|b| b.display.start == b.display.end) {
+        return finish(removed, empty_ix, 0);
     }
     // No empty slot yet (e.g. `- item\n- ` → `- item\n`) — add one after.
     insert_empty_paragraph_after(&removed, del.start.min(removed.len()))
@@ -733,24 +782,15 @@ fn delete_empty_block(p: &Projection, src: &str, ix: usize) -> (String, usize) {
     } else if this.source.start > 0 && src.as_bytes()[this.source.start - 1] == b'\n' {
         this.source.start - 1..this.source.start
     } else {
-        return (src.to_string(), this.source.start.min(src.len()));
+        return (src.to_string(), after(src, ix, 0));
     };
 
-    let caret = if ix > 0 {
-        let prev = &p.blocks[ix - 1];
-        p.to_source(prev.display.end, Affinity::Inside)
-    } else {
-        0
-    };
-    let removed = del.end - del.start;
     let next = splice(src, del.clone(), "");
-    let caret = if caret > del.start {
-        caret.saturating_sub(removed)
+    if ix > 0 {
+        finish(next, ix - 1, usize::MAX)
     } else {
-        caret
+        (next, 0)
     }
-    .min(next.len());
-    (next, caret)
 }
 
 fn join_prev(p: &Projection, src: &str, block_src: Range<usize>) -> (String, usize) {
@@ -783,15 +823,12 @@ fn join_prev(p: &Projection, src: &str, block_src: Range<usize>) -> (String, usi
     };
     let span = prev.source.start..this.source.end;
     let next = splice(src, span, &joined);
-    // Place caret at the join boundary inside the rebuilt GFM (accounts for
-    // heading/quote/list wrappers prepended to `prev_disp`).
-    let caret = (prev.source.start + joined.len().saturating_sub(this_disp.len())).min(next.len());
-    (next, caret)
+    finish(next, ix - 1, prev_disp.len())
 }
 
 fn set_item_indent(
     src: &str,
-    _p: &Projection,
+    p: &Projection,
     item_src: Range<usize>,
     indent: usize,
 ) -> (String, usize) {
@@ -800,7 +837,19 @@ fn set_item_indent(
     let pad = "  ".repeat(indent);
     let next_line = format!("{pad}{trimmed}");
     let next = splice(src, item_src.clone(), &next_line);
-    (next, item_src.start + pad.len() + marker_len(trimmed))
+    let d = p
+        .blocks
+        .iter()
+        .find_map(|b| {
+            if let BlockExtra::List { items, .. } = &b.extra {
+                items.iter().find(|it| it.source == item_src).map(|it| it.display.start)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let ix = block_ix(p, d);
+    finish(next, ix, 0)
 }
 
 fn marker_len(line: &str) -> usize {
@@ -820,7 +869,8 @@ fn marker_len(line: &str) -> usize {
 
 pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String, usize) {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
+    let bix = block_ix(&p, d);
     let Some(block) = p.block_at_display(d) else {
         let (n, c) = insert_text(src, caret, None, "\n\n", affinity);
         return (n, c);
@@ -847,8 +897,7 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
                 format!("{left_gfm}\n\n{right_gfm}")
             };
             let next = splice(src, block.source.clone(), &insert);
-            let caret = (block.source.start + left_gfm.len() + 2).min(next.len());
-            (next, caret)
+            finish(next, bix + 1, 0)
         }
         BlockKind::Quote | BlockKind::Alert(_) => {
             let empty_line = body
@@ -867,8 +916,7 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
                 };
                 let insert = format!("{gfm}\n\n");
                 let next = splice(src, block.source.clone(), &insert);
-                let caret = (block.source.start + insert.len()).min(next.len());
-                (next, caret)
+                finish(next, bix + 1, 0)
             } else {
                 insert_text(src, caret, None, "\n", affinity)
             }
@@ -883,7 +931,7 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
                     let text = &p.display[item.display.clone()];
                     // Notion: Enter on an empty item exits the list.
                     if text.trim().is_empty() {
-                        return exit_empty_list_item(src, item, ix + 1 < items.len());
+                        return exit_empty_list_item(src, item, ix + 1 < items.len(), bix);
                     }
                     let item_local = d.saturating_sub(item.display.start).min(text.len());
                     let right = &text[item_local..];
@@ -899,7 +947,17 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
                         .clamp(item.source.start, core_end);
                     let insert = format!("\n{marker}{right}");
                     let next = splice(src, cut..core_end, &insert);
-                    let caret = (cut + 1 + marker.len()).min(next.len());
+                    let p2 = project(&next);
+                    let caret = p2
+                        .blocks
+                        .get(bix)
+                        .and_then(|b| match &b.extra {
+                            BlockExtra::List { items, .. } => {
+                                items.get(ix + 1).or_else(|| items.last()).map(|it| it.display.start)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| after(&next, bix, usize::MAX));
                     return (next, caret);
                 }
             }
@@ -909,7 +967,7 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
         BlockKind::Rule | BlockKind::Html => {
             let insert = "\n\n";
             let next = splice(src, block.source.end..block.source.end, insert);
-            (next, block.source.end + insert.len())
+            finish(next, bix + 1, 0)
         }
         BlockKind::Paragraph | BlockKind::Raw => {
             // Empty block: always create a brand-new empty paragraph below
@@ -925,29 +983,11 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
             let right = body[local.min(body.len())..].trim_start();
             let insert = format!("{left}\n\n{right}");
             let next = splice(src, block.source.clone(), &insert);
-            let p2 = project(&next);
-            // Prefer re-projected caret: empty → new empty slot; split → start
-            // of the right-hand block (raw +2 can sit on a gap and look stuck).
-            let caret = if right.is_empty() {
-                p2.blocks
-                    .iter()
-                    .find(|b| {
-                        b.display.start == b.display.end
-                            && b.source.start >= block.source.start + left.len()
-                    })
-                    .map(|b| p2.to_source(b.display.start, Affinity::Inside))
-                    .unwrap_or_else(|| (block.source.start + left.len() + 1).min(next.len()))
+            if right.is_empty() {
+                finish(next, bix + 1, 0)
             } else {
-                p2.blocks
-                    .iter()
-                    .find(|b| {
-                        b.display.start != b.display.end
-                            && b.source.start >= block.source.start + left.len()
-                    })
-                    .map(|b| p2.to_source(b.display.start, Affinity::Inside))
-                    .unwrap_or_else(|| (block.source.start + left.len() + 2).min(next.len()))
-            };
-            (next, caret)
+                finish(next, bix + 1, 0)
+            }
         }
     }
 }
@@ -976,8 +1016,8 @@ fn insert_empty_paragraph_after(src: &str, at: usize) -> (String, usize) {
                 && b.source.start < inserted.end
                 && b.source.end > inserted.start
         })
-        .map(|b| p.to_source(b.display.start, Affinity::Inside))
-        .unwrap_or_else(|| (at + insert.len()).min(next.len()));
+        .map(|b| b.display.start)
+        .unwrap_or_else(|| p.display.len());
     (next, caret)
 }
 
@@ -989,14 +1029,21 @@ fn insert_empty_paragraph_before(src: &str, at: usize) -> (String, usize) {
         "\n\n"
     };
     let next = splice(src, at..at, insert);
-    (next, at)
+    let p = project(&next);
+    let caret = p
+        .blocks
+        .iter()
+        .find(|b| b.display.start == b.display.end)
+        .map(|b| b.display.start)
+        .unwrap_or(0);
+    (next, caret)
 }
 
 /// Vim/Helix `o` / `O`: always open a new empty paragraph above/below the
 /// current block — never reuse an adjacent empty block.
 pub fn open_line(src: &str, caret: usize, above: bool) -> (String, usize) {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let Some(block) = p.block_at_display(d) else {
         return insert_text(src, caret, None, "\n\n", Affinity::Inside);
     };
@@ -1022,8 +1069,9 @@ fn item_marker(item_src: &str, ordered: bool, checked: Option<bool>) -> String {
 
 pub fn tab(src: &str, caret: usize, shift: bool) -> Option<(String, usize)> {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let block = p.block_at_display(d)?;
+    let bix = block_ix(&p, d);
     match &block.extra {
         BlockExtra::List { items, .. } => {
             let item = items.iter().find(|it| d >= it.display.start && d <= it.display.end)?;
@@ -1032,7 +1080,7 @@ pub fn tab(src: &str, caret: usize, shift: bool) -> Option<(String, usize)> {
                 if item.indent == 0 {
                     let body = p.display[item.display.clone()].to_string();
                     let next = splice(src, item.source.clone(), &body);
-                    return Some((next, item.source.start));
+                    return Some(finish(next, bix, 0));
                 }
                 return Some(set_item_indent(src, &p, item.source.clone(), item.indent - 1));
             }
@@ -1069,20 +1117,20 @@ fn table_tab(
     shift: bool,
 ) -> (String, usize) {
     let Some(cur) = cells.iter().find(|c| d >= c.display.start && d <= c.display.end) else {
-        return (src.to_string(), p.to_source(d, Affinity::Inside));
+        return (src.to_string(), d);
     };
     if shift {
         if let Some(prev) = cells.iter().rev().find(|c| {
             c.row < cur.row || (c.row == cur.row && c.col < cur.col)
         }) {
-            return (src.to_string(), p.to_source(prev.display.start, Affinity::Inside));
+            return (src.to_string(), prev.display.start);
         }
-        return (src.to_string(), p.to_source(cur.display.start, Affinity::Inside));
+        return (src.to_string(), cur.display.start);
     }
     if let Some(next) = cells.iter().find(|c| {
         c.row > cur.row || (c.row == cur.row && c.col > cur.col)
     }) {
-        return (src.to_string(), p.to_source(next.display.start, Affinity::Inside));
+        return (src.to_string(), next.display.start);
     }
     let (headers, body) = table_strings(p, cells, cols);
     let mut body = body;
@@ -1096,12 +1144,10 @@ fn table_tab(
         .iter()
         .find(|b| b.kind == BlockKind::Table)
         .and_then(|b| match &b.extra {
-            BlockExtra::Table { cells, .. } => cells.last().map(|c| {
-                p2.to_source(c.display.start, Affinity::Inside)
-            }),
+            BlockExtra::Table { cells, .. } => cells.last().map(|c| c.display.start),
             _ => None,
         })
-        .unwrap_or(block.source.start + gfm.len());
+        .unwrap_or_else(|| p2.display.len());
     let _ = rows;
     (next, caret)
 }
@@ -1134,8 +1180,8 @@ pub fn toggle_mark(
     mark: Mark,
 ) -> Option<(String, Range<usize>)> {
     let p = project(src);
-    let d0 = p.to_display(sel.start.min(sel.end));
-    let d1 = p.to_display(sel.end.max(sel.start)).min(p.display.len());
+    let d0 = sel.start.min(sel.end).min(p.display.len());
+    let d1 = sel.end.max(sel.start).min(p.display.len());
     if d0 >= d1 {
         return None;
     }
@@ -1147,9 +1193,11 @@ pub fn toggle_mark(
         .get(d0..d1)
         .is_some_and(|s| !s.chars().any(char::is_whitespace));
     if all || (any && wordish) {
-        unmark_display_range(src, &p, d0, d1, mark)
+        let (next, _) = unmark_display_range(src, &p, d0, d1, mark)?;
+        Some((next, d0..d1))
     } else {
-        ensure_mark_display_range(src, &p, d0, d1, mark)
+        let (next, _) = ensure_mark_display_range(src, &p, d0, d1, mark)?;
+        Some((next, d0..d1))
     }
 }
 
@@ -1387,30 +1435,33 @@ fn p_segments_closer(p: &Projection, seg: &crate::display::Segment) -> Range<usi
 
 pub fn apply_link(src: &str, sel: Range<usize>, url: &str) -> (String, usize) {
     let p = project(src);
-    let d0 = p.to_display(sel.start.min(sel.end));
-    let d1 = p.to_display(sel.end.max(sel.start));
+    let d0 = sel.start.min(sel.end).min(p.display.len());
+    let d1 = sel.end.max(sel.start).min(p.display.len());
     let text = p.display.get(d0..d1).unwrap_or("").to_string();
     let range = p.display_range_to_source(d0..d1, Affinity::Inside);
     let replacement = if url.is_empty() {
-        text
+        text.clone()
     } else {
         format!("[{text}]({url})")
     };
     let next = splice(src, range.clone(), &replacement);
-    (next, range.start + replacement.len())
+    let ix = block_ix(&p, d0);
+    let local = d0.saturating_sub(p.blocks.get(ix).map(|b| b.display.start).unwrap_or(0));
+    finish(next, ix, local + text.len())
 }
 
 pub fn set_code_lang(src: &str, caret: usize, lang: &str) -> Option<(String, usize)> {
     let p = project(src);
-    let d = p.to_display(caret);
+    let d = caret.min(p.display.len());
     let block = p.block_at_display(d)?;
+    let ix = block_ix(&p, d);
     let BlockExtra::Code { .. } = &block.extra else {
         return None;
     };
     let body = p.display[block.display.clone()].to_string();
     let gfm = notion::wrap_fence(lang, &body);
     let next = splice(src, block.source.clone(), &gfm);
-    Some((next, block.source.start + 3 + lang.len() + 1))
+    Some(finish(next, ix, 0))
 }
 
 #[cfg(test)]
@@ -1419,16 +1470,19 @@ mod tests {
 
     #[test]
     fn insert_into_heading() {
-        let (out, caret) = insert_text("# Hi", 4, None, "!", Affinity::Inside);
+        let p = project("# Hi");
+        let caret = p.blocks[0].display.end;
+        let (out, at) = insert_text("# Hi", caret, None, "!", Affinity::Inside);
         assert_eq!(out, "# Hi!");
-        assert_eq!(&out[..caret], "# Hi!");
+        let p2 = project(&out);
+        assert_eq!(&p2.display[..at], "Hi!");
     }
 
     #[test]
     fn enter_splits_heading() {
         let src = "# Hello";
         let p = project(src);
-        let caret = p.to_source(p.display.len(), Affinity::Inside);
+        let caret = p.display.len();
         let (out, _) = enter(src, caret, Affinity::Inside, false);
         assert!(out.starts_with("# Hello"), "{out}");
         assert!(out.contains("\n\n"), "{out:?}");
@@ -1439,7 +1493,7 @@ mod tests {
         let src = "para\n\n# ";
         let p = project(src);
         let d = p.blocks.last().unwrap().display.start;
-        let caret = p.to_source(d, Affinity::Inside);
+        let caret = d;
         let (out, _) = backspace(src, caret, Affinity::Inside).expect("join");
         assert!(out.contains("para"), "{out}");
         assert!(!out.contains('#'), "{out}");
@@ -1454,11 +1508,11 @@ mod tests {
             .iter()
             .find(|b| matches!(b.kind, BlockKind::Heading(_)))
             .unwrap();
-        let caret = p.to_source(heading.display.start, Affinity::Inside);
+        let caret = heading.display.start;
         let (out, at) = backspace(src, caret, Affinity::Inside).expect("join");
         assert_eq!(out, "A paragraphLists");
-        assert_eq!(at, "A paragraph".len());
-        assert_eq!(&out[..at], "A paragraph");
+        let p2 = project(&out);
+        assert_eq!(&p2.display[..at], "A paragraph");
         assert!(!out.contains('#'), "{out}");
     }
 
@@ -1466,17 +1520,18 @@ mod tests {
     fn backspace_heading_into_heading_caret() {
         let src = "# Hello\n\n## World";
         let p = project(src);
-        let caret = p.to_source(p.blocks[1].display.start, Affinity::Inside);
+        let caret = p.blocks[1].display.start;
         let (out, at) = backspace(src, caret, Affinity::Inside).expect("join");
         assert_eq!(out, "# HelloWorld");
-        assert_eq!(&out[..at], "# Hello");
+        let p2 = project(&out);
+        assert_eq!(&p2.display[..at], "Hello");
     }
 
     #[test]
     fn open_below_heading_makes_paragraph() {
         let src = "# Hello\n\npara";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.start, Affinity::Inside);
+        let caret = p.blocks[0].display.start;
         let (out, at) = open_line(src, caret, false);
         assert!(out.starts_with("# Hello"), "{out}");
         assert!(out.contains("para"), "{out}");
@@ -1497,7 +1552,7 @@ mod tests {
     fn open_below_always_creates_even_if_next_empty() {
         let src = "hello\n\n";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.start, Affinity::Inside);
+        let caret = p.blocks[0].display.start;
         let before = p.blocks.len();
         let (out, _) = open_line(src, caret, false);
         let after = project(&out).blocks.len();
@@ -1514,7 +1569,7 @@ mod tests {
         assert!(p.blocks.len() >= 2, "{:?}", p.blocks.len());
         let empty = &p.blocks[1];
         assert_eq!(empty.display.start, empty.display.end);
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         let before = p.blocks.len();
         let (out, _) = enter(src, caret, Affinity::Inside, false);
         let after = project(&out).blocks.len();
@@ -1534,7 +1589,7 @@ mod tests {
             panic!("expected list");
         };
         assert_eq!(items.len(), 2);
-        let caret = p.to_source(items[1].display.end, Affinity::Inside);
+        let caret = items[1].display.end;
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         assert!(
             out.contains("next") && !out.contains("- [ ] next") && !out.contains("- [ ]next"),
@@ -1562,7 +1617,7 @@ mod tests {
         };
         // Caret after "hello "
         let d = items[0].display.start + "hello ".len();
-        let caret = p.to_source(d, Affinity::Inside);
+        let caret = d;
         let (out, _) = enter(src, caret, Affinity::Inside, false);
         assert!(
             out.contains("- hello") && out.contains("- world"),
@@ -1574,10 +1629,10 @@ mod tests {
     fn enter_on_empty_before_content_keeps_caret_on_new_empty() {
         let src = "\n\nLists";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.start, Affinity::Inside);
+        let caret = p.blocks[0].display.start;
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert!(
             block.display.start == block.display.end
@@ -1601,7 +1656,7 @@ mod tests {
         let src = "\n\n";
         let p = project(src);
         assert!(p.blocks.len() >= 2);
-        let caret = p.to_source(p.blocks[0].display.start, Affinity::Inside);
+        let caret = p.blocks[0].display.start;
         let before = p.blocks.len();
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         let p2 = project(&out);
@@ -1609,7 +1664,7 @@ mod tests {
             p2.blocks.len() > before,
             "should grow empties: {out:?}"
         );
-        let d = p2.to_display(at);
+        let d = at;
         // Must not still be on the first block.
         assert!(
             d > p2.blocks[0].display.end || (p2.blocks[0].display.is_empty() && d > 0),
@@ -1643,7 +1698,7 @@ mod tests {
             .iter()
             .find(|b| b.display.start == b.display.end)
             .expect("empty");
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         let (out, at) = insert_text(src, caret, None, "NEW", Affinity::Inside);
         let p2 = project(&out);
         let texts: Vec<_> = p2
@@ -1663,7 +1718,7 @@ mod tests {
             !texts.iter().any(|t| t.contains("NEW") && t.contains("Second")),
             "must not soft-join NEW into Second: {texts:?} out={out:?}"
         );
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert_eq!(&p2.display[block.display.clone()], "NEW");
     }
@@ -1677,7 +1732,7 @@ mod tests {
             .iter()
             .find(|b| p.display[b.display.clone()].contains("Hello"))
             .expect("hello");
-        let caret = p.to_source(hello.display.end, Affinity::Inside);
+        let caret = hello.display.end;
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         let (out2, at2) = insert_text(&out, at, None, "NEW", Affinity::Inside);
         let p2 = project(&out2);
@@ -1707,10 +1762,10 @@ mod tests {
     fn enter_mid_paragraph_lands_on_right_half() {
         let src = "Hello world";
         let p = project(src);
-        let mid = p.to_source(p.blocks[0].display.start + 5, Affinity::Inside);
+        let mid = p.blocks[0].display.start + 5;
         let (out, at) = enter(src, mid, Affinity::Inside, false);
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         let text = &p2.display[block.display.clone()];
         assert!(
@@ -1730,7 +1785,7 @@ mod tests {
         let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
             panic!("expected list");
         };
-        let caret = p.to_source(items[0].display.end, Affinity::Inside);
+        let caret = items[0].display.end;
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         let (out2, at2) = insert_text(&out, at, None, "list three", Affinity::Inside);
         assert!(
@@ -1767,10 +1822,10 @@ mod tests {
     fn open_below_keeps_caret_on_new_empty() {
         let src = "hello\n\nLists";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.end, Affinity::Inside);
+        let caret = p.blocks[0].display.end;
         let (out, at) = open_line(src, caret, false);
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert!(
             p2.display[block.display.clone()].trim().is_empty(),
@@ -1793,7 +1848,7 @@ mod tests {
             .iter()
             .find(|b| b.display.start == b.display.end)
             .expect("empty block");
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         let (out, at) = backspace(src, caret, Affinity::Inside).expect("delete empty");
         assert!(
             !out.contains("What's upHello"),
@@ -1810,7 +1865,36 @@ mod tests {
             "next block preserved: {out:?}"
         );
         // Caret at end of previous
-        assert_eq!(&out[..at], "What's up");
+        assert_eq!(&p2.display[..at.min(p2.display.len())], "What's up");
+    }
+
+    #[test]
+    fn delete_last_char_of_middle_paragraph_stays_on_empty() {
+        let src = "1\n\n2\n\n3\n\n4\n\n5";
+        let p = project(src);
+        let three = p
+            .blocks
+            .iter()
+            .find(|b| &p.display[b.display.clone()] == "3")
+            .expect("3");
+        let caret = three.display.end;
+        let (out, at) = delete_char(src, caret, Affinity::Inside);
+        let p2 = project(&out);
+        let block = p2.block_at_display(at).expect("block");
+        assert_eq!(
+            block.display.start, block.display.end,
+            "caret must stay on the emptied slot, not jump: at={at} display={:?} kinds={:?}",
+            p2.display,
+            p2.blocks.iter().map(|b| (b.kind, p2.display[b.display.clone()].to_string())).collect::<Vec<_>>()
+        );
+        let texts: Vec<_> = p2
+            .blocks
+            .iter()
+            .map(|b| p2.display[b.display.clone()].to_string())
+            .collect();
+        assert!(texts.iter().any(|t| t == "2"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "4"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "1" && block.display.start == 0), "must not jump to first block: {texts:?} at={at}");
     }
 
 
@@ -1822,7 +1906,7 @@ mod tests {
         let p = project(src);
         assert!(p.blocks.len() >= 3, "{:?}", p.blocks.len());
         let empty = p.blocks.iter().find(|b| b.display.start == b.display.end).expect("empty");
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
         let p2 = project(&out);
         assert!(p2.display.contains("hello"), "{out:?} display={:?}", p2.display);
@@ -1854,7 +1938,7 @@ mod tests {
 
     fn sel_display(src: &str, d0: usize, d1: usize) -> Range<usize> {
         let p = project(src);
-        p.to_source(d0, Affinity::Inside)..p.to_source(d1, Affinity::Inside)
+        d0..d1
     }
 
     fn assert_no_visible_stars(src: &str) {
@@ -1951,14 +2035,14 @@ mod tests {
             panic!("list");
         };
         assert_eq!(items.len(), 2);
-        let caret = p.to_source(items[1].display.start, Affinity::Inside);
+        let caret = items[1].display.start;
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         assert!(
             !out.contains("- [ ] \n- [ ]"),
             "must not create another empty task: {out:?}"
         );
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert!(
             matches!(block.kind, BlockKind::Paragraph | BlockKind::Raw)
@@ -1980,14 +2064,14 @@ mod tests {
         let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
             panic!("list");
         };
-        let caret = p.to_source(items[1].display.start, Affinity::Inside);
+        let caret = items[1].display.start;
         let (out, at) = backspace(src, caret, Affinity::Inside).expect("exit");
         assert!(
             !out.contains("- [x]") && !out.contains("- [ ] three-"),
             "must not mangle markers: {out:?}"
         );
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert!(
             block.display.start == block.display.end
@@ -2006,7 +2090,7 @@ mod tests {
             panic!("list");
         };
         assert_eq!(items.len(), 3);
-        let caret = p.to_source(items[1].display.start, Affinity::Inside);
+        let caret = items[1].display.start;
         let (out, _) = backspace(src, caret, Affinity::Inside).expect("exit");
         let p2 = project(&out);
         assert!(
@@ -2018,6 +2102,85 @@ mod tests {
             !out.contains("- \n- item 3") && !out.contains("-  \n"),
             "empty bullet gone: {out:?}"
         );
+        let empties = p2
+            .blocks
+            .iter()
+            .filter(|b| b.display.start == b.display.end)
+            .count();
+        assert_eq!(
+            empties, 1,
+            "exactly one empty between lists: blocks={} out={out:?}",
+            p2.blocks.len()
+        );
+    }
+
+    #[test]
+    fn dash_between_lists_stays_paragraph_until_space() {
+        let src = "- item 1\n- \n- item 3\n";
+        let p = project(src);
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!("list");
+        };
+        let caret = items[1].display.start;
+        let (split, at) = backspace(src, caret, Affinity::Inside).expect("exit");
+        let (out, at) = insert_text(&split, at, None, "-", Affinity::Inside);
+        let p2 = project(&out);
+        let kinds: Vec<_> = p2.blocks.iter().map(|b| b.kind).collect();
+        assert!(
+            p2.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Paragraph | BlockKind::Raw)
+                    && p2.display[b.display.clone()].contains('-')),
+            "lone dash must stay a paragraph, not a bullet: kinds={kinds:?} out={out:?} display={:?}",
+            p2.display
+        );
+        assert!(
+            !p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::List { .. })
+                && p2.display[b.display.clone()]
+                    .lines()
+                    .any(|l| l.trim() == "-")),
+            "must not merge dash into a list item: out={out:?} display={:?}",
+            p2.display
+        );
+        let (out2, _) = insert_text(&out, at, None, " ", Affinity::Inside);
+        let p3 = project(&out2);
+        assert!(
+            p3.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::List { .. })),
+            "dash+space becomes a list: out={out2:?}"
+        );
+    }
+
+    #[test]
+    fn dash_after_list_stays_paragraph_until_space() {
+        let src = "- one\n- two\n\n";
+        let p = project(src);
+        let empty = p
+            .blocks
+            .iter()
+            .find(|b| b.display.start == b.display.end)
+            .expect("empty after list");
+        let caret = empty.display.start;
+        let (out, at) = insert_text(src, caret, None, "-", Affinity::Inside);
+        let p2 = project(&out);
+        assert!(
+            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Paragraph)
+                && p2.display[b.display.clone()].contains('-')),
+            "dash after a list must not become a 3rd bullet: out={out:?} display={:?}",
+            p2.display
+        );
+        let (out2, _) = insert_text(&out, at, None, " ", Affinity::Inside);
+        let p3 = project(&out2);
+        let lists = p3
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, BlockKind::List { .. }))
+            .count();
+        assert!(
+            lists >= 2 || p3.blocks.iter().any(|b| matches!(b.kind, BlockKind::List { .. })),
+            "space confirms a new list: out={out2:?}"
+        );
     }
 
     #[test]
@@ -2027,7 +2190,7 @@ mod tests {
         let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
             panic!("list");
         };
-        let caret = p.to_source(items[0].display.end, Affinity::Inside);
+        let caret = items[0].display.end;
         let (out, at) = insert_text(src, caret, None, " ", Affinity::Inside);
         assert_eq!(out, "- something ");
         let p2 = project(&out);
@@ -2036,7 +2199,7 @@ mod tests {
             "trailing space must stay visible: {:?}",
             p2.display
         );
-        assert_eq!(p2.to_display(at), p2.display.len());
+        assert_eq!(at, p2.display.len());
         let (out2, _) = insert_text(&out, at, None, "x", Affinity::Inside);
         assert_eq!(out2, "- something x");
         assert_eq!(project(&out2).display, "something x");
@@ -2046,7 +2209,7 @@ mod tests {
     fn type_hash_after_spaces_in_heading() {
         let src = "# Hello there   ";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.end, Affinity::Inside);
+        let caret = p.blocks[0].display.end;
         let (out, at) = insert_text(src, caret, None, "#", Affinity::Inside);
         let p2 = project(&out);
         assert!(
@@ -2078,10 +2241,10 @@ mod tests {
             .find(|b| b.display.start == b.display.end)
             .expect("empty");
         let before_blocks = p.blocks.len();
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         let (out, at) = insert_text(src, caret, None, "/", Affinity::Inside);
         let p2 = project(&out);
-        let d = p2.to_display(at);
+        let d = at;
         let (out2, _) = delete_display_range(&out, d - 1..d);
         let p3 = project(&out2);
         assert!(
@@ -2096,7 +2259,7 @@ mod tests {
     fn cmd_backspace_clears_paragraph_without_extra_line() {
         let src = "hello there nerd\n\n";
         let p = project(src);
-        let caret = p.to_source(p.blocks[0].display.end, Affinity::Inside);
+        let caret = p.blocks[0].display.end;
         let (out, _) = delete_to_line_start(src, caret);
         let p2 = project(&out);
         assert!(
@@ -2112,7 +2275,7 @@ mod tests {
         let p = project(src);
         assert!(p.blocks.len() >= 3, "{}", p.blocks.len());
         let mid = &p.blocks[1];
-        let caret = p.to_source(mid.display.end, Affinity::Inside);
+        let caret = mid.display.end;
         let (out, at) = delete_to_line_start(src, caret);
         let p2 = project(&out);
         let empties = p2
@@ -2130,7 +2293,7 @@ mod tests {
         );
         assert!(p2.display.contains("above") && p2.display.contains("below"), "{out:?}");
         assert!(!p2.display.contains("hello"), "{out:?}");
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).expect("block");
         assert!(
             block.display.start == block.display.end,
@@ -2172,7 +2335,7 @@ mod tests {
         let mut src = "# Hello there".to_string();
         let mut caret = {
             let p = project(&src);
-            p.to_source(p.blocks[0].display.end, Affinity::Inside)
+            p.blocks[0].display.end
         };
         for ch in [" ", " ", "#"] {
             let (out, at) = insert_text(&src, caret, None, ch, Affinity::Inside);
@@ -2195,7 +2358,7 @@ mod tests {
             panic!("expected list, got {:?}", p.blocks.last().map(|b| b.kind));
         };
         let before = p.blocks.len();
-        let caret = p.to_source(items[0].display.start, Affinity::Inside);
+        let caret = items[0].display.start;
         let (out, at) = backspace(src, caret, Affinity::Inside).expect("exit");
         let p2 = project(&out);
         assert!(
@@ -2210,7 +2373,7 @@ mod tests {
             .filter(|b| b.display.start == b.display.end)
             .count();
         assert_eq!(empties, 1, "exactly one empty: {out:?}");
-        let d = p2.to_display(at);
+        let d = at;
         let block = p2.block_at_display(d).unwrap();
         assert!(
             block.display.start == block.display.end,
@@ -2225,7 +2388,7 @@ mod tests {
         let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
             panic!("list");
         };
-        let caret = p.to_source(items[1].display.start, Affinity::Inside);
+        let caret = items[1].display.start;
         let (out, at) = insert_text(src, caret, None, "-", Affinity::Inside);
         let p2 = project(&out);
         assert!(
@@ -2256,7 +2419,7 @@ mod tests {
     fn slash_not_becomes_note_alert() {
         let src = "/not";
         let p = project(src);
-        let caret = p.to_source(p.display.len(), Affinity::Inside);
+        let caret = p.display.len();
         let (out, _) = apply_slash(src, caret, "> [!NOTE]\n> ");
         assert!(out.contains("> [!NOTE]"), "{out:?}");
         assert!(!out.contains("/no"), "{out:?}");
@@ -2291,7 +2454,7 @@ mod tests {
             .iter()
             .find(|b| matches!(b.kind, BlockKind::Alert(_)))
             .expect("alert");
-        let caret = p.to_source(alert.display.start, Affinity::Inside);
+        let caret = alert.display.start;
         let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
         assert!(
             out.contains("> [!NOTE]"),
@@ -2321,7 +2484,7 @@ mod tests {
         let p = project(src);
         let start = p.blocks[0].display.start;
         let next_d = apply_motion(&p.display, start, Motion::Down, 1, None);
-        let caret = p.to_source(next_d, Affinity::Inside);
+        let caret = next_d;
         let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
         assert!(out.contains("> hello"), "{out:?}");
         assert!(!out.contains("hello> [!NOTE]"), "{out:?}");
@@ -2344,7 +2507,7 @@ mod tests {
             .iter()
             .find(|b| b.display.start == b.display.end)
             .expect("empty");
-        let caret = p.to_source(empty.display.start, Affinity::Inside);
+        let caret = empty.display.start;
         for ch in ["/", "-", "a"] {
             let (out, at) = insert_text(src, caret, None, ch, Affinity::Inside);
             let (out2, _) = delete_char(&out, at, Affinity::Inside);

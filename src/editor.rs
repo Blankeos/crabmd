@@ -355,6 +355,8 @@ pub struct Workspace {
     settings_open: bool,
     settings_pane: SettingsPane,
     scroll_handle: ScrollHandle,
+    /// Keep the caret in view after the next paint. Clicks leave scroll alone.
+    follow_caret: bool,
     surface_h: gpui::Pixels,
     titlebar_moving: bool,
     mouse_anchor: Option<usize>,
@@ -411,6 +413,7 @@ impl Workspace {
             settings_open: false,
             settings_pane: SettingsPane::Editor,
             scroll_handle: ScrollHandle::new(),
+            follow_caret: true,
             surface_h: px(0.),
             titlebar_moving: false,
             mouse_anchor: None,
@@ -496,16 +499,25 @@ impl Workspace {
     }
 
     fn clamp_caret(&mut self) {
-        if self.caret > self.source.len() {
-            self.caret = self.source.len();
+        let n = self.proj().display.len();
+        if self.caret > n {
+            self.caret = n;
         }
         if let Some(sel) = self.sel.as_mut() {
-            sel.start = sel.start.min(self.source.len());
-            sel.end = sel.end.min(self.source.len());
+            sel.start = sel.start.min(n);
+            sel.end = sel.end.min(n);
             if sel.start == sel.end {
                 self.sel = None;
             }
         }
+    }
+
+    fn caret_src(&self) -> usize {
+        self.proj().to_source(self.caret, self.affinity)
+    }
+
+    fn set_caret_src(&mut self, src: usize) {
+        self.caret = self.proj().to_display(src);
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -528,7 +540,8 @@ impl Workspace {
         if self.mode.extends_selection() {
             self.snap_visual_sel();
         }
-        self.scroll_caret_into_view();
+        self.follow_caret = true;
+        self.request_short_block_scroll();
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -538,8 +551,8 @@ impl Workspace {
             return;
         };
         let p = self.proj();
-        let da = p.to_display(anchor);
-        let dc = p.to_display(self.caret);
+        let da = anchor.min(p.display.len());
+        let dc = self.caret.min(p.display.len());
         if self.mode == Mode::VisualLine {
             let a = da.min(dc);
             let b = da.max(dc);
@@ -548,15 +561,14 @@ impl Workspace {
             if end < p.display.len() && p.display.as_bytes()[end] == b'\n' {
                 end += 1;
             }
-            let s = p.display_range_to_source(start..end, Affinity::Inside);
-            self.sel = Some(s);
+            self.sel = Some(start..end);
         } else {
             let a = da.min(dc);
             let b = da.max(dc);
             if a == b {
                 self.sel = None;
             } else {
-                self.sel = Some(p.display_range_to_source(a..b, Affinity::Inside));
+                self.sel = Some(a..b);
             }
         }
     }
@@ -570,7 +582,7 @@ impl Workspace {
     ) {
         let keep_insert = self.mode.is_insert() || self.is_notion();
         self.source = source;
-        self.caret = caret.min(self.source.len());
+        self.caret = project(&self.source).to_display(caret.min(self.source.len()));
         self.sel = None;
         self.visual_anchor = None;
         self.dirty = true;
@@ -585,7 +597,7 @@ impl Workspace {
     }
 
     fn land(&mut self, next: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.caret = next.min(self.source.len());
+        self.caret = next.min(self.proj().display.len());
         if self.mode.extends_selection() {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -598,12 +610,65 @@ impl Workspace {
         self.refresh_raw(window, cx);
     }
 
-    fn scroll_caret_into_view(&self) {
-        let ranges = self.paint_ranges();
-        if let Some(ix) = ranges.iter().position(|r| {
-            r.range.start <= self.caret && (self.caret < r.range.end || r.range.end == self.source.len())
-        }) {
-            self.scroll_handle.scroll_to_item(ix);
+    /// Same-frame scroll for short blocks (new empty line at EOF). Tall
+    /// lists/paragraphs skip this — `scroll_to_item` would snap to their top.
+    fn request_short_block_scroll(&self) {
+        let p = self.proj();
+        let d = self.caret;
+        let Some(ix) = p
+            .blocks
+            .iter()
+            .position(|b| d >= b.display.start && d <= b.display.end)
+        else {
+            return;
+        };
+        let viewport = self.scroll_handle.bounds();
+        if let Some(bounds) = self.scroll_handle.bounds_for_item(ix) {
+            if viewport.size.height > px(0.) && bounds.size.height > viewport.size.height {
+                return;
+            }
+            if viewport.size.height > px(0.) {
+                let offset = self.scroll_handle.offset();
+                let top = bounds.top() + offset.y;
+                let bottom = bounds.bottom() + offset.y;
+                if top >= viewport.top() && bottom <= viewport.bottom() {
+                    return;
+                }
+            }
+        }
+        self.scroll_handle.scroll_to_item(ix);
+    }
+
+    /// Nudge scroll so the caret line is inside the viewport. Never snaps a
+    /// tall list/paragraph to its top (`scroll_to_item` does that).
+    fn ensure_caret_visible(&mut self, cx: &mut Context<Self>) {
+        let viewport = self.scroll_handle.bounds();
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+        if self.hits.is_empty() {
+            return;
+        }
+        let d = self.caret;
+        let Some((caret_top, line_h)) = surface::caret_screen_y(&self.hits, d) else {
+            self.follow_caret = false;
+            return;
+        };
+        self.follow_caret = false;
+        let caret_bottom = caret_top + line_h;
+        let margin = (line_h * 0.5).max(px(4.));
+        let mut offset = self.scroll_handle.offset();
+        let mut changed = false;
+        if caret_top < viewport.top() + margin {
+            offset.y += viewport.top() + margin - caret_top;
+            changed = true;
+        } else if caret_bottom > viewport.bottom() - margin {
+            offset.y -= caret_bottom - (viewport.bottom() - margin);
+            changed = true;
+        }
+        if changed {
+            self.scroll_handle.set_offset(offset);
+            cx.notify();
         }
     }
 
@@ -632,7 +697,7 @@ impl Workspace {
 
     fn apply_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         self.source = snap.source;
-        self.caret = snap.caret.min(self.source.len());
+        self.caret = snap.caret.min(project(&self.source).display.len());
         self.sel = snap.sel;
         self.insert_origin = None;
         self.clear_pending();
@@ -681,7 +746,7 @@ impl Workspace {
         self.push_doc_undo();
         let (next, caret) = wysiwyg::enter(&self.source, self.caret, self.affinity, hard);
         self.source = next;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
@@ -690,13 +755,11 @@ impl Workspace {
     }
 
     pub fn click_display(&mut self, d: usize, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let p = self.proj();
-        let src = p.to_source(d, Affinity::Inside);
         if shift {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
             }
-            self.caret = src;
+            self.caret = d;
             self.mode = if self.config.editor == EditorKind::Helix {
                 Mode::Select
             } else if self.config.editor.is_modal() {
@@ -706,8 +769,8 @@ impl Workspace {
             };
             self.snap_visual_sel();
         } else {
-            self.caret = src;
-            self.mouse_anchor = Some(src);
+            self.caret = d;
+            self.mouse_anchor = Some(d);
             self.affinity = Affinity::Inside;
             if !self.mode.is_insert() && self.config.editor.is_modal() {
                 self.mode = Mode::Normal;
@@ -718,18 +781,19 @@ impl Workspace {
             }
         }
         self.mouse_dragging = true;
-        self.refresh(window, cx);
+        self.clamp_caret();
+        self.follow_caret = false;
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     pub fn drag_display(&mut self, d: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.mouse_dragging {
             return;
         }
-        let p = self.proj();
-        let src = p.to_source(d, Affinity::Inside);
         let anchor = self.mouse_anchor.unwrap_or(self.caret);
         self.visual_anchor = Some(anchor);
-        self.caret = src;
+        self.caret = d;
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             self.mode = if self.config.editor == EditorKind::Helix {
                 Mode::Select
@@ -738,12 +802,15 @@ impl Workspace {
             };
         }
         self.snap_visual_sel();
-        self.refresh(window, cx);
+        self.clamp_caret();
+        self.follow_caret = false;
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     fn commit_edit(&mut self, source: String, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.source = source;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
@@ -753,7 +820,7 @@ impl Workspace {
 
     fn slash_query(&self) -> Option<String> {
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let block = p.block_at_display(d)?;
         let body = &p.display[block.display.clone()];
         let local = d.saturating_sub(block.display.start).min(body.len());
@@ -789,7 +856,7 @@ impl Workspace {
         self.push_doc_undo();
         let (next, caret) = wysiwyg::apply_slash(&self.source, self.caret, item.template);
         self.source = next;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
@@ -800,7 +867,7 @@ impl Workspace {
     fn close_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (next, caret) = wysiwyg::clear_slash_query(&self.source, self.caret);
         self.source = next;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
@@ -810,7 +877,7 @@ impl Workspace {
 
     fn leave_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_notion() {
-            self.scroll_caret_into_view();
+            self.follow_caret = true;
             cx.notify();
             return;
         }
@@ -842,8 +909,8 @@ impl Workspace {
         self.clear_pending();
         match caret {
             Caret::Start => self.caret = 0,
-            Caret::End => self.caret = self.source.len(),
-            Caret::Offset(n) => self.caret = n.min(self.source.len()),
+            Caret::End => self.caret = self.proj().display.len(),
+            Caret::Offset(n) => self.caret = n.min(self.proj().display.len()),
         }
         self.refresh(window, cx);
     }
@@ -871,7 +938,7 @@ impl Workspace {
         let count = take_count(&mut self.pending_count);
         self.pending_g = false;
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let wrap = self.wrap_cols();
         let mut next_d = apply_motion(&p.display, d, motion, count, wrap);
         let insert_like = self.mode.is_insert() || self.is_notion();
@@ -891,7 +958,7 @@ impl Workspace {
         } else {
             self.affinity = Affinity::Inside;
         }
-        let next = p.to_source(next_d, self.affinity);
+        let next = next_d;
         if extend {
             if self.is_modal_nav() && !self.mode.is_visual() {
                 self.mode = if self.config.editor == EditorKind::Helix {
@@ -928,7 +995,8 @@ impl Workspace {
         } else {
             0
         };
-        self.land(pos, window, cx);
+        let d = project(&self.source).to_display(pos);
+        self.land(d, window, cx);
     }
 
     fn click_range(&mut self, range: Range<usize>, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1022,7 +1090,7 @@ impl Workspace {
         window.prevent_default();
         let off = {
             let p = self.proj();
-            let d = p.to_display(self.caret);
+            let d = self.caret;
             // Stay on this logical line — never jump to the next block.
             let d2 = after_caret_same_line(&p.display, d);
             p.to_source(d2, Affinity::Inside)
@@ -1035,7 +1103,7 @@ impl Workspace {
             return;
         }
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let range = logical_line_range(&p.display, d);
         let off = first_non_blank_in(&p.display, range);
         let off = p.to_source(off, Affinity::Inside);
@@ -1047,7 +1115,7 @@ impl Workspace {
             return;
         }
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let end = logical_line_range(&p.display, d).end;
         let off = p.to_source(end, Affinity::Inside);
         self.enter_insert(Caret::Offset(off), window, cx);
@@ -1403,7 +1471,7 @@ impl Workspace {
             self.affinity,
         );
         self.source = next;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
@@ -1423,7 +1491,7 @@ impl Workspace {
         }
         window.prevent_default();
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         if d == 0 {
             return;
         }
@@ -1453,7 +1521,7 @@ impl Workspace {
             return;
         }
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let start_d = logical_line_range(&p.display, d).start;
         if start_d >= d {
             // At line start — delete previous newline (join) via normal backspace.
@@ -1491,7 +1559,7 @@ impl Workspace {
             return;
         }
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         if d == 0 {
             return;
         }
@@ -1546,7 +1614,7 @@ impl Workspace {
     ) {
         let Some((query, _)) = self.last_search.clone() else { return };
         let p = self.proj();
-        let from = p.to_display(self.caret);
+        let from = self.caret;
         let found = if forward {
             let start = if from < p.display.len() { from + 1 } else { 0 };
             search_next(&p.display, start, &query, wrap)
@@ -1558,7 +1626,7 @@ impl Workspace {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
             self.sel = None;
-            self.caret = p.to_source(range.start, Affinity::Inside);
+            self.caret = range.start;
             self.refresh(window, cx);
         } else {
             self.status = format!("no match: {query}").into();
@@ -1718,7 +1786,7 @@ impl Workspace {
         let Some(dir) = self.pending_bracket.take() else { return };
         let count = take_count(&mut self.pending_count);
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let next_d = match key {
             "p" => {
                 let src_next = paragraph_jump(&p.display, d, dir, count);
@@ -1929,14 +1997,14 @@ impl Workspace {
             .unwrap_or("image");
         let line = images::gfm_image(alt, filename);
         self.push_doc_undo();
-        let at = self.caret.min(self.source.len());
+        let at = self.caret_src();
         let insert = if at > 0 && !self.source[..at].ends_with('\n') {
             format!("\n{line}\n")
         } else {
             format!("{line}\n")
         };
         self.source = splice(&self.source, at..at, &insert);
-        self.caret = at + insert.len();
+        self.set_caret_src(at + insert.len());
         self.dirty = true;
         self.status = "unsaved".into();
         self.refresh(window, cx);
@@ -2721,10 +2789,8 @@ impl Workspace {
     ) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let d_caret = p.to_display(self.caret);
-        let d_sel = self.sel.as_ref().map(|s| {
-            p.to_display(s.start.min(s.end))..p.to_display(s.end.max(s.start))
-        });
+        let d_caret = self.caret;
+        let d_sel = self.sel.clone();
         let d_marked = self.marked.clone();
         let local_caret = if d_caret >= display.start && d_caret <= display.end {
             Some(d_caret - display.start)
@@ -2801,7 +2867,7 @@ impl Workspace {
         let text = p.display.get(block.display.clone()).unwrap_or("").to_string();
         let empty = text.trim().is_empty() && !block.extra.is_atomic();
         let caret_here = {
-            let d = p.to_display(self.caret);
+            let d = self.caret;
             d >= block.display.start && d <= block.display.end
         };
         // Only show the empty-block hint on the focused row (less noisy).
@@ -2826,7 +2892,7 @@ impl Workspace {
             is_code,
             cx,
         );
-        let slash = self.slash_is_open() && p.block_at_display(p.to_display(self.caret)).map(|b| b.source == block.source).unwrap_or(false);
+        let slash = self.slash_is_open() && p.block_at_display(self.caret).map(|b| b.source == block.source).unwrap_or(false);
         match &block.extra {
             BlockExtra::Alert(kind) => {
                 let color = pal.alert_color(*kind);
@@ -3049,7 +3115,7 @@ impl Workspace {
                 grid[c.row][c.col] = Some(c.clone());
             }
         }
-        let in_table = p.table_cell_at(p.to_display(self.caret)).is_some();
+        let in_table = p.table_cell_at(self.caret).is_some();
         v_flex()
             .w_full()
             .min_w_0()
@@ -3120,7 +3186,7 @@ impl Workspace {
 
     fn table_insert(&mut self, col: bool, before: bool, window: &mut Window, cx: &mut Context<Self>) {
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let Some((block, cell)) = p.table_cell_at(d) else { return };
         let BlockExtra::Table { cells, cols, .. } = &block.extra else { return };
         let cols = *cols;
@@ -3159,7 +3225,7 @@ impl Workspace {
 
     fn delete_current_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let Some(block) = p.block_at_display(d) else { return };
         if !matches!(block.kind, BlockKind::Table) { return; }
         self.push_doc_undo();
@@ -3209,7 +3275,7 @@ impl Workspace {
             p.block_at_display(d0)
                 .is_some_and(|b| b.source == this.source)
         } else if self.link_open {
-            let d = p.to_display(self.caret);
+            let d = self.caret;
             p.block_at_display(d)
                 .is_some_and(|b| b.source == this.source)
         } else {
@@ -3374,7 +3440,7 @@ impl Workspace {
             if let Some((next, range)) = wysiwyg::toggle_mark(&self.source, sel, mark) {
                 self.push_doc_undo();
                 self.source = next;
-                self.caret = range.end;
+                self.caret = range.end.min(self.proj().display.len());
                 self.sel = Some(range);
                 self.dirty = true;
                 self.status = "unsaved".into();
@@ -3529,10 +3595,10 @@ impl EntityInputHandler for Workspace {
             return None;
         }
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let range = if let Some(sel) = &self.sel {
-            let a = p.to_display(sel.start.min(sel.end));
-            let b = p.to_display(sel.end.max(sel.start));
+            let a = sel.start.min(sel.end);
+            let b = sel.end.max(sel.start);
             Self::offset_to_utf16(&p.display, a)..Self::offset_to_utf16(&p.display, b)
         } else {
             let u = Self::offset_to_utf16(&p.display, d);
@@ -3575,11 +3641,11 @@ impl EntityInputHandler for Workspace {
         let display_range = if let Some(r) = range_utf16 {
             Self::offset_from_utf16(&p.display, r.start)..Self::offset_from_utf16(&p.display, r.end)
         } else if let Some(sel) = &self.sel {
-            p.to_display(sel.start.min(sel.end))..p.to_display(sel.end.max(sel.start))
+            sel.start.min(sel.end)..sel.end.max(sel.start)
         } else if let Some(m) = &self.marked {
             m.clone()
         } else {
-            let d = p.to_display(self.caret);
+            let d = self.caret;
             d..d
         };
         if text.is_empty() {
@@ -3589,7 +3655,7 @@ impl EntityInputHandler for Workspace {
             if self.insert_origin.is_none() {
                 self.insert_origin = Some(self.snapshot());
             }
-            let (next, caret) = if display_range.end == p.to_display(self.caret)
+            let (next, caret) = if display_range.end == self.caret
                 && display_range.end - display_range.start == p.display[..display_range.end]
                     .chars()
                     .next_back()
@@ -3601,7 +3667,7 @@ impl EntityInputHandler for Workspace {
                 wysiwyg::delete_display_range(&self.source, display_range)
             };
             self.source = next;
-            self.caret = caret.min(self.source.len());
+            self.caret = caret.min(self.proj().display.len());
             self.sel = None;
             self.marked = None;
             self.dirty = true;
@@ -3633,7 +3699,7 @@ impl EntityInputHandler for Workspace {
             (next, src_range.start + insert.len())
         };
         self.source = next;
-        self.caret = caret.min(self.source.len());
+        self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.marked = None;
         self.dirty = true;
@@ -3657,7 +3723,7 @@ impl EntityInputHandler for Workspace {
     ) {
         self.replace_text_in_range(range_utf16, new_text, window, cx);
         let p = self.proj();
-        let d = p.to_display(self.caret);
+        let d = self.caret;
         let start = d.saturating_sub(new_text.len());
         self.marked = if new_text.is_empty() {
             None
@@ -3667,7 +3733,7 @@ impl EntityInputHandler for Workspace {
         if let Some(sel) = new_selected_range {
             let a = start + Self::offset_from_utf16(new_text, sel.start);
             let b = start + Self::offset_from_utf16(new_text, sel.end);
-            self.caret = p.to_source(b.min(p.display.len()), self.affinity);
+            self.caret = b.min(p.display.len());
             let _ = a;
         }
         cx.notify();
@@ -3862,6 +3928,9 @@ impl Render for Workspace {
                                 if h > px(0.) && this.surface_h != h {
                                     this.surface_h = h;
                                     cx.notify();
+                                }
+                                if this.follow_caret {
+                                    this.ensure_caret_visible(cx);
                                 }
                             });
                         }
