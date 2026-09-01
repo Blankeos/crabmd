@@ -463,11 +463,43 @@ fn content_point(src: &str, r: &PaintRange) -> Range<usize> {
             let start = r.range.end.saturating_sub(text.len()).min(src.len());
             start..start
         }
+        BlockKind::Quote | BlockKind::Alert(_) => {
+            let at = quote_body_point(slice, r.range.start, matches!(r.kind, BlockKind::Alert(_)));
+            at..at
+        }
         _ => {
             let p = r.range.start.min(src.len());
             p..p
         }
     }
+}
+
+fn quote_prefix_len(line: &str) -> usize {
+    if line.starts_with("> ") {
+        2
+    } else if line.starts_with('>') {
+        1
+    } else {
+        0
+    }
+}
+
+/// Byte offset in `src` where quote/alert body text should be inserted.
+fn quote_body_point(slice: &str, abs_start: usize, skip_alert_label: bool) -> usize {
+    let mut offset = 0usize;
+    if skip_alert_label {
+        if let Some(first) = slice.lines().next() {
+            if first.contains("[!") && first.contains(']') {
+                offset += first.len();
+                if slice.as_bytes().get(first.len()) == Some(&b'\n') {
+                    offset += 1;
+                }
+            }
+        }
+    }
+    let rest = slice.get(offset..).unwrap_or("");
+    let line = rest.split('\n').next().unwrap_or("");
+    (abs_start + offset + quote_prefix_len(line)).min(abs_start + slice.len())
 }
 
 fn project_block(
@@ -776,6 +808,7 @@ fn project_inlines(
     let mut item_checked: Option<bool> = None;
     let mut saw_list = false;
     let mut skip_alert_label = matches!(r.kind, BlockKind::Alert(_));
+    let mut skip_alert_break = false;
     let mut after_item = false;
 
     for (event, range) in parser {
@@ -841,6 +874,7 @@ fn project_inlines(
             Event::Text(t) => {
                 if skip_alert_label && is_alert_label(&t) {
                     skip_alert_label = false;
+                    skip_alert_break = true;
                     continue;
                 }
                 skip_alert_label = false;
@@ -866,6 +900,10 @@ fn project_inlines(
                 );
             }
             Event::SoftBreak | Event::HardBreak => {
+                if skip_alert_label || skip_alert_break {
+                    skip_alert_break = false;
+                    continue;
+                }
                 let d0 = display.len();
                 display.push('\n');
                 segments.push(Segment {
@@ -889,9 +927,13 @@ fn project_inlines(
 }
 
 fn is_alert_label(t: &str) -> bool {
-    let u = t.trim().trim_start_matches('!').to_ascii_uppercase();
+    let inner = t
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_start_matches('!');
     matches!(
-        u.as_str(),
+        inner.to_ascii_uppercase().as_str(),
         "NOTE" | "TIP" | "IMPORTANT" | "WARNING" | "CAUTION"
     )
 }
@@ -1165,6 +1207,32 @@ mod tests {
         assert_eq!(p.display, "something ");
         let p = project("1. something ");
         assert_eq!(p.display, "something ");
+    }
+
+    #[test]
+    fn empty_alert_caret_is_in_body() {
+        let src = "> [!NOTE]\n>";
+        let p = project(src);
+        assert!(
+            matches!(p.blocks[0].kind, BlockKind::Alert(_)),
+            "{:?}",
+            p.blocks[0].kind
+        );
+        assert!(
+            p.display.trim().is_empty(),
+            "label is chrome, not display: {:?}",
+            p.display
+        );
+        let at = p.to_source(p.blocks[0].display.start, Affinity::Inside);
+        assert!(
+            at > src.find("[!NOTE]").unwrap(),
+            "caret after label, got {at} in {src:?}"
+        );
+        assert!(
+            src[..at].ends_with("> ") || src[..at].ends_with('>'),
+            "caret on body line: {:?} at={at}",
+            &src[..at]
+        );
     }
 
     #[test]

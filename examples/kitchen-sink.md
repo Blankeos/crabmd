@@ -19,7 +19,9 @@ A paragraph with **bold**, *italic*, ~~strikethrough~~, `inline code`, and a [li
 
 GitHub-style note.
 
- > [!TIP]
+a
+
+> [!TIP]
 > GitHub-style tip.
 
 > [!IMPORTANT]
@@ -51,11 +53,4 @@ fn main() {
 
 Visit <https://github.github.com/gfm/>.
 
-#
-
-> [!NOTE]
->
-
-# asd
-
-# carlo is cool
+# 

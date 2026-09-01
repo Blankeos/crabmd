@@ -84,6 +84,16 @@ pub fn insert_text(
         if matches!(block.kind, BlockKind::Heading(_)) && d == block.display.end {
             return append_at_heading_body_end(src, block.source.clone(), text);
         }
+        if matches!(block.kind, BlockKind::Quote | BlockKind::Alert(_)) {
+            let raw = src.get(block.source.clone()).unwrap_or("");
+            let body = match block.kind {
+                BlockKind::Alert(_) => notion::strip_alert_body(raw),
+                _ => notion::strip_quote(raw),
+            };
+            if body.trim().is_empty() {
+                return fill_empty_quote_or_alert(src, block, text);
+            }
+        }
     }
     let s = p.to_source(d, affinity);
     let next = splice(src, s..s, text);
@@ -112,6 +122,25 @@ fn append_at_heading_body_end(src: &str, block: Range<usize>, text: &str) -> (St
     let at = (block.start + line.len()).min(src.len());
     let next = splice(src, at..at, text);
     (next, at + text.len())
+}
+
+fn fill_empty_quote_or_alert(
+    src: &str,
+    block: &crate::display::ProjBlock,
+    text: &str,
+) -> (String, usize) {
+    let slice = src.get(block.source.clone()).unwrap_or("");
+    let mut gfm = match block.kind {
+        BlockKind::Alert(k) => notion::wrap_alert(k, text),
+        BlockKind::Quote => notion::wrap_quote(text),
+        _ => text.to_string(),
+    };
+    if slice.ends_with('\n') && !gfm.ends_with('\n') {
+        gfm.push('\n');
+    }
+    let next = splice(src, block.source.clone(), &gfm);
+    let caret = (block.source.start + gfm.trim_end_matches('\n').len()).min(next.len());
+    (next, caret)
 }
 
 fn fill_empty_list_item(src: &str, item: &ListItem, text: &str) -> (String, usize) {
@@ -255,6 +284,59 @@ fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str) -> (String, u
 
     let next = splice(src, content_end..next_content, &rep);
     let caret = caret.min(next.len());
+    (next, caret)
+}
+
+fn slash_query_display(p: &Projection, caret: usize) -> Option<(Range<usize>, Range<usize>)> {
+    let d = p.to_display(caret);
+    let block = p.block_at_display(d)?;
+    let body = p.display.get(block.display.clone())?;
+    let local = d.saturating_sub(block.display.start).min(body.len());
+    let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let rel = body[line_start..local].rfind('/')?;
+    let d0 = block.display.start + line_start + rel;
+    let d1 = block.display.start + local;
+    Some((d0..d1, block.source.clone()))
+}
+
+/// Drop the `/query` at `caret`. Whole-block queries become one empty slot.
+pub fn clear_slash_query(src: &str, caret: usize) -> (String, usize) {
+    let p = project(src);
+    let Some((display, _)) = slash_query_display(&p, caret) else {
+        return (src.to_string(), caret.min(src.len()));
+    };
+    if let Some(block) = p.block_at_display(display.start) {
+        if display.start <= block.display.start && display.end >= block.display.end {
+            return clear_block_leave_empty(src, &p, block);
+        }
+    }
+    delete_display_range(src, display)
+}
+
+/// Replace `/query` with a slash-menu template (GFM).
+pub fn apply_slash(src: &str, caret: usize, template: &str) -> (String, usize) {
+    if template.is_empty() {
+        return clear_slash_query(src, caret);
+    }
+    let p = project(src);
+    let Some((display, source)) = slash_query_display(&p, caret) else {
+        return insert_text(src, caret, None, template, Affinity::Inside);
+    };
+    if let Some(block) = p.block_at_display(display.start) {
+        if block.source == source && display.start <= block.display.start && display.end >= block.display.end {
+            let slice = src.get(block.source.clone()).unwrap_or("");
+            let mut gfm = template.to_string();
+            if slice.ends_with('\n') && !gfm.ends_with('\n') {
+                gfm.push('\n');
+            }
+            let next = splice(src, block.source.clone(), &gfm);
+            let caret = (block.source.start + gfm.trim_end_matches('\n').len()).min(next.len());
+            return (next, caret);
+        }
+    }
+    let range = p.display_range_to_source(display, Affinity::Inside);
+    let next = splice(src, range.clone(), template);
+    let caret = (range.start + template.len()).min(next.len());
     (next, caret)
 }
 
@@ -1053,58 +1135,233 @@ pub fn toggle_mark(
 ) -> Option<(String, Range<usize>)> {
     let p = project(src);
     let d0 = p.to_display(sel.start.min(sel.end));
-    let d1 = p.to_display(sel.end.max(sel.start));
-    if d0 == d1 {
+    let d1 = p.to_display(sel.end.max(sel.start)).min(p.display.len());
+    if d0 >= d1 {
         return None;
     }
-    let all = (d0..d1).all(|i| {
-        if i >= p.display.len() {
-            return false;
-        }
-        mark.has(p.marks_at(i, Affinity::Inside))
-    });
-    let (open, close) = mark.wrap();
-    if all {
-        let mut next = src.to_string();
-        let segs: Vec<_> = p
-            .segments
-            .iter()
-            .filter(|s| s.display.start < d1 && s.display.end > d0 && mark.has(s.marks))
-            .cloned()
-            .collect();
-        for seg in segs.into_iter().rev() {
-            let closer = p_segments_closer(&p, &seg);
-            let opener = p_segments_opener(&p, &seg);
-            // Prefer the delimiter immediately after the marked span (EOL-safe).
-            if closer.start + close.len() <= next.len()
-                && next.get(closer.start..closer.start + close.len()) == Some(close)
-            {
-                next.replace_range(closer.start..closer.start + close.len(), "");
-            } else if closer.end > closer.start && closer.end <= next.len() {
-                let at = closer.end.saturating_sub(close.len());
-                if at >= closer.start && next.get(at..closer.end) == Some(close) {
-                    next.replace_range(at..closer.end, "");
-                }
-            }
-            if opener.start + open.len() <= next.len()
-                && next.get(opener.start..opener.start + open.len()) == Some(open)
-            {
-                next.replace_range(opener.start..opener.start + open.len(), "");
-            }
-        }
-        let p2 = project(&next);
-        let caret = p2.to_source(d0.min(p2.display.len()), Affinity::Inside);
-        let end = p2.to_source(d1.min(p2.display.len()), Affinity::Inside);
-        Some((next, caret..end))
+    let marked = |i| mark.has(p.marks_at(i, Affinity::Inside));
+    let all = (d0..d1).all(marked);
+    let any = (d0..d1).any(marked);
+    let wordish = p
+        .display
+        .get(d0..d1)
+        .is_some_and(|s| !s.chars().any(char::is_whitespace));
+    if all || (any && wordish) {
+        unmark_display_range(src, &p, d0, d1, mark)
     } else {
-        let range = p.display_range_to_source(d0..d1, Affinity::Inside);
-        let mut next = src.to_string();
-        next.insert_str(range.end, close);
-        next.insert_str(range.start, open);
-        let start = range.start + open.len();
-        let end = range.end + open.len();
-        Some((next, start..end))
+        ensure_mark_display_range(src, &p, d0, d1, mark)
     }
+}
+
+fn marked_segs(p: &Projection, d0: usize, d1: usize, mark: Mark) -> Vec<crate::display::Segment> {
+    p.segments
+        .iter()
+        .filter(|s| s.display.start < d1 && s.display.end > d0 && mark.has(s.marks))
+        .cloned()
+        .collect()
+}
+
+fn mark_delims(mark: Mark) -> &'static [&'static str] {
+    match mark {
+        Mark::Bold => &["**", "__"],
+        Mark::Italic => &["*", "_"],
+        Mark::Strike => &["~~"],
+        Mark::Code => &["`"],
+    }
+}
+
+fn remove_delim(next: &mut String, gap: Range<usize>, delim: &str) -> bool {
+    if delim.is_empty() || gap.start > next.len() {
+        return false;
+    }
+    let start = gap.start.min(next.len());
+    let end = gap.end.min(next.len()).max(start);
+    if start + delim.len() <= next.len() && next.get(start..start + delim.len()) == Some(delim) {
+        next.replace_range(start..start + delim.len(), "");
+        return true;
+    }
+    if end > start {
+        let at = end.saturating_sub(delim.len());
+        if at >= start && at <= next.len() && end <= next.len() && next.get(at..end) == Some(delim) {
+            next.replace_range(at..end, "");
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_mark_delim(next: &mut String, gap: Range<usize>, mark: Mark) {
+    for delim in mark_delims(mark) {
+        if remove_delim(next, gap.clone(), delim) {
+            return;
+        }
+    }
+}
+
+fn display_prev(s: &str, i: usize) -> usize {
+    s.get(..i)
+        .and_then(|pre| pre.char_indices().next_back().map(|(j, _)| j))
+        .unwrap_or(0)
+}
+
+fn display_next(s: &str, i: usize) -> usize {
+    s.get(i..)
+        .and_then(|rest| rest.chars().next().map(|c| i + c.len_utf8()))
+        .unwrap_or(s.len())
+}
+
+fn is_ws_at(s: &str, i: usize) -> bool {
+    s.get(i..)
+        .and_then(|rest| rest.chars().next())
+        .map(|c| c.is_whitespace())
+        .unwrap_or(false)
+}
+
+/// CommonMark closers cannot be preceded by whitespace (`**foo **` shows stars).
+fn skip_ws_left(s: &str, mut i: usize) -> usize {
+    while i > 0 {
+        let prev = display_prev(s, i);
+        if !is_ws_at(s, prev) {
+            break;
+        }
+        i = prev;
+    }
+    i
+}
+
+/// CommonMark openers cannot be followed by whitespace (`** foo**` shows stars).
+fn skip_ws_right(s: &str, mut i: usize) -> usize {
+    while i < s.len() && is_ws_at(s, i) {
+        i = display_next(s, i);
+    }
+    i
+}
+
+fn flanking_ok(mark: Mark) -> bool {
+    !matches!(mark, Mark::Code)
+}
+
+fn extend_marked(p: &Projection, mut left: usize, mut right: usize, mark: Mark) -> (usize, usize) {
+    while left > 0 {
+        let prev = display_prev(&p.display, left);
+        if p.display.as_bytes().get(prev) == Some(&b'\n') {
+            break;
+        }
+        if !mark.has(p.marks_at(prev, Affinity::Inside)) {
+            break;
+        }
+        left = prev;
+    }
+    while right < p.display.len() {
+        if p.display.as_bytes().get(right) == Some(&b'\n') {
+            break;
+        }
+        if !mark.has(p.marks_at(right, Affinity::Inside)) {
+            break;
+        }
+        right = display_next(&p.display, right);
+    }
+    (left, right)
+}
+
+fn unmark_display_range(
+    src: &str,
+    p: &Projection,
+    d0: usize,
+    d1: usize,
+    mark: Mark,
+) -> Option<(String, Range<usize>)> {
+    let (open, close) = mark.wrap();
+    let mut next = src.to_string();
+    for seg in marked_segs(p, d0, d1, mark).into_iter().rev() {
+        let vis_start = d0.max(seg.display.start);
+        let vis_end = d1.min(seg.display.end);
+        if vis_start >= vis_end {
+            continue;
+        }
+        let closer = p_segments_closer(p, &seg);
+        let opener = p_segments_opener(p, &seg);
+        let full_start = vis_start == seg.display.start;
+        let full_end = vis_end == seg.display.end;
+        if full_start && full_end {
+            remove_mark_delim(&mut next, closer, mark);
+            remove_mark_delim(&mut next, opener, mark);
+            continue;
+        }
+        let mut keep_start = vis_start;
+        let mut keep_end = vis_end;
+        if flanking_ok(mark) {
+            if !full_start {
+                keep_start = skip_ws_left(&p.display, vis_start);
+            }
+            if !full_end {
+                keep_end = skip_ws_right(&p.display, vis_end);
+            }
+        }
+        let drop_open = full_start || keep_start <= seg.display.start;
+        let drop_close = full_end || keep_end >= seg.display.end;
+        if drop_open && drop_close {
+            remove_mark_delim(&mut next, closer, mark);
+            remove_mark_delim(&mut next, opener, mark);
+            continue;
+        }
+        if drop_open {
+            // Keep a suffix: insert a new opener at keep_end, drop the original opener.
+            let at = p.to_source(keep_end, Affinity::Inside).min(next.len());
+            next.insert_str(at, open);
+            remove_mark_delim(&mut next, opener, mark);
+        } else if drop_close {
+            // Keep a prefix: insert a new closer at keep_start, drop the original closer.
+            let at = p.to_source(keep_start, Affinity::Inside).min(next.len());
+            next.insert_str(at, close);
+            let shifted = closer.start.saturating_add(close.len())..closer.end.saturating_add(close.len());
+            remove_mark_delim(&mut next, shifted, mark);
+        } else {
+            let at_end = p.to_source(keep_end, Affinity::Inside).min(next.len());
+            let at_start = p.to_source(keep_start, Affinity::Inside).min(at_end);
+            next.insert_str(at_end, open);
+            next.insert_str(at_start, close);
+        }
+    }
+    let p2 = project(&next);
+    let caret = p2.to_source(d0.min(p2.display.len()), Affinity::Inside);
+    let end = p2.to_source(d1.min(p2.display.len()), Affinity::Inside);
+    Some((next, caret..end))
+}
+
+fn ensure_mark_display_range(
+    src: &str,
+    p: &Projection,
+    d0: usize,
+    d1: usize,
+    mark: Mark,
+) -> Option<(String, Range<usize>)> {
+    let (open, close) = mark.wrap();
+    let (left, right) = extend_marked(p, d0, d1, mark);
+    let mut next = src.to_string();
+    for seg in marked_segs(p, left, right, mark).into_iter().rev() {
+        remove_mark_delim(&mut next, p_segments_closer(p, &seg), mark);
+        remove_mark_delim(&mut next, p_segments_opener(p, &seg), mark);
+    }
+    let p2 = project(&next);
+    let mut d_left = left.min(p2.display.len());
+    let mut d_right = right.min(p2.display.len()).max(d_left);
+    if flanking_ok(mark) {
+        d_left = skip_ws_right(&p2.display, d_left);
+        d_right = skip_ws_left(&p2.display, d_right);
+    }
+    if d_left >= d_right {
+        let start = p2.to_source(d0.min(p2.display.len()), Affinity::Inside);
+        let end = p2.to_source(d1.min(p2.display.len()), Affinity::Inside);
+        return Some((next, start..end));
+    }
+    let range = p2.display_range_to_source(d_left..d_right, Affinity::Inside);
+    next.insert_str(range.end, close);
+    next.insert_str(range.start, open);
+    let p3 = project(&next);
+    let start = p3.to_source(d0.min(p3.display.len()), Affinity::Inside);
+    let end = p3.to_source(d1.min(p3.display.len()), Affinity::Inside);
+    Some((next, start..end))
 }
 
 fn p_segments_opener(p: &Projection, seg: &crate::display::Segment) -> Range<usize> {
@@ -1114,8 +1371,8 @@ fn p_segments_opener(p: &Projection, seg: &crate::display::Segment) -> Range<usi
         .rev()
         .find(|s| s.display.end <= seg.display.start)
         .map(|s| s.source.end)
-        .unwrap_or(seg.source.start);
-    prev..seg.source.start
+        .unwrap_or(0);
+    prev.min(seg.source.start)..seg.source.start
 }
 
 fn p_segments_closer(p: &Projection, seg: &crate::display::Segment) -> Range<usize> {
@@ -1595,6 +1852,97 @@ mod tests {
         assert_eq!(out2, "hello there nerd");
     }
 
+    fn sel_display(src: &str, d0: usize, d1: usize) -> Range<usize> {
+        let p = project(src);
+        p.to_source(d0, Affinity::Inside)..p.to_source(d1, Affinity::Inside)
+    }
+
+    fn assert_no_visible_stars(src: &str) {
+        let p = project(src);
+        assert!(
+            !p.display.contains('*'),
+            "visible asterisks in display={:?} src={src:?}",
+            p.display
+        );
+        assert!(!src.contains("****"), "stacked asterisks: {src:?}");
+    }
+
+    #[test]
+    fn toggle_bold_roundtrips_already_bold_word() {
+        let src = "hello **world**";
+        let sel = sel_display(src, 6, 11);
+        let (out, range) = toggle_mark(src, sel, Mark::Bold).unwrap();
+        assert_eq!(out, "hello world");
+        let (out2, _) = toggle_mark(&out, range, Mark::Bold).unwrap();
+        assert_eq!(out2, "hello **world**");
+        assert_no_visible_stars(&out2);
+    }
+
+    #[test]
+    fn toggle_bold_clears_partially_bold_word() {
+        let src = "h**ell**o";
+        let sel = sel_display(src, 0, 5);
+        let (out, range) = toggle_mark(src, sel, Mark::Bold).unwrap();
+        assert_eq!(out, "hello");
+        let (out2, _) = toggle_mark(&out, range, Mark::Bold).unwrap();
+        assert_eq!(out2, "**hello**");
+        assert_no_visible_stars(&out2);
+    }
+
+    #[test]
+    fn toggle_bold_repeated_on_partial_does_not_stack_stars() {
+        let mut src = "h**ell**o".to_string();
+        for _ in 0..6 {
+            let sel = sel_display(&src, 0, 5);
+            let (next, _) = toggle_mark(&src, sel, Mark::Bold).unwrap();
+            assert_no_visible_stars(&next);
+            src = next;
+        }
+        assert!(src == "hello" || src == "**hello**", "{src:?}");
+    }
+
+    #[test]
+    fn toggle_bold_unmarks_middle_without_orphan_stars() {
+        let src = "**hello**";
+        let sel = sel_display(src, 1, 4);
+        let (out, _) = toggle_mark(src, sel, Mark::Bold).unwrap();
+        assert_eq!(out, "**h**ell**o**");
+        assert_no_visible_stars(&out);
+        let p = project(&out);
+        assert!(p.marks_at(0, Affinity::Inside).bold);
+        assert!(!p.marks_at(1, Affinity::Inside).bold);
+        assert!(p.marks_at(4, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn toggle_bold_merges_into_existing_span() {
+        let src = "hello **world**";
+        let sel = sel_display(src, 3, 8);
+        let (out, _) = toggle_mark(src, sel, Mark::Bold).unwrap();
+        assert_eq!(out, "hel**lo world**");
+        assert_no_visible_stars(&out);
+    }
+
+    #[test]
+    fn toggle_bold_unbold_cool_does_not_leave_stars_after_space() {
+        let src = "you're cool bruh!";
+        let (out, _) = toggle_mark(src, sel_display(src, 1, 10), Mark::Bold).unwrap();
+        assert_eq!(out, "y**ou're coo**l bruh!");
+        assert_no_visible_stars(&out);
+
+        let (out2, _) = toggle_mark(&out, sel_display(&out, 7, 11), Mark::Bold).unwrap();
+        assert_eq!(out2, "y**ou're** cool bruh!");
+        assert_no_visible_stars(&out2);
+
+        let (out3, _) = toggle_mark(&out, sel_display(&out, 7, 10), Mark::Bold).unwrap();
+        assert_eq!(out3, "y**ou're** cool bruh!");
+        assert_no_visible_stars(&out3);
+
+        let (out4, _) = toggle_mark(&out, sel_display(&out, 6, 10), Mark::Bold).unwrap();
+        assert_eq!(out4, "y**ou're** cool bruh!");
+        assert_no_visible_stars(&out4);
+    }
+
     #[test]
     fn enter_on_empty_task_exits_list() {
         let src = "- [ ] three\n- [ ] \n";
@@ -1901,6 +2249,88 @@ mod tests {
             visible.matches('-').count() >= 2,
             "dashes remain visible: display={:?} out={out2:?}",
             p3.display
+        );
+    }
+
+    #[test]
+    fn slash_not_becomes_note_alert() {
+        let src = "/not";
+        let p = project(src);
+        let caret = p.to_source(p.display.len(), Affinity::Inside);
+        let (out, _) = apply_slash(src, caret, "> [!NOTE]\n> ");
+        assert!(out.contains("> [!NOTE]"), "{out:?}");
+        assert!(!out.contains("/no"), "{out:?}");
+        let p2 = project(&out);
+        assert!(
+            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Alert(_))),
+            "kinds={:?} out={out:?}",
+            p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        assert!(!p2.display.contains('/'), "display={:?}", p2.display);
+    }
+
+    #[test]
+    fn slash_not_after_paragraph() {
+        let src = "hello\n\n/not";
+        let p = project(src);
+        let caret = src.len();
+        let _ = p;
+        let (out, _) = apply_slash(src, caret, "> [!NOTE]\n> ");
+        assert!(out.contains("hello"), "{out:?}");
+        assert!(out.contains("> [!NOTE]"), "{out:?}");
+        assert!(!out.contains("/not"), "{out:?}");
+        assert!(!out.contains("/no>"), "{out:?}");
+    }
+
+    #[test]
+    fn type_into_empty_alert_stays_in_body() {
+        let src = "\n> [!NOTE]\n>";
+        let p = project(src);
+        let alert = p
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Alert(_)))
+            .expect("alert");
+        let caret = p.to_source(alert.display.start, Affinity::Inside);
+        let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
+        assert!(
+            out.contains("> [!NOTE]"),
+            "label must stay: {out:?}"
+        );
+        assert!(
+            out.contains("> hello"),
+            "body after label: {out:?}"
+        );
+        assert!(
+            !out.contains("hello> [!NOTE]"),
+            "must not prepend the marker: {out:?}"
+        );
+        let p2 = project(&out);
+        assert!(
+            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Alert(_))),
+            "still an alert: {out:?} kinds={:?}",
+            p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        assert!(p2.display.contains("hello"), "visible body: {:?}", p2.display);
+    }
+
+    #[test]
+    fn down_from_empty_line_types_in_alert_body() {
+        use crate::motion::{apply_motion, Motion};
+        let src = "x\n\n> [!NOTE]\n>";
+        let p = project(src);
+        let start = p.blocks[0].display.start;
+        let next_d = apply_motion(&p.display, start, Motion::Down, 1, None);
+        let caret = p.to_source(next_d, Affinity::Inside);
+        let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
+        assert!(out.contains("> hello"), "{out:?}");
+        assert!(!out.contains("hello> [!NOTE]"), "{out:?}");
+        assert!(
+            project(&out)
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Alert(_))),
+            "{out:?}"
         );
     }
 

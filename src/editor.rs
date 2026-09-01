@@ -355,6 +355,7 @@ pub struct Workspace {
     settings_open: bool,
     settings_pane: SettingsPane,
     scroll_handle: ScrollHandle,
+    surface_h: gpui::Pixels,
     titlebar_moving: bool,
     mouse_anchor: Option<usize>,
     mouse_dragging: bool,
@@ -410,6 +411,7 @@ impl Workspace {
             settings_open: false,
             settings_pane: SettingsPane::Editor,
             scroll_handle: ScrollHandle::new(),
+            surface_h: px(0.),
             titlebar_moving: false,
             mouse_anchor: None,
             mouse_dragging: false,
@@ -785,12 +787,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.push_doc_undo();
-        let (cleared, caret) = self.clear_slash_query();
-        let (next, caret) = if item.template.is_empty() {
-            (cleared, caret)
-        } else {
-            wysiwyg::insert_text(&cleared, caret, None, item.template, self.affinity)
-        };
+        let (next, caret) = wysiwyg::apply_slash(&self.source, self.caret, item.template);
         self.source = next;
         self.caret = caret.min(self.source.len());
         self.slash_index = 0;
@@ -801,7 +798,7 @@ impl Workspace {
     }
 
     fn close_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (next, caret) = self.clear_slash_query();
+        let (next, caret) = wysiwyg::clear_slash_query(&self.source, self.caret);
         self.source = next;
         self.caret = caret.min(self.source.len());
         self.slash_index = 0;
@@ -809,27 +806,6 @@ impl Workspace {
         self.dirty = true;
         self.status = "unsaved".into();
         self.refresh_raw(window, cx);
-    }
-
-    /// Delete `/query` from the current block as visible text (not a source line wipe).
-    fn clear_slash_query(&self) -> (String, usize) {
-        let p = self.proj();
-        let d = p.to_display(self.caret);
-        let Some(block) = p.block_at_display(d) else {
-            return (self.source.clone(), self.caret);
-        };
-        let body = p.display.get(block.display.clone()).unwrap_or("");
-        let local = d.saturating_sub(block.display.start).min(body.len());
-        let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let Some(rel) = body[line_start..local].rfind('/') else {
-            return (self.source.clone(), self.caret);
-        };
-        let d0 = block.display.start + line_start + rel;
-        let d1 = block.display.start + local;
-        if d0 <= block.display.start && d1 >= block.display.end {
-            return wysiwyg::delete_char(&self.source, self.caret, self.affinity);
-        }
-        wysiwyg::delete_display_range(&self.source, d0..d1)
     }
 
     fn leave_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3367,7 +3343,30 @@ impl Workspace {
                     .into_any_element(),
             );
         }
+        let overscroll = self.overscroll_px();
+        if overscroll > px(0.) {
+            kids.push(div().w_full().h(overscroll).flex_shrink_0().into_any_element());
+        }
         kids
+    }
+
+    fn overscroll_px(&self) -> gpui::Pixels {
+        let viewport = self.scroll_handle.bounds().size.height;
+        let viewport = if viewport > px(0.) {
+            viewport
+        } else {
+            self.surface_h
+        };
+        if viewport <= px(0.) {
+            return px(0.);
+        }
+        let last = self.proj().blocks.len().saturating_sub(1);
+        let last_h = self
+            .scroll_handle
+            .bounds_for_item(last)
+            .map(|b| b.size.height)
+            .unwrap_or(px(0.));
+        (viewport - last_h).max(px(0.))
     }
 
     fn toggle_mark_action(&mut self, mark: Mark, window: &mut Window, cx: &mut Context<Self>) {
@@ -3852,14 +3851,26 @@ impl Render for Workspace {
             .child(self.render_titlebar(cx))
             .child(
                 v_flex()
-                    .id("surface")
                     .flex_1()
                     .w_full()
                     .min_w_0()
+                    .on_children_prepainted({
+                        let view = cx.entity();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                let h = this.scroll_handle.bounds().size.height;
+                                if h > px(0.) && this.surface_h != h {
+                                    this.surface_h = h;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .id("surface")
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .track_scroll(&self.scroll_handle)
-                    .py_10()
+                    .pt_10()
                     .gap_1()
                     .on_mouse_down(
                         MouseButton::Left,
