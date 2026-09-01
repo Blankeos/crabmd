@@ -331,7 +331,10 @@ pub fn project(src: &str) -> Projection {
         if r.is_blank(src) {
             let last = i + 1 == ranges.len();
             let nls = src[r.range.clone()].bytes().filter(|&b| b == b'\n').count();
-            if !(last || nls >= 2) {
+            // Skip only Raw soft gaps between blocks (a single newline separator).
+            // Trailing blanks, multi-newline blanks, and explicit blank Paragraph
+            // placeholders (e.g. NBSP used to break lists) become empty slots.
+            if matches!(r.kind, BlockKind::Raw) && !(last || nls >= 2) {
                 prev_end = r.range.end;
                 continue;
             }
@@ -507,6 +510,7 @@ fn project_block(
         BlockKind::Heading(level) => {
             project_inlines(src, r, display, segments, links);
             restore_trailing_spaces(src, r.range.clone(), display, segments);
+            restore_heading_suffix(src, r.range.clone(), display, segments);
             BlockExtra::Heading(level)
         }
         BlockKind::Quote => {
@@ -520,8 +524,16 @@ fn project_block(
             BlockExtra::Alert(kind)
         }
         BlockKind::Paragraph => {
-            project_inlines(src, r, display, segments, links);
-            restore_trailing_spaces(src, r.range.clone(), display, segments);
+            // Incomplete list markers (`-`, `1.`) must show as literal text until
+            // the user types the trailing space that Notion uses to confirm.
+            if crate::document::is_incomplete_list_marker(slice) {
+                let line = slice.trim_end_matches(['\n', '\r']);
+                let abs = r.range.start..r.range.start + line.len();
+                emit_plain(display, segments, abs, line, Marks::default());
+            } else {
+                project_inlines(src, r, display, segments, links);
+                restore_trailing_spaces(src, r.range.clone(), display, segments);
+            }
             BlockExtra::Text
         }
     }
@@ -551,6 +563,157 @@ fn restore_trailing_spaces(
     if !gap.is_empty() && gap.bytes().all(|b| b == b' ' || b == b'\t') {
         emit_plain(display, segments, last..content_end, gap, Marks::default());
     }
+}
+
+/// ATX closers (`# Title #`) and spaces before them are dropped by cmark.
+/// Restore the raw heading-body suffix so `#` / spaces typed at EOL stay visible.
+fn restore_heading_suffix(
+    src: &str,
+    block: Range<usize>,
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+) {
+    let slice = src.get(block.clone()).unwrap_or("");
+    let (_, expected) = notion::strip_heading(slice);
+    let expected = expected.trim_end_matches(['\n', '\r']);
+    let shown_from = {
+        let mut start = display.len();
+        let mut found = false;
+        for seg in segments.iter().rev() {
+            if seg.source.start >= block.start && seg.source.end <= block.end {
+                start = seg.display.start.min(start);
+                found = true;
+            } else if found {
+                break;
+            }
+        }
+        if found {
+            start
+        } else {
+            display.len()
+        }
+    };
+    let shown = display.get(shown_from..).unwrap_or("");
+    if !expected.starts_with(shown) {
+        return;
+    }
+    let suffix = &expected[shown.len()..];
+    if suffix.is_empty() {
+        return;
+    }
+    let line = slice.trim_end_matches(['\n', '\r']);
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    let mut body_at = hashes;
+    if line.as_bytes().get(body_at) == Some(&b' ') {
+        body_at += 1;
+    }
+    let body_src_start = block.start + body_at;
+    let suffix_start = body_src_start + shown.len();
+    let suffix_end = (suffix_start + suffix.len()).min(block.start + line.len());
+    if suffix_end <= suffix_start {
+        return;
+    }
+    let gap = &src[suffix_start..suffix_end];
+    emit_plain(
+        display,
+        segments,
+        suffix_start..suffix_end,
+        gap,
+        Marks::default(),
+    );
+}
+
+/// pulldown-cmark drops trailing spaces on list item text, and may hide bodies
+/// that look like nested markers (`- -`) or escapes. Restore the raw body.
+fn restore_list_item_trailing_spaces(
+    src: &str,
+    item_source: &Range<usize>,
+    item_d0: usize,
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+    checked: Option<bool>,
+) {
+    let slice = src.get(item_source.clone()).unwrap_or("");
+    let line = slice.trim_end_matches(['\n', '\r']);
+    let marker = list_marker_byte_len(line, checked);
+    if marker > line.len() {
+        return;
+    }
+    let body = &line[marker..];
+    let shown = display.get(item_d0..).unwrap_or("");
+    // Unescaped body for visible text (keep source mapping on the raw slice).
+    let visible = unescape_md_punct(body);
+    if shown.is_empty() && !visible.trim().is_empty() {
+        emit_plain(
+            display,
+            segments,
+            item_source.start + marker..item_source.start + marker + body.len(),
+            &visible,
+            Marks::default(),
+        );
+        return;
+    }
+    if !body.starts_with(shown) && !visible.starts_with(shown) {
+        return;
+    }
+    // Trailing spaces only.
+    if body.starts_with(shown) {
+        let suffix = &body[shown.len()..];
+        if suffix.is_empty() || !suffix.bytes().all(|b| b == b' ' || b == b'\t') {
+            return;
+        }
+        let src_start = item_source.start + marker + shown.len();
+        let src_end = src_start + suffix.len();
+        emit_plain(
+            display,
+            segments,
+            src_start..src_end,
+            suffix,
+            Marks::default(),
+        );
+    }
+}
+
+fn unescape_md_punct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn list_marker_byte_len(line: &str, checked: Option<bool>) -> usize {
+    let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let t = &line[indent..];
+    let marker = if checked.is_some() {
+        if t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ") {
+            6
+        } else if t.starts_with("* [ ] ") || t.starts_with("* [x] ") || t.starts_with("* [X] ") {
+            6
+        } else {
+            // Task marker without trailing space yet
+            5
+        }
+    } else if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+        2
+    } else {
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && (t[digits..].starts_with(". ") || t[digits..].starts_with(") ")) {
+            digits + 2
+        } else {
+            0
+        }
+    };
+    indent + marker
 }
 
 fn body_abs_range(slice: &str, body: &str, abs: usize) -> Range<usize> {
@@ -639,9 +802,18 @@ fn project_inlines(
             }
             Event::End(TagEnd::Item) => {
                 if let Some(src_r) = item_src.take() {
+                    let src_range = src_r.start..r.range.start + range.end;
+                    restore_list_item_trailing_spaces(
+                        src,
+                        &src_range,
+                        item_d0,
+                        display,
+                        segments,
+                        item_checked,
+                    );
                     items.push(ListItem {
                         display: item_d0..display.len(),
-                        source: src_r.start..r.range.start + range.end,
+                        source: src_range,
                         indent: item_indent,
                         checked: item_checked,
                     });
@@ -987,5 +1159,19 @@ mod tests {
         assert_eq!(p.display, "hello ");
         let p = project("# Hi ");
         assert_eq!(p.display, "Hi ");
+        let p = project("- something ");
+        assert_eq!(p.display, "something ");
+        let p = project("- [ ] something ");
+        assert_eq!(p.display, "something ");
+        let p = project("1. something ");
+        assert_eq!(p.display, "something ");
+    }
+
+    #[test]
+    fn heading_keeps_trailing_hash() {
+        let p = project("# Hello there   #");
+        assert_eq!(p.display, "Hello there   #");
+        let p = project("# Hello there#");
+        assert_eq!(p.display, "Hello there#");
     }
 }

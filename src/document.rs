@@ -157,6 +157,32 @@ pub fn parse_ranges(src: &str) -> Vec<PaintRange> {
 
     covered.sort_by_key(|(start, _, _)| *start);
 
+    // Lists (unlike paragraphs/headings) absorb trailing blank lines into the
+    // End offset. Peel those newlines off so they become Raw gaps and project
+    // as empty paragraphs — needed for Notion "exit list" Enter/Backspace.
+    for entry in covered.iter_mut() {
+        if matches!(entry.2, BlockKind::List { .. }) {
+            let mut end = entry.1.min(src.len());
+            while end > entry.0 && src.as_bytes()[end - 1] == b'\n' {
+                // Keep one trailing newline on the list itself (end of last item).
+                let before = end - 1;
+                if before > entry.0 && src.as_bytes()[before - 1] == b'\n' {
+                    end = before;
+                } else {
+                    break;
+                }
+            }
+            entry.1 = end;
+
+            // Notion: typing `-` alone must NOT become a bullet until `- ` (space).
+            // Same for `*`/`+`/`1.`/`1)`. Demote incomplete markers to Paragraph.
+            let slice = src.get(entry.0..entry.1).unwrap_or("");
+            if is_incomplete_list_marker(slice) {
+                entry.2 = BlockKind::Paragraph;
+            }
+        }
+    }
+
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
     for (start, end, kind) in covered {
@@ -189,6 +215,24 @@ pub fn parse_ranges(src: &str) -> Vec<PaintRange> {
         });
     }
     ranges
+}
+
+/// `-` / `*` / `+` / `1.` / `1)` without a following space — not yet a list in Notion.
+pub fn is_incomplete_list_marker(slice: &str) -> bool {
+    let line = slice.trim_end_matches(['\n', '\r']);
+    // Only demote single-line incomplete markers (not real multi-item lists).
+    if line.contains('\n') {
+        return false;
+    }
+    let t = line.trim_start();
+    matches!(t, "-" | "*" | "+")
+        || {
+            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+            digits > 0
+                && digits == t.len().saturating_sub(1)
+                && (t.ends_with('.') || t.ends_with(')'))
+                && t[..digits].chars().all(|c| c.is_ascii_digit())
+        }
 }
 
 fn contains_caret(range: &Range<usize>, caret: usize, src_len: usize) -> bool {

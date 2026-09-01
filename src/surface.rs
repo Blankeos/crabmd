@@ -297,23 +297,17 @@ pub fn edit_text<V: EntityInputHandler>(
 ) -> gpui::AnyElement {
     let text = text.into();
     let empty = text.is_empty();
-    let shown: gpui::SharedString = if empty {
-        placeholder.unwrap_or("").to_string().into()
+    // Never put the placeholder in the IME/layout string — macOS will treat it
+    // as real text (replace/backspace then invents extra blocks).
+    let shown: gpui::SharedString = text.clone();
+    let placeholder_label = if empty {
+        placeholder.unwrap_or("").to_string()
     } else {
-        text.clone()
+        String::new()
     };
     let mut hs = highlights;
     if empty {
         hs.clear();
-        if !shown.is_empty() {
-            hs.push((
-                0..shown.len(),
-                HighlightStyle {
-                    color: Some(p.text_muted),
-                    ..Default::default()
-                },
-            ));
-        }
     }
     hs.retain(|(r, _)| {
         r.start < r.end
@@ -328,7 +322,9 @@ pub fn edit_text<V: EntityInputHandler>(
         layout: layout.clone(),
     });
     let color = p.primary;
+    let muted = p.text_muted;
     let click_empty = empty;
+    let ph = placeholder_label.clone();
     div()
         .id(("edit", display_start))
         .relative()
@@ -340,6 +336,16 @@ pub fn edit_text<V: EntityInputHandler>(
         .when(wrap, |el| el.whitespace_normal())
         .when(!wrap, |el| el.whitespace_nowrap())
         .child(styled)
+        .when(!ph.is_empty(), |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .text_color(muted)
+                    .child(ph),
+            )
+        })
         .child(CaretLayer {
             layout: layout.clone(),
             local_caret: if empty {

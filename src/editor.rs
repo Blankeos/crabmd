@@ -511,6 +511,9 @@ impl Workspace {
     }
 
     fn push_doc_undo(&mut self) {
+        // Commit any coalesced typing session first so Undo restores the
+        // pre-edit caret/text (e.g. list Enter → cmd-z lands back on the item).
+        self.finish_insert_undo();
         self.undo.push(self.snapshot());
     }
 
@@ -781,9 +784,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let line = logical_line_range(&self.source, self.caret);
-        self.source = splice(&self.source, line.clone(), item.template);
-        self.caret = line.start + item.template.len();
+        self.push_doc_undo();
+        let (cleared, caret) = self.clear_slash_query();
+        let (next, caret) = if item.template.is_empty() {
+            (cleared, caret)
+        } else {
+            wysiwyg::insert_text(&cleared, caret, None, item.template, self.affinity)
+        };
+        self.source = next;
+        self.caret = caret.min(self.source.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
@@ -792,14 +801,35 @@ impl Workspace {
     }
 
     fn close_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let line = logical_line_range(&self.source, self.caret);
-        self.source = splice(&self.source, line.clone(), "");
-        self.caret = line.start;
+        let (next, caret) = self.clear_slash_query();
+        self.source = next;
+        self.caret = caret.min(self.source.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
         self.status = "unsaved".into();
         self.refresh_raw(window, cx);
+    }
+
+    /// Delete `/query` from the current block as visible text (not a source line wipe).
+    fn clear_slash_query(&self) -> (String, usize) {
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let Some(block) = p.block_at_display(d) else {
+            return (self.source.clone(), self.caret);
+        };
+        let body = p.display.get(block.display.clone()).unwrap_or("");
+        let local = d.saturating_sub(block.display.start).min(body.len());
+        let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let Some(rel) = body[line_start..local].rfind('/') else {
+            return (self.source.clone(), self.caret);
+        };
+        let d0 = block.display.start + line_start + rel;
+        let d1 = block.display.start + local;
+        if d0 <= block.display.start && d1 >= block.display.end {
+            return wysiwyg::delete_char(&self.source, self.caret, self.affinity);
+        }
+        wysiwyg::delete_display_range(&self.source, d0..d1)
     }
 
     fn leave_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1433,6 +1463,19 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if self.is_notion() {
+            let before = self.source.clone();
+            let caret_before = self.caret;
+            let (next, caret) = wysiwyg::delete_to_line_start(&self.source, self.caret);
+            if next == before && caret == caret_before {
+                // At line/block start — structural backspace (join / exit).
+                self.on_block_backspace(&BlockBackspace, window, cx);
+                return;
+            }
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+            return;
+        }
         let p = self.proj();
         let d = p.to_display(self.caret);
         let start_d = logical_line_range(&p.display, d).start;
@@ -1477,8 +1520,7 @@ impl Workspace {
             return;
         }
         self.push_doc_undo();
-        let prev = p.display[..d].chars().next_back().map(|c| d - c.len_utf8()).unwrap_or(0);
-        let (next, caret) = wysiwyg::delete_display_range(&self.source, prev..d);
+        let (next, caret) = wysiwyg::delete_char(&self.source, self.caret, self.affinity);
         self.commit_edit(next, caret, window, cx);
     }
 
@@ -2782,7 +2824,12 @@ impl Workspace {
         let block = p.blocks[ix].clone();
         let text = p.display.get(block.display.clone()).unwrap_or("").to_string();
         let empty = text.trim().is_empty() && !block.extra.is_atomic();
-        let placeholder = if empty {
+        let caret_here = {
+            let d = p.to_display(self.caret);
+            d >= block.display.start && d <= block.display.end
+        };
+        // Only show the empty-block hint on the focused row (less noisy).
+        let placeholder = if empty && caret_here {
             Some("Type to write, or / for blocks")
         } else {
             None
@@ -3153,9 +3200,6 @@ impl Workspace {
         };
         let p = &self.palette;
         h_flex()
-            .absolute()
-            .top(px(8.))
-            .left(px(80.))
             .gap_1()
             .px_2()
             .py_1()
@@ -3179,6 +3223,38 @@ impl Workspace {
             )
             .when(self.link_open, |el| el.child(self.render_link_field(cx)))
             .into_any_element()
+    }
+
+    fn selection_bubble_for_block(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.proj();
+        let this = p.blocks.get(ix)?;
+        let show = if let Some(sel) = self.sel.as_ref().filter(|s| s.start != s.end) {
+            let d0 = p.to_display(sel.start.min(sel.end));
+            p.block_at_display(d0)
+                .is_some_and(|b| b.source == this.source)
+        } else if self.link_open {
+            let d = p.to_display(self.caret);
+            p.block_at_display(d)
+                .is_some_and(|b| b.source == this.source)
+        } else {
+            false
+        };
+        if !show {
+            return None;
+        }
+        // Float above the selected block (same deferred trick as the slash menu).
+        Some(
+            deferred(
+                div()
+                    .absolute()
+                    .top(px(-40.))
+                    .left(px(48.))
+                    .occlude()
+                    .child(self.render_bubble(cx)),
+            )
+            .with_priority(2)
+            .into_any_element(),
+        )
     }
 
     fn mark_btn(&self, label: &'static str, mark: Mark, cx: &mut Context<Self>) -> AnyElement {
@@ -3264,6 +3340,7 @@ impl Workspace {
             kids.push(
                 div()
                     .id(("blk", i))
+                    .relative()
                     .w(px(COLUMN_PX))
                     .max_w_full()
                     .min_w_0()
@@ -3286,10 +3363,10 @@ impl Workspace {
                         }
                     })
                     .child(self.render_block(i, cx))
+                    .children(self.selection_bubble_for_block(i, cx))
                     .into_any_element(),
             );
         }
-        kids.push(self.render_bubble(cx));
         kids
     }
 
@@ -3506,6 +3583,34 @@ impl EntityInputHandler for Workspace {
             let d = p.to_display(self.caret);
             d..d
         };
+        if text.is_empty() {
+            if display_range.start == display_range.end {
+                return;
+            }
+            if self.insert_origin.is_none() {
+                self.insert_origin = Some(self.snapshot());
+            }
+            let (next, caret) = if display_range.end == p.to_display(self.caret)
+                && display_range.end - display_range.start == p.display[..display_range.end]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1)
+            {
+                wysiwyg::delete_char(&self.source, self.caret, self.affinity)
+            } else {
+                wysiwyg::delete_display_range(&self.source, display_range)
+            };
+            self.source = next;
+            self.caret = caret.min(self.source.len());
+            self.sel = None;
+            self.marked = None;
+            self.dirty = true;
+            self.status = "unsaved".into();
+            self.refresh(window, cx);
+            self.sync_title(window);
+            return;
+        }
         let mut insert = text.to_string();
         if self.sticky.bold && !insert.contains("**") {
             insert = format!("**{insert}**");

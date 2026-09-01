@@ -19,7 +19,7 @@ A paragraph with **bold**, *italic*, ~~strikethrough~~, `inline code`, and a [li
 
 GitHub-style note.
 
-> [!TIP]
+ > [!TIP]
 > GitHub-style tip.
 
 > [!IMPORTANT]

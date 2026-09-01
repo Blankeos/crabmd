@@ -14,6 +14,14 @@ pub struct SlashItem {
 
 pub const ITEMS: &[SlashItem] = &[
     SlashItem {
+        keys: &["text", "paragraph", "p", "plain"],
+        label: "Paragraph",
+        hint: "text",
+        template: "",
+        kind: BlockKind::Paragraph,
+        icon: "type",
+    },
+    SlashItem {
         keys: &["h1", "heading1", "title"],
         label: "Heading 1",
         hint: "#",
@@ -185,6 +193,15 @@ mod tests {
         let hits = filter("h1");
         assert_eq!(hits[0].template, "# ");
         assert_eq!(hits[0].icon, "heading");
+    }
+
+    #[test]
+    fn paragraph_option() {
+        let hits = filter("paragraph");
+        assert_eq!(hits[0].label, "Paragraph");
+        assert_eq!(hits[0].template, "");
+        let hits = filter("text");
+        assert!(hits.iter().any(|i| i.label == "Paragraph"));
     }
 
     #[test]
