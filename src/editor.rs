@@ -24,7 +24,8 @@ use gpui_component::{
 
 use crate::config::{self, Config, EditorKind};
 use crate::display::{
-    project, wrap_cols_for, Affinity, BlockExtra, Projection, CODE_LANGS, COLUMN_PX,
+    list_sibling_index, ordered_marker, project, wrap_cols_for, Affinity, BlockExtra, Projection,
+    CODE_LANGS, COLUMN_PX,
 };
 use crate::document::{
     alert_icon_name, extract_links, parse_ranges, splice, BlockKind, PaintRange,
@@ -231,6 +232,13 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectGranularity {
+    Char,
+    Word,
+    Line,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 enum SettingsPane {
     Editor,
@@ -375,7 +383,10 @@ pub struct Workspace {
     surface_h: gpui::Pixels,
     titlebar_moving: bool,
     mouse_anchor: Option<usize>,
+    /// Initial word/line unit from a multi-click, used while dragging.
+    mouse_unit: Option<Range<usize>>,
     mouse_dragging: bool,
+    mouse_granularity: SelectGranularity,
     block_dragging: Option<usize>,
     block_drag_gap: Option<usize>,
     block_menu: Option<usize>,
@@ -437,7 +448,9 @@ impl Workspace {
             surface_h: px(0.),
             titlebar_moving: false,
             mouse_anchor: None,
+            mouse_unit: None,
             mouse_dragging: false,
+            mouse_granularity: SelectGranularity::Char,
             block_dragging: None,
             block_drag_gap: None,
             block_menu: None,
@@ -802,17 +815,23 @@ impl Workspace {
         if click_count >= 2 && !shift {
             let p = self.proj();
             let d = d.min(p.display.len());
-            let range = if click_count >= 3 {
-                crate::motion::logical_line_range(&p.display, d)
+            let (range, gran) = if click_count >= 3 {
+                (
+                    crate::motion::logical_line_range(&p.display, d),
+                    SelectGranularity::Line,
+                )
             } else {
-                word_range_at(&p.display, d)
+                (word_range_at(&p.display, d), SelectGranularity::Word)
             };
             if range.start < range.end {
                 self.caret = range.end;
                 self.mouse_anchor = Some(range.start);
+                self.mouse_unit = Some(range.clone());
                 self.sel = Some(range);
+                self.mouse_granularity = gran;
                 self.affinity = Affinity::Inside;
-                self.mouse_dragging = false;
+                // Keep dragging so double-click-then-drag extends by words/lines.
+                self.mouse_dragging = true;
                 self.clamp_caret();
                 self.follow_caret = false;
                 self.focus.focus(window, cx);
@@ -820,6 +839,8 @@ impl Workspace {
                 return;
             }
         }
+        self.mouse_granularity = SelectGranularity::Char;
+        self.mouse_unit = None;
         if shift {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -856,9 +877,8 @@ impl Workspace {
         if !self.mouse_dragging {
             return;
         }
-        let anchor = self.mouse_anchor.unwrap_or(self.caret);
-        self.visual_anchor = Some(anchor);
-        self.caret = d;
+        let p = self.proj();
+        let d = d.min(p.display.len());
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             self.mode = if self.config.editor == EditorKind::Helix {
                 Mode::Select
@@ -866,7 +886,25 @@ impl Workspace {
                 Mode::Visual
             };
         }
-        self.snap_visual_sel();
+        match self.mouse_granularity {
+            SelectGranularity::Char => {
+                let anchor = self.mouse_anchor.unwrap_or(self.caret);
+                self.visual_anchor = Some(anchor);
+                self.caret = d;
+                self.snap_visual_sel();
+            }
+            SelectGranularity::Word | SelectGranularity::Line => {
+                let unit = self.mouse_unit.clone().unwrap_or(d..d);
+                let range = extend_select_unit(&p.display, unit, d, self.mouse_granularity);
+                self.sel = Some(range.clone());
+                self.caret = if d < range.start {
+                    range.start
+                } else {
+                    range.end
+                };
+                self.visual_anchor = Some(range.start);
+            }
+        }
         self.clamp_caret();
         self.follow_caret = false;
         self.focus.focus(window, cx);
@@ -3303,7 +3341,7 @@ impl Workspace {
                         "☐".to_string()
                     }
                 } else if ordered {
-                    format!("{}.", i + 1)
+                    ordered_marker(item.indent, list_sibling_index(items, i))
                 } else {
                     "•".to_string()
                 };
@@ -3328,7 +3366,7 @@ impl Workspace {
                     .pl(indent)
                     .child(
                         div()
-                            .w(px(18.))
+                            .w(px(28.))
                             .pt(px(2.))
                             .text_color(pal.markdown_list_item)
                             .when(item.checked.is_some(), |el| {
@@ -4018,8 +4056,16 @@ impl Workspace {
             .unwrap_or("")
             .to_string();
         let checked = item.checked;
+        let indent_level = item.indent;
         let indent = px((item.indent as f32) * 16.);
         let ordered = *ordered;
+        let sibling = list_sibling_index(items, item_ix);
+        let marker = match checked {
+            Some(true) => None,
+            Some(false) => None,
+            None if ordered => Some(ordered_marker(indent_level, sibling)),
+            None => None,
+        };
         let edit = self.render_edit(
             item.display.clone(),
             &text,
@@ -4040,7 +4086,7 @@ impl Workspace {
             .pl(indent)
             .child(
                 div()
-                    .w(px(18.))
+                    .w(px(28.))
                     .h(px(22.))
                     .flex()
                     .items_center()
@@ -4061,10 +4107,13 @@ impl Workspace {
                             icon_el("square-check", pal.markdown_list_item).into_any_element()
                         }
                         Some(false) => icon_el("square", pal.markdown_list_item).into_any_element(),
-                        None if ordered => {
-                            div().child(format!("{}.", item_ix + 1)).into_any_element()
+                        None => {
+                            if let Some(m) = marker {
+                                div().child(m).into_any_element()
+                            } else {
+                                div().child("•").into_any_element()
+                            }
                         }
-                        None => div().child("•").into_any_element(),
                     }),
             )
             .child(div().flex_1().min_w_0().child(edit))
@@ -4287,6 +4336,46 @@ impl Workspace {
             utf16 += ch.len_utf16();
         }
         utf16
+    }
+}
+
+fn extend_select_unit(
+    display: &str,
+    unit: Range<usize>,
+    d: usize,
+    gran: SelectGranularity,
+) -> Range<usize> {
+    let d = d.min(display.len());
+    if d < unit.start {
+        let other = match gran {
+            SelectGranularity::Word => {
+                let w = word_range_at(display, d);
+                if w.start < w.end {
+                    w
+                } else {
+                    d..d
+                }
+            }
+            SelectGranularity::Line => crate::motion::logical_line_range(display, d),
+            SelectGranularity::Char => d..d,
+        };
+        other.start..unit.end
+    } else if d > unit.end {
+        let other = match gran {
+            SelectGranularity::Word => {
+                let w = word_range_at(display, d);
+                if w.start < w.end {
+                    w
+                } else {
+                    d..d
+                }
+            }
+            SelectGranularity::Line => crate::motion::logical_line_range(display, d),
+            SelectGranularity::Char => d..d,
+        };
+        unit.start..other.end
+    } else {
+        unit
     }
 }
 
@@ -4719,6 +4808,8 @@ impl Render for Workspace {
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     if this.mouse_dragging {
                         this.mouse_dragging = false;
+                        this.mouse_unit = None;
+                        this.mouse_granularity = SelectGranularity::Char;
                         if this.sel.as_ref().is_some_and(|s| s.start != s.end)
                             && this.config.editor.is_modal()
                             && !this.mode.is_insert()

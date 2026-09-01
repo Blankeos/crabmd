@@ -1450,14 +1450,24 @@ fn node_to_gfm(n: &Node) -> String {
                 let pad = "  ".repeat(it.indent);
                 let marker = if let Some(c) = it.checked {
                     if c {
-                        "- [x] "
+                        "- [x] ".to_string()
                     } else {
-                        "- [ ] "
+                        "- [ ] ".to_string()
                     }
                 } else if *ordered {
-                    return format!("{pad}{}. {}", i + 1, inlines_to_gfm(&it.inlines));
+                    // Sibling index within this indent under the nearest shallower parent.
+                    let mut n = 0usize;
+                    for j in (0..i).rev() {
+                        if items[j].indent < it.indent {
+                            break;
+                        }
+                        if items[j].indent == it.indent {
+                            n += 1;
+                        }
+                    }
+                    format!("{}. ", n + 1)
                 } else {
-                    "- "
+                    "- ".to_string()
                 };
                 format!("{pad}{marker}{}", inlines_to_gfm(&it.inlines))
             })

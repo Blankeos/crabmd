@@ -3155,4 +3155,86 @@ mod tests {
         let (out, _) = move_block(src, 3, 2).unwrap();
         assert_eq!(display_units(&out), ["A", "", "C", "B"]);
     }
+
+    #[test]
+    fn opt_backspace_last_word_leaves_empty_block() {
+        let src = "above\n\nhello";
+        let mut doc = crate::tree::Doc::from_gfm(src);
+        let p = doc.project();
+        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
+        let caret = block.display.end;
+        let start = crate::motion::apply_motion(&p.display, caret, crate::motion::Motion::WordBack, 1, None);
+        assert_eq!(start, block.display.start);
+        let at = doc.delete_display(start..caret);
+        let p2 = doc.project();
+        assert_eq!(doc.nodes.len(), 2, "must keep empty node");
+        let b = p2.block_at_display(at).unwrap();
+        assert_eq!(b.display.start, b.display.end, "caret on empty block, at={at} display={:?}", p2.display);
+    }
+
+    #[test]
+    fn opt_backspace_sole_word_leaves_empty_doc_block() {
+        let src = "hello";
+        let mut doc = crate::tree::Doc::from_gfm(src);
+        let p = doc.project();
+        let caret = p.display.len();
+        let start = crate::motion::apply_motion(&p.display, caret, crate::motion::Motion::WordBack, 1, None);
+        let at = doc.delete_display(start..caret);
+        assert_eq!(doc.nodes.len(), 1);
+        let p2 = doc.project();
+        let b = p2.block_at_display(at).unwrap();
+        assert_eq!(b.display.start, b.display.end, "sole empty block at={at}");
+    }
+
+    #[test]
+    fn word_back_at_block_start_crosses_newline() {
+        let src = "above\n\nhello";
+        let doc = crate::tree::Doc::from_gfm(src);
+        let p = doc.project();
+        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
+        let start = crate::motion::apply_motion(&p.display, block.display.start, crate::motion::Motion::WordBack, 1, None);
+        eprintln!("display={:?} block_start={} word_back={}", p.display, block.display.start, start);
+        assert!(start < block.display.start, "WordBack at block start crosses into previous");
+    }
+
+    #[test]
+    fn editor_path_opt_backspace_last_word() {
+        // Mimic on_delete_word_back + commit_edit
+        let src = "above\n\nhello";
+        let p = project(src);
+        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
+        let d = block.display.end;
+        let start_d = crate::motion::apply_motion(&p.display, d, crate::motion::Motion::WordBack, 1, None);
+        eprintln!("step1 display={:?} start={} d={} block={:?}", p.display, start_d, d, block.display);
+        let (next, caret) = delete_display_range(src, start_d..d);
+        let doc = crate::tree::Doc::from_gfm(&next);
+        let source = doc.to_gfm();
+        let p2 = doc.project();
+        let caret = caret.min(p2.display.len());
+        eprintln!("after1 gfm={:?} display={:?} caret={} nodes={} blocks={:?}",
+            source, p2.display, caret, doc.nodes.len(),
+            p2.blocks.iter().map(|b| (b.display.clone(), p2.display.get(b.display.clone()).unwrap_or("").to_string())).collect::<Vec<_>>());
+
+        // Second opt-backspace from resulting caret (Notion "again")
+        let start2 = crate::motion::apply_motion(&p2.display, caret, crate::motion::Motion::WordBack, 1, None);
+        eprintln!("step2 word_back from {} -> {}", caret, start2);
+        let (next2, caret2) = delete_display_range(&source, start2..caret);
+        let doc2 = crate::tree::Doc::from_gfm(&next2);
+        eprintln!("after2 gfm={:?} display={:?} caret={} nodes={}", doc2.to_gfm(), doc2.project().display, caret2, doc2.nodes.len());
+    }
+
+    #[test]
+    fn editor_path_cmd_backspace_last_word_equiv() {
+        let src = "above\n\nhello";
+        let p = project(src);
+        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
+        let d = block.display.end;
+        let (next, caret) = delete_to_line_start(src, d);
+        let doc = crate::tree::Doc::from_gfm(&next);
+        let p2 = doc.project();
+        eprintln!("cmd1 gfm={:?} display={:?} caret={} nodes={}", doc.to_gfm(), p2.display, caret, doc.nodes.len());
+        assert_eq!(doc.nodes.len(), 2);
+        let b = p2.block_at_display(caret.min(p2.display.len())).unwrap();
+        assert_eq!(b.display.start, b.display.end);
+    }
 }

@@ -52,6 +52,75 @@ pub struct ListItem {
     pub checked: Option<bool>,
 }
 
+/// Sibling index of `ix` among items that share its indent under the same parent.
+pub fn list_sibling_index(items: &[ListItem], ix: usize) -> usize {
+    let Some(it) = items.get(ix) else {
+        return 0;
+    };
+    let indent = it.indent;
+    let mut n = 0usize;
+    for j in (0..ix).rev() {
+        if items[j].indent < indent {
+            break;
+        }
+        if items[j].indent == indent {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Notion-style ordered marker: `1.` / `a.` / `i.` cycling by indent depth.
+pub fn ordered_marker(indent: usize, sibling_ix: usize) -> String {
+    match indent % 3 {
+        0 => format!("{}.", sibling_ix + 1),
+        1 => format!("{}.", to_alpha(sibling_ix)),
+        _ => format!("{}.", to_roman(sibling_ix + 1)),
+    }
+}
+
+fn to_alpha(mut ix: usize) -> String {
+    let mut s = String::new();
+    loop {
+        s.insert(0, (b'a' + (ix % 26) as u8) as char);
+        if ix < 26 {
+            break;
+        }
+        ix = ix / 26 - 1;
+    }
+    s
+}
+
+fn to_roman(n: usize) -> String {
+    if n == 0 {
+        return "i".into();
+    }
+    let table = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut n = n;
+    let mut out = String::new();
+    for &(val, sym) in &table {
+        while n >= val {
+            out.push_str(sym);
+            n -= val;
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 pub struct TableCell {
     pub display: Range<usize>,
@@ -1251,5 +1320,51 @@ mod tests {
         assert_eq!(p.display, "Hello there   #");
         let p = project("# Hello there#");
         assert_eq!(p.display, "Hello there#");
+    }
+}
+
+#[cfg(test)]
+mod ordered_marker_tests {
+    use super::{list_sibling_index, ordered_marker, ListItem};
+
+    fn item(indent: usize) -> ListItem {
+        ListItem {
+            display: 0..0,
+            source: 0..0,
+            indent,
+            checked: None,
+        }
+    }
+
+    #[test]
+    fn cycles_1_a_i_by_indent() {
+        assert_eq!(ordered_marker(0, 0), "1.");
+        assert_eq!(ordered_marker(0, 1), "2.");
+        assert_eq!(ordered_marker(1, 0), "a.");
+        assert_eq!(ordered_marker(1, 1), "b.");
+        assert_eq!(ordered_marker(2, 0), "i.");
+        assert_eq!(ordered_marker(2, 1), "ii.");
+        assert_eq!(ordered_marker(2, 3), "iv.");
+        assert_eq!(ordered_marker(3, 0), "1.");
+        assert_eq!(ordered_marker(4, 0), "a.");
+        assert_eq!(ordered_marker(5, 0), "i.");
+    }
+
+    #[test]
+    fn sibling_index_resets_under_parent() {
+        let items = vec![
+            item(0), // 1
+            item(1), // a
+            item(1), // b
+            item(2), // i
+            item(0), // 2
+            item(1), // a again
+        ];
+        assert_eq!(list_sibling_index(&items, 0), 0);
+        assert_eq!(list_sibling_index(&items, 1), 0);
+        assert_eq!(list_sibling_index(&items, 2), 1);
+        assert_eq!(list_sibling_index(&items, 3), 0);
+        assert_eq!(list_sibling_index(&items, 4), 1);
+        assert_eq!(list_sibling_index(&items, 5), 0);
     }
 }
