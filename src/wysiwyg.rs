@@ -10,36 +10,10 @@ use std::ops::Range;
 use crate::display::{
     project, serialize_table, Affinity, BlockExtra, ListItem, Projection, TableCell,
 };
-use crate::document::{splice, BlockKind};
+use crate::document::{delete_block_index, splice, BlockKind};
 use crate::notion;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mark {
-    Bold,
-    Italic,
-    Strike,
-    Code,
-}
-
-impl Mark {
-    fn wrap(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Bold => ("**", "**"),
-            Self::Italic => ("*", "*"),
-            Self::Strike => ("~~", "~~"),
-            Self::Code => ("`", "`"),
-        }
-    }
-
-    fn has(self, marks: crate::display::Marks) -> bool {
-        match self {
-            Self::Bold => marks.bold,
-            Self::Italic => marks.italic,
-            Self::Strike => marks.strike,
-            Self::Code => marks.code,
-        }
-    }
-}
+pub use crate::tree::{units, unit_display, Mark, Unit};
 
 fn block_ix(p: &Projection, d: usize) -> usize {
     p.block_at_display(d)
@@ -67,6 +41,19 @@ fn finish(next: String, ix: usize, local: usize) -> (String, usize) {
 }
 
 pub fn insert_text(
+    src: &str,
+    caret: usize,
+    sel: Option<Range<usize>>,
+    text: &str,
+    _affinity: Affinity,
+) -> (String, usize) {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.insert_text(caret, sel, text, crate::display::Marks::default());
+    (doc.to_gfm(), caret)
+}
+
+#[allow(dead_code)]
+fn insert_text_gfm(
     src: &str,
     caret: usize,
     sel: Option<Range<usize>>,
@@ -105,11 +92,11 @@ pub fn insert_text(
                     if item.display.start == item.display.end
                         || p.display[item.display.clone()].trim().is_empty()
                     {
-                        return fill_empty_list_item(src, item, text, ix);
+                        return fill_empty_list_item(src, item, text, ix, block.display.start);
                     }
                     // At visual EOL: append after the item's raw body (keeps spaces).
                     if d == item.display.end {
-                        return append_at_item_body_end(src, item, text, ix);
+                        return append_at_item_body_end(src, item, text, ix, block.display.start);
                     }
                 }
             }
@@ -133,7 +120,13 @@ pub fn insert_text(
     confirm_list_shortcut(&next, after(&next, ix, local + text.len()), ix)
 }
 
-fn append_at_item_body_end(src: &str, item: &ListItem, text: &str, ix: usize) -> (String, usize) {
+fn append_at_item_body_end(
+    src: &str,
+    item: &ListItem,
+    text: &str,
+    ix: usize,
+    block_d0: usize,
+) -> (String, usize) {
     let slice = src.get(item.source.clone()).unwrap_or("");
     let core = slice.trim_end_matches('\n');
     let marker_end = list_item_marker_end(core);
@@ -145,7 +138,8 @@ fn append_at_item_body_end(src: &str, item: &ListItem, text: &str, ix: usize) ->
         rep.push('\n');
     }
     let next = splice(src, item.source.clone(), &rep);
-    let local = (item.display.end - item.display.start) + text.len();
+    // `local` is offset within the list *block*, not the item.
+    let local = item.display.end.saturating_sub(block_d0) + text.len();
     finish(next, ix, local)
 }
 
@@ -182,7 +176,13 @@ fn fill_empty_quote_or_alert(
     finish(next, ix, text.len())
 }
 
-fn fill_empty_list_item(src: &str, item: &ListItem, text: &str, ix: usize) -> (String, usize) {
+fn fill_empty_list_item(
+    src: &str,
+    item: &ListItem,
+    text: &str,
+    ix: usize,
+    block_d0: usize,
+) -> (String, usize) {
     let slice = src.get(item.source.clone()).unwrap_or("");
     let core = slice.trim_end_matches('\n');
     let marker_end = list_item_marker_end(core);
@@ -196,7 +196,8 @@ fn fill_empty_list_item(src: &str, item: &ListItem, text: &str, ix: usize) -> (S
         rep.push('\n');
     }
     let next = splice(src, item.source.clone(), &rep);
-    finish(next, ix, text.len())
+    let local = item.display.start.saturating_sub(block_d0) + text.len();
+    finish(next, ix, local)
 }
 
 /// Escape list-item bodies that cmark would reparse as nested lists / HRs.
@@ -207,8 +208,7 @@ fn safe_list_item_body(body: &str) -> String {
         return body.to_string();
     }
     let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-    let hr_or_marker = !compact.is_empty()
-        && compact.chars().all(|c| matches!(c, '-' | '*' | '_'))
+    let hr_or_marker = !compact.is_empty() && compact.chars().all(|c| matches!(c, '-' | '*' | '_'))
         || is_ordered_marker_prefix(t);
     if hr_or_marker {
         let mut out = String::new();
@@ -303,16 +303,25 @@ fn fill_empty_paragraph(src: &str, slot: Range<usize>, text: &str, ix: usize) ->
     let empties_above = empty_index;
     let empties_below = empty_count.saturating_sub(empty_index + 1);
 
-    let mut rep = String::new();
-    if has_prev {
-        // `\n\n` paragraph break, plus one extra `\n` per empty above.
-        for _ in 0..(empties_above + 2) {
-            rep.push('\n');
-        }
+    // cmark omits the trailing newline on fences/tables/headings, but includes
+    // it on paragraphs. `+2` assumes that newline is in the replaced run;
+    // without it, `\n\n` before `text` invents an extra empty slot (typing
+    // between a code fence and a table then creates a new line per key).
+    let p0 = project(src);
+    let prev_ends_nl = ix
+        .checked_sub(1)
+        .and_then(|i| p0.blocks.get(i))
+        .map(|b| b.source.end > b.source.start && src.as_bytes()[b.source.end - 1] == b'\n')
+        .unwrap_or(false);
+    let nls_before = if has_prev {
+        empties_above + if prev_ends_nl { 2 } else { 1 }
     } else {
-        for _ in 0..empties_above {
-            rep.push('\n');
-        }
+        empties_above
+    };
+
+    let mut rep = String::new();
+    for _ in 0..nls_before {
+        rep.push('\n');
     }
     let caret = content_end + rep.len() + text.len();
     let _ = caret;
@@ -359,11 +368,10 @@ fn confirm_list_shortcut(src: &str, caret_d: usize, ix: usize) -> (String, usize
 }
 
 fn is_confirmed_list_shortcut(body: &str) -> bool {
-    matches!(body, "- " | "* " | "+ ")
-        || {
-            let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
-            digits > 0 && (&body[digits..] == ". " || &body[digits..] == ") ")
-        }
+    matches!(body, "- " | "* " | "+ ") || {
+        let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0 && (&body[digits..] == ". " || &body[digits..] == ") ")
+    }
 }
 
 fn slash_query_display(p: &Projection, caret: usize) -> Option<(Range<usize>, Range<usize>)> {
@@ -394,6 +402,13 @@ pub fn clear_slash_query(src: &str, caret: usize) -> (String, usize) {
 
 /// Replace `/query` with a slash-menu template (GFM).
 pub fn apply_slash(src: &str, caret: usize, template: &str) -> (String, usize) {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.apply_slash(caret, template);
+    (doc.to_gfm(), caret)
+}
+
+#[allow(dead_code)]
+fn apply_slash_gfm(src: &str, caret: usize, template: &str) -> (String, usize) {
     if template.is_empty() {
         return clear_slash_query(src, caret);
     }
@@ -402,7 +417,10 @@ pub fn apply_slash(src: &str, caret: usize, template: &str) -> (String, usize) {
         return insert_text(src, caret, None, template, Affinity::Inside);
     };
     if let Some(block) = p.block_at_display(display.start) {
-        if block.source == source && display.start <= block.display.start && display.end >= block.display.end {
+        if block.source == source
+            && display.start <= block.display.start
+            && display.end >= block.display.end
+        {
             let slice = src.get(block.source.clone()).unwrap_or("");
             let mut gfm = template.to_string();
             if slice.ends_with('\n') && !gfm.ends_with('\n') {
@@ -420,14 +438,18 @@ pub fn apply_slash(src: &str, caret: usize, template: &str) -> (String, usize) {
 }
 
 pub fn delete_display_range(src: &str, display: Range<usize>) -> (String, usize) {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.delete_display(display);
+    (doc.to_gfm(), caret)
+}
+
+#[allow(dead_code)]
+fn delete_display_range_gfm(src: &str, display: Range<usize>) -> (String, usize) {
     let p = project(src);
     let ix = block_ix(&p, display.start);
-    let local = display.start.saturating_sub(
-        p.blocks
-            .get(ix)
-            .map(|b| b.display.start)
-            .unwrap_or(0),
-    );
+    let local = display
+        .start
+        .saturating_sub(p.blocks.get(ix).map(|b| b.display.start).unwrap_or(0));
     let range = p.display_range_to_source(display, Affinity::Inside);
     let next = splice(src, range.clone(), "");
     finish(next, ix, local)
@@ -436,6 +458,16 @@ pub fn delete_display_range(src: &str, display: Range<usize>) -> (String, usize)
 /// Delete the display character before `caret`. If that empties the block,
 /// leave a single empty slot (do not invent extra blank lines).
 pub fn delete_char(src: &str, caret: usize, _affinity: Affinity) -> (String, usize) {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    if let Some(c) = doc.backspace(caret) {
+        return (doc.to_gfm(), c);
+    }
+    let c = doc.delete_char(caret);
+    (doc.to_gfm(), c)
+}
+
+#[allow(dead_code)]
+fn delete_char_gfm(src: &str, caret: usize, _affinity: Affinity) -> (String, usize) {
     let p = project(src);
     let d = caret.min(p.display.len());
     if d == 0 {
@@ -459,12 +491,13 @@ pub fn delete_char(src: &str, caret: usize, _affinity: Affinity) -> (String, usi
         return clear_block_leave_empty(src, &p, block);
     }
     if let BlockExtra::List { items, .. } = &block.extra {
-        if let Some(item) = items.iter().find(|it| {
-            (prev >= it.display.start && prev < it.display.end) || d == it.display.end
-        }) {
+        if let Some(item) = items
+            .iter()
+            .find(|it| (prev >= it.display.start && prev < it.display.end) || d == it.display.end)
+        {
             if prev <= item.display.start && d >= item.display.end {
                 let ix = block_ix(&p, prev);
-                return fill_empty_list_item(src, item, "", ix);
+                return fill_empty_list_item(src, item, "", ix, block.display.start);
             }
         }
     }
@@ -581,9 +614,11 @@ fn clear_block_leave_empty(
     let has_prev_content = p.blocks[..ix]
         .iter()
         .any(|b| b.display.start != b.display.end);
-    let has_next_content = p.blocks.iter().skip(ix + 1).any(|b| {
-        b.display.start != b.display.end && b.source.start >= del_end
-    });
+    let has_next_content = p
+        .blocks
+        .iter()
+        .skip(ix + 1)
+        .any(|b| b.display.start != b.display.end && b.source.start >= del_end);
 
     // Last content block: previous separator (`\n\n`) already yields one empty.
     // Replacing with another `\n` invented `Hello\n\n/` → `Hello\n\n\n`.
@@ -635,9 +670,10 @@ fn collapse_all_empty_doc(src: &str, caret: usize) -> (String, usize) {
     if !p.display.trim().is_empty() {
         return (src.to_string(), caret.min(p.display.len()));
     }
-    if p.blocks.iter().all(|b| {
-        b.display.start == b.display.end || p.display[b.display.clone()].trim().is_empty()
-    }) {
+    if p.blocks
+        .iter()
+        .all(|b| b.display.start == b.display.end || p.display[b.display.clone()].trim().is_empty())
+    {
         return ("\n".to_string(), 0);
     }
     (src.to_string(), caret.min(p.display.len()))
@@ -645,6 +681,18 @@ fn collapse_all_empty_doc(src: &str, caret: usize) -> (String, usize) {
 
 /// Backspace. `None` = delete one display char (caller). `Some` = structural.
 pub fn backspace(src: &str, caret: usize, _affinity: Affinity) -> Option<(String, usize)> {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    match doc.backspace(caret) {
+        Some(c) => Some((doc.to_gfm(), c)),
+        None => {
+            let c = doc.delete_char(caret);
+            Some((doc.to_gfm(), c))
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn backspace_gfm(src: &str, caret: usize, _affinity: Affinity) -> Option<(String, usize)> {
     let p = project(src);
     let d = caret.min(p.display.len());
     let block = p.block_at_display(d)?;
@@ -762,7 +810,11 @@ fn exit_empty_list_item(
     // `Hello\n\n- ` must become `Hello\n\n` (not `Hello\n\n\n`).
     let removed = splice(src, del.clone(), "");
     let p2 = project(&removed);
-    if let Some(empty_ix) = p2.blocks.iter().position(|b| b.display.start == b.display.end) {
+    if let Some(empty_ix) = p2
+        .blocks
+        .iter()
+        .position(|b| b.display.start == b.display.end)
+    {
         return finish(removed, empty_ix, 0);
     }
     // No empty slot yet (e.g. `- item\n- ` → `- item\n`) — add one after.
@@ -808,7 +860,9 @@ fn join_prev(p: &Projection, src: &str, block_src: Range<usize>) -> (String, usi
     let this_disp = p.display[this.display.clone()].to_string();
     let prev_disp = p.display[prev.display.clone()].to_string();
     let joined = match prev.kind {
-        BlockKind::Heading(level) => notion::wrap_heading(level, &format!("{prev_disp}{this_disp}")),
+        BlockKind::Heading(level) => {
+            notion::wrap_heading(level, &format!("{prev_disp}{this_disp}"))
+        }
         BlockKind::Quote => notion::wrap_quote(&format!("{prev_disp}{this_disp}")),
         BlockKind::Alert(k) => notion::wrap_alert(k, &format!("{prev_disp}{this_disp}")),
         BlockKind::List { ordered } => {
@@ -842,7 +896,10 @@ fn set_item_indent(
         .iter()
         .find_map(|b| {
             if let BlockExtra::List { items, .. } = &b.extra {
-                items.iter().find(|it| it.source == item_src).map(|it| it.display.start)
+                items
+                    .iter()
+                    .find(|it| it.source == item_src)
+                    .map(|it| it.display.start)
             } else {
                 None
             }
@@ -867,7 +924,14 @@ fn marker_len(line: &str) -> usize {
     0
 }
 
-pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String, usize) {
+pub fn enter(src: &str, caret: usize, _affinity: Affinity, hard: bool) -> (String, usize) {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.enter(caret, hard);
+    (doc.to_gfm(), caret)
+}
+
+#[allow(dead_code)]
+fn enter_gfm(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String, usize) {
     let p = project(src);
     let d = caret.min(p.display.len());
     let bix = block_ix(&p, d);
@@ -952,9 +1016,10 @@ pub fn enter(src: &str, caret: usize, affinity: Affinity, hard: bool) -> (String
                         .blocks
                         .get(bix)
                         .and_then(|b| match &b.extra {
-                            BlockExtra::List { items, .. } => {
-                                items.get(ix + 1).or_else(|| items.last()).map(|it| it.display.start)
-                            }
+                            BlockExtra::List { items, .. } => items
+                                .get(ix + 1)
+                                .or_else(|| items.last())
+                                .map(|it| it.display.start),
                             _ => None,
                         })
                         .unwrap_or_else(|| after(&next, bix, usize::MAX));
@@ -1055,7 +1120,10 @@ pub fn open_line(src: &str, caret: usize, above: bool) -> (String, usize) {
 }
 
 fn item_marker(item_src: &str, ordered: bool, checked: Option<bool>) -> String {
-    let indent: String = item_src.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let indent: String = item_src
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
     if let Some(c) = checked {
         let mark = if c { "x" } else { " " };
         return format!("{indent}- [{mark}] ");
@@ -1074,7 +1142,9 @@ pub fn tab(src: &str, caret: usize, shift: bool) -> Option<(String, usize)> {
     let bix = block_ix(&p, d);
     match &block.extra {
         BlockExtra::List { items, .. } => {
-            let item = items.iter().find(|it| d >= it.display.start && d <= it.display.end)?;
+            let item = items
+                .iter()
+                .find(|it| d >= it.display.start && d <= it.display.end)?;
             let ix = items.iter().position(|it| it.source == item.source)?;
             if shift {
                 if item.indent == 0 {
@@ -1082,7 +1152,12 @@ pub fn tab(src: &str, caret: usize, shift: bool) -> Option<(String, usize)> {
                     let next = splice(src, item.source.clone(), &body);
                     return Some(finish(next, bix, 0));
                 }
-                return Some(set_item_indent(src, &p, item.source.clone(), item.indent - 1));
+                return Some(set_item_indent(
+                    src,
+                    &p,
+                    item.source.clone(),
+                    item.indent - 1,
+                ));
             }
             if ix == 0 {
                 return None;
@@ -1091,7 +1166,12 @@ pub fn tab(src: &str, caret: usize, shift: bool) -> Option<(String, usize)> {
             if item.indent > prev.indent {
                 return None;
             }
-            Some(set_item_indent(src, &p, item.source.clone(), item.indent + 1))
+            Some(set_item_indent(
+                src,
+                &p,
+                item.source.clone(),
+                item.indent + 1,
+            ))
         }
         BlockExtra::Table { cells, rows, cols } => {
             Some(table_tab(src, &p, cells, *rows, *cols, d, shift))
@@ -1116,20 +1196,26 @@ fn table_tab(
     d: usize,
     shift: bool,
 ) -> (String, usize) {
-    let Some(cur) = cells.iter().find(|c| d >= c.display.start && d <= c.display.end) else {
+    let Some(cur) = cells
+        .iter()
+        .find(|c| d >= c.display.start && d <= c.display.end)
+    else {
         return (src.to_string(), d);
     };
     if shift {
-        if let Some(prev) = cells.iter().rev().find(|c| {
-            c.row < cur.row || (c.row == cur.row && c.col < cur.col)
-        }) {
+        if let Some(prev) = cells
+            .iter()
+            .rev()
+            .find(|c| c.row < cur.row || (c.row == cur.row && c.col < cur.col))
+        {
             return (src.to_string(), prev.display.start);
         }
         return (src.to_string(), cur.display.start);
     }
-    if let Some(next) = cells.iter().find(|c| {
-        c.row > cur.row || (c.row == cur.row && c.col > cur.col)
-    }) {
+    if let Some(next) = cells
+        .iter()
+        .find(|c| c.row > cur.row || (c.row == cur.row && c.col > cur.col))
+    {
         return (src.to_string(), next.display.start);
     }
     let (headers, body) = table_strings(p, cells, cols);
@@ -1152,11 +1238,20 @@ fn table_tab(
     (next, caret)
 }
 
-fn table_strings(p: &Projection, cells: &[TableCell], cols: usize) -> (Vec<String>, Vec<Vec<String>>) {
+fn table_strings(
+    p: &Projection,
+    cells: &[TableCell],
+    cols: usize,
+) -> (Vec<String>, Vec<Vec<String>>) {
     let mut headers = vec![String::new(); cols.max(1)];
     let mut rows: Vec<Vec<String>> = Vec::new();
     for c in cells {
-        let text = p.display.get(c.display.clone()).unwrap_or("").replace('\t', "").to_string();
+        let text = p
+            .display
+            .get(c.display.clone())
+            .unwrap_or("")
+            .replace('\t', "")
+            .to_string();
         if c.header {
             if c.col < headers.len() {
                 headers[c.col] = text;
@@ -1174,11 +1269,14 @@ fn table_strings(p: &Projection, cells: &[TableCell], cols: usize) -> (Vec<Strin
     (headers, rows)
 }
 
-pub fn toggle_mark(
-    src: &str,
-    sel: Range<usize>,
-    mark: Mark,
-) -> Option<(String, Range<usize>)> {
+pub fn toggle_mark(src: &str, sel: Range<usize>, mark: Mark) -> Option<(String, Range<usize>)> {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let range = doc.toggle_mark(sel, mark)?;
+    Some((doc.to_gfm(), range))
+}
+
+#[allow(dead_code)]
+fn toggle_mark_gfm(src: &str, sel: Range<usize>, mark: Mark) -> Option<(String, Range<usize>)> {
     let p = project(src);
     let d0 = sel.start.min(sel.end).min(p.display.len());
     let d1 = sel.end.max(sel.start).min(p.display.len());
@@ -1215,6 +1313,7 @@ fn mark_delims(mark: Mark) -> &'static [&'static str] {
         Mark::Italic => &["*", "_"],
         Mark::Strike => &["~~"],
         Mark::Code => &["`"],
+        Mark::Underline => &["<u>", "</u>"],
     }
 }
 
@@ -1230,7 +1329,8 @@ fn remove_delim(next: &mut String, gap: Range<usize>, delim: &str) -> bool {
     }
     if end > start {
         let at = end.saturating_sub(delim.len());
-        if at >= start && at <= next.len() && end <= next.len() && next.get(at..end) == Some(delim) {
+        if at >= start && at <= next.len() && end <= next.len() && next.get(at..end) == Some(delim)
+        {
             next.replace_range(at..end, "");
             return true;
         }
@@ -1362,7 +1462,8 @@ fn unmark_display_range(
             // Keep a prefix: insert a new closer at keep_start, drop the original closer.
             let at = p.to_source(keep_start, Affinity::Inside).min(next.len());
             next.insert_str(at, close);
-            let shifted = closer.start.saturating_add(close.len())..closer.end.saturating_add(close.len());
+            let shifted =
+                closer.start.saturating_add(close.len())..closer.end.saturating_add(close.len());
             remove_mark_delim(&mut next, shifted, mark);
         } else {
             let at_end = p.to_source(keep_end, Affinity::Inside).min(next.len());
@@ -1464,6 +1565,179 @@ pub fn set_code_lang(src: &str, caret: usize, lang: &str) -> Option<(String, usi
     Some(finish(next, ix, 0))
 }
 
+fn unit_start(p: &Projection, src: &str, units: &[Unit], ui: usize) -> usize {
+    if ui == 0 {
+        return 0;
+    }
+    let u = units[ui];
+    match u.item {
+        Some(i) => {
+            let Some(BlockExtra::List { items, .. }) = p.blocks.get(u.block).map(|b| &b.extra)
+            else {
+                return p.blocks[u.block].source.start.min(src.len());
+            };
+            items
+                .get(i)
+                .map(|it| it.source.start.min(src.len()))
+                .unwrap_or_else(|| p.blocks[u.block].source.start.min(src.len()))
+        }
+        None => p.blocks[u.block].source.start.min(src.len()),
+    }
+}
+
+fn unit_span(p: &Projection, src: &str, units: &[Unit], ui: usize) -> Range<usize> {
+    let start = unit_start(p, src, units, ui);
+    let end = if ui + 1 < units.len() {
+        unit_start(p, src, units, ui + 1)
+    } else {
+        src.len()
+    };
+    start.min(end)..end
+}
+
+fn trim_unit_src(s: &str) -> &str {
+    s.trim_end_matches(['\n', '\r'])
+}
+
+fn trailing_nl_count(s: &str) -> usize {
+    s.bytes().rev().take_while(|&b| b == b'\n').count()
+}
+
+fn concat_units(src: &str, parts: &[(Unit, String)]) -> String {
+    let mut out = String::new();
+    let mut pending_empty = 0usize;
+    let mut last_list = false;
+
+    for (unit, part) in parts {
+        if part.trim().is_empty() {
+            pending_empty += 1;
+            last_list = false;
+            continue;
+        }
+        let body = trim_unit_src(part);
+        if out.is_empty() && pending_empty == 0 {
+            out.push_str(body);
+            last_list = unit.is_list_item();
+            continue;
+        }
+        let need = if last_list && unit.is_list_item() && pending_empty == 0 {
+            1
+        } else {
+            2 + pending_empty
+        };
+        let have = trailing_nl_count(&out);
+        for _ in have..need {
+            out.push('\n');
+        }
+        out.push_str(body);
+        pending_empty = 0;
+        last_list = unit.is_list_item();
+    }
+    if pending_empty > 0 {
+        // Trailing empties: previous block's newline + one extra per slot.
+        let need = pending_empty + 1;
+        let have = trailing_nl_count(&out);
+        for _ in have..need {
+            out.push('\n');
+        }
+    } else if parts.last().is_some_and(|(_, p)| !p.trim().is_empty()) {
+        let had = src.ends_with('\n');
+        out = out.trim_end_matches(['\n', '\r']).to_string();
+        if had {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn caret_at_unit(src: &str, ix: usize) -> usize {
+    let p = project(src);
+    let units = units(&p);
+    let Some(u) = units.get(ix.min(units.len().saturating_sub(1))) else {
+        return 0;
+    };
+    unit_display(&p, *u).start
+}
+
+/// Delete unit `ix` (block or list item). Caret lands on the next (or previous) row.
+pub fn delete_block(src: &str, ix: usize) -> Option<(String, usize)> {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.delete_unit(ix);
+    Some((doc.to_gfm(), caret))
+}
+
+pub fn duplicate_block(src: &str, ix: usize) -> Option<(String, usize)> {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.duplicate_unit(ix);
+    Some((doc.to_gfm(), caret))
+}
+
+pub fn move_block(src: &str, from: usize, gap: usize) -> Option<(String, usize)> {
+    let mut doc = crate::tree::Doc::from_gfm(src);
+    let caret = doc.move_unit(from, gap)?;
+    Some((doc.to_gfm(), caret))
+}
+
+#[allow(dead_code)]
+fn delete_block_gfm(src: &str, ix: usize) -> Option<(String, usize)> {
+    let p = project(src);
+    let us = units(&p);
+    let n = us.len();
+    if n == 0 || ix >= n {
+        return None;
+    }
+    let mut parts: Vec<(Unit, String)> = (0..n)
+        .map(|i| (us[i], src[unit_span(&p, src, &us, i)].to_string()))
+        .collect();
+    parts.remove(ix);
+    let next = concat_units(src, &parts);
+    let at = delete_block_index(n, ix).unwrap_or(0);
+    let caret = caret_at_unit(&next, at);
+    Some((next, caret))
+}
+
+/// Duplicate unit `ix` immediately after it.
+#[allow(dead_code)]
+fn duplicate_block_gfm(src: &str, ix: usize) -> Option<(String, usize)> {
+    let p = project(src);
+    let us = units(&p);
+    let n = us.len();
+    if n == 0 || ix >= n {
+        return None;
+    }
+    let mut parts: Vec<(Unit, String)> = (0..n)
+        .map(|i| (us[i], src[unit_span(&p, src, &us, i)].to_string()))
+        .collect();
+    let copy = parts[ix].clone();
+    parts.insert(ix + 1, copy);
+    let next = concat_units(src, &parts);
+    let caret = caret_at_unit(&next, ix + 1);
+    Some((next, caret))
+}
+
+/// Move unit `from` to drop-gap `gap` (`0..=n`, like Notion's edge).
+#[allow(dead_code)]
+fn move_block_gfm(src: &str, from: usize, gap: usize) -> Option<(String, usize)> {
+    let p = project(src);
+    let us = units(&p);
+    let n = us.len();
+    if n == 0 || from >= n || gap > n {
+        return None;
+    }
+    if gap == from || gap == from + 1 {
+        return None;
+    }
+    let mut parts: Vec<(Unit, String)> = (0..n)
+        .map(|i| (us[i], src[unit_span(&p, src, &us, i)].to_string()))
+        .collect();
+    let item = parts.remove(from);
+    let insert_at = if from < gap { gap - 1 } else { gap };
+    parts.insert(insert_at, item);
+    let next = concat_units(src, &parts);
+    let caret = caret_at_unit(&next, insert_at);
+    Some((next, caret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1539,9 +1813,9 @@ mod tests {
         assert!(
             out.contains("Hello\n\n\n") || out.contains("Hello\n\n\npara") || {
                 let p2 = project(&out);
-                p2.blocks.iter().any(|b| {
-                    b.kind == BlockKind::Paragraph && b.display.start == b.display.end
-                })
+                p2.blocks
+                    .iter()
+                    .any(|b| b.kind == BlockKind::Paragraph && b.display.start == b.display.end)
             },
             "expected a new empty paragraph in {out:?}"
         );
@@ -1660,10 +1934,7 @@ mod tests {
         let before = p.blocks.len();
         let (out, at) = enter(src, caret, Affinity::Inside, false);
         let p2 = project(&out);
-        assert!(
-            p2.blocks.len() > before,
-            "should grow empties: {out:?}"
-        );
+        assert!(p2.blocks.len() > before, "should grow empties: {out:?}");
         let d = at;
         // Must not still be on the first block.
         assert!(
@@ -1715,7 +1986,9 @@ mod tests {
             "Second must stay separate, got {texts:?} out={out:?}"
         );
         assert!(
-            !texts.iter().any(|t| t.contains("NEW") && t.contains("Second")),
+            !texts
+                .iter()
+                .any(|t| t.contains("NEW") && t.contains("Second")),
             "must not soft-join NEW into Second: {texts:?} out={out:?}"
         );
         let d = at;
@@ -1773,7 +2046,9 @@ mod tests {
             "caret should be on the right half, got {text:?} out={out:?} at={at} d={d}"
         );
         assert!(
-            !text.contains("Hello") || text.trim_start().starts_with("world") || text.starts_with(' '),
+            !text.contains("Hello")
+                || text.trim_start().starts_with("world")
+                || text.starts_with(' '),
             "should not remain on Hello alone: {text:?}"
         );
     }
@@ -1803,7 +2078,9 @@ mod tests {
             .map(|b| p2.display[b.display.clone()].to_string())
             .collect();
         assert!(
-            texts.iter().any(|t| t.contains("list three") && t.contains("list one")),
+            texts
+                .iter()
+                .any(|t| t.contains("list three") && t.contains("list one")),
             "list should contain both items, got {texts:?} out={out2:?}"
         );
         let d = p2.to_display(at2);
@@ -1813,10 +2090,6 @@ mod tests {
             "caret should remain in the list"
         );
     }
-
-
-
-
 
     #[test]
     fn open_below_keeps_caret_on_new_empty() {
@@ -1882,10 +2155,14 @@ mod tests {
         let p2 = project(&out);
         let block = p2.block_at_display(at).expect("block");
         assert_eq!(
-            block.display.start, block.display.end,
+            block.display.start,
+            block.display.end,
             "caret must stay on the emptied slot, not jump: at={at} display={:?} kinds={:?}",
             p2.display,
-            p2.blocks.iter().map(|b| (b.kind, p2.display[b.display.clone()].to_string())).collect::<Vec<_>>()
+            p2.blocks
+                .iter()
+                .map(|b| (b.kind, p2.display[b.display.clone()].to_string()))
+                .collect::<Vec<_>>()
         );
         let texts: Vec<_> = p2
             .blocks
@@ -1894,31 +2171,33 @@ mod tests {
             .collect();
         assert!(texts.iter().any(|t| t == "2"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "4"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "1" && block.display.start == 0), "must not jump to first block: {texts:?} at={at}");
+        assert!(
+            !texts.iter().any(|t| t == "1" && block.display.start == 0),
+            "must not jump to first block: {texts:?} at={at}"
+        );
     }
-
-
-
 
     #[test]
     fn type_into_nbsp_list_break() {
         let src = "- item 1\n\n\u{00A0}\n\n- item 3\n";
         let p = project(src);
         assert!(p.blocks.len() >= 3, "{:?}", p.blocks.len());
-        let empty = p.blocks.iter().find(|b| b.display.start == b.display.end).expect("empty");
+        let empty = p
+            .blocks
+            .iter()
+            .find(|b| b.display.start == b.display.end)
+            .expect("empty");
         let caret = empty.display.start;
         let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
         let p2 = project(&out);
-        assert!(p2.display.contains("hello"), "{out:?} display={:?}", p2.display);
+        assert!(
+            p2.display.contains("hello"),
+            "{out:?} display={:?}",
+            p2.display
+        );
         assert!(!out.contains('\u{00A0}'), "nbsp consumed: {out:?}");
         assert!(out.contains("item 1") && out.contains("item 3"), "{out:?}");
     }
-
-
-
-
-
-
 
     #[test]
     fn toggle_bold_wraps() {
@@ -2051,10 +2330,7 @@ mod tests {
             "caret on empty paragraph after exit: kind={:?} out={out:?} at={at}",
             block.kind
         );
-        assert!(
-            p2.display.contains("three"),
-            "previous item kept: {out:?}"
-        );
+        assert!(p2.display.contains("three"), "previous item kept: {out:?}");
     }
 
     #[test]
@@ -2108,7 +2384,8 @@ mod tests {
             .filter(|b| b.display.start == b.display.end)
             .count();
         assert_eq!(
-            empties, 1,
+            empties,
+            1,
             "exactly one empty between lists: blocks={} out={out:?}",
             p2.blocks.len()
         );
@@ -2135,10 +2412,12 @@ mod tests {
             p2.display
         );
         assert!(
-            !p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::List { .. })
-                && p2.display[b.display.clone()]
-                    .lines()
-                    .any(|l| l.trim() == "-")),
+            !p2.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::List { .. })
+                    && p2.display[b.display.clone()]
+                        .lines()
+                        .any(|l| l.trim() == "-")),
             "must not merge dash into a list item: out={out:?} display={:?}",
             p2.display
         );
@@ -2165,8 +2444,10 @@ mod tests {
         let (out, at) = insert_text(src, caret, None, "-", Affinity::Inside);
         let p2 = project(&out);
         assert!(
-            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Paragraph)
-                && p2.display[b.display.clone()].contains('-')),
+            p2.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Paragraph)
+                    && p2.display[b.display.clone()].contains('-')),
             "dash after a list must not become a 3rd bullet: out={out:?} display={:?}",
             p2.display
         );
@@ -2178,7 +2459,11 @@ mod tests {
             .filter(|b| matches!(b.kind, BlockKind::List { .. }))
             .count();
         assert!(
-            lists >= 2 || p3.blocks.iter().any(|b| matches!(b.kind, BlockKind::List { .. })),
+            lists >= 2
+                || p3
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b.kind, BlockKind::List { .. })),
             "space confirms a new list: out={out2:?}"
         );
     }
@@ -2262,10 +2547,7 @@ mod tests {
         let caret = p.blocks[0].display.end;
         let (out, _) = delete_to_line_start(src, caret);
         let p2 = project(&out);
-        assert!(
-            p2.display.trim().is_empty(),
-            "content cleared: {out:?}"
-        );
+        assert!(p2.display.trim().is_empty(), "content cleared: {out:?}");
         assert_eq!(p2.blocks.len(), 1, "single empty block: {out:?}");
     }
 
@@ -2284,14 +2566,21 @@ mod tests {
             .filter(|b| b.display.start == b.display.end)
             .count();
         assert_eq!(
-            empties, 1,
+            empties,
+            1,
             "exactly one empty between neighbors: out={out:?} blocks={:?}",
             p2.blocks
                 .iter()
-                .map(|b| (b.kind, p2.display.get(b.display.clone()).unwrap_or("").to_string()))
+                .map(|b| (
+                    b.kind,
+                    p2.display.get(b.display.clone()).unwrap_or("").to_string()
+                ))
                 .collect::<Vec<_>>()
         );
-        assert!(p2.display.contains("above") && p2.display.contains("below"), "{out:?}");
+        assert!(
+            p2.display.contains("above") && p2.display.contains("below"),
+            "{out:?}"
+        );
         assert!(!p2.display.contains("hello"), "{out:?}");
         let d = at;
         let block = p2.block_at_display(d).expect("block");
@@ -2425,7 +2714,9 @@ mod tests {
         assert!(!out.contains("/no"), "{out:?}");
         let p2 = project(&out);
         assert!(
-            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Alert(_))),
+            p2.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Alert(_))),
             "kinds={:?} out={out:?}",
             p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
         );
@@ -2456,25 +2747,25 @@ mod tests {
             .expect("alert");
         let caret = alert.display.start;
         let (out, _) = insert_text(src, caret, None, "hello", Affinity::Inside);
-        assert!(
-            out.contains("> [!NOTE]"),
-            "label must stay: {out:?}"
-        );
-        assert!(
-            out.contains("> hello"),
-            "body after label: {out:?}"
-        );
+        assert!(out.contains("> [!NOTE]"), "label must stay: {out:?}");
+        assert!(out.contains("> hello"), "body after label: {out:?}");
         assert!(
             !out.contains("hello> [!NOTE]"),
             "must not prepend the marker: {out:?}"
         );
         let p2 = project(&out);
         assert!(
-            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Alert(_))),
+            p2.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Alert(_))),
             "still an alert: {out:?} kinds={:?}",
             p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
         );
-        assert!(p2.display.contains("hello"), "visible body: {:?}", p2.display);
+        assert!(
+            p2.display.contains("hello"),
+            "visible body: {:?}",
+            p2.display
+        );
     }
 
     #[test]
@@ -2528,10 +2819,340 @@ mod tests {
             assert!(p2.display.contains("Hello"), "{out2:?}");
         }
     }
+
+    fn display_blocks(src: &str) -> Vec<String> {
+        let p = project(src);
+        p.blocks
+            .iter()
+            .map(|b| p.display[b.display.clone()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn move_block_first_to_end() {
+        let src = "# A\n\nB\n\nC";
+        assert_eq!(display_blocks(src), ["A", "B", "C"]);
+        let (out, _) = move_block(src, 0, 3).unwrap();
+        assert_eq!(display_blocks(&out), ["B", "C", "A"]);
+        assert!(out.contains("# A"), "{out}");
+    }
+
+    #[test]
+    fn move_block_last_to_start() {
+        let src = "# A\n\nB\n\nC";
+        let (out, _) = move_block(src, 2, 0).unwrap();
+        assert_eq!(display_blocks(&out), ["C", "A", "B"]);
+    }
+
+    #[test]
+    fn move_block_adjacent_is_noop() {
+        let src = "# A\n\nB\n\nC";
+        assert!(move_block(src, 1, 1).is_none());
+        assert!(move_block(src, 1, 2).is_none());
+    }
+
+    #[test]
+    fn duplicate_block_after() {
+        let src = "# A\n\nB";
+        let (out, _) = duplicate_block(src, 0).unwrap();
+        assert_eq!(display_blocks(&out), ["A", "A", "B"]);
+        assert_eq!(out.matches("# A").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn delete_block_middle() {
+        let src = "# A\n\nB\n\nC";
+        let (out, _) = delete_block(src, 1).unwrap();
+        assert_eq!(display_blocks(&out), ["A", "C"]);
+    }
+
+    #[test]
+    fn delete_last_block_leaves_previous() {
+        let src = "# A\n\nB";
+        let (out, _) = delete_block(src, 1).unwrap();
+        assert_eq!(display_blocks(&out), ["A"]);
+    }
+
+    #[test]
+    fn delete_only_block_empties_doc() {
+        let src = "hello";
+        let (out, caret) = delete_block(src, 0).unwrap();
+        assert!(out.trim().is_empty(), "{out:?}");
+        assert_eq!(caret, 0);
+    }
+
+    fn display_units(src: &str) -> Vec<String> {
+        let p = project(src);
+        units(&p)
+            .into_iter()
+            .map(|u| p.display[unit_display(&p, u)].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn list_items_are_separate_units() {
+        let src = "- a\n- b\n- c";
+        assert_eq!(display_units(src), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn move_list_item_within_list() {
+        let src = "- a\n- b\n- c";
+        let (out, _) = move_block(src, 0, 3).unwrap();
+        assert_eq!(display_units(&out), ["b", "c", "a"]);
+        assert!(out.contains("- a"), "{out}");
+        assert!(!out.contains("\n\n"), "list must stay one list: {out:?}");
+    }
+
+    #[test]
+    fn move_list_item_between_paragraphs() {
+        let src = "A\n\n- b\n- c\n\nD";
+        // units: A, b, c, D — move b after D
+        let (out, _) = move_block(src, 1, 4).unwrap();
+        assert_eq!(display_units(&out), ["A", "c", "D", "b"]);
+        assert!(out.contains("- b"), "{out}");
+        assert!(out.contains("- c"), "{out}");
+    }
+
+    #[test]
+    fn duplicate_list_item() {
+        let src = "- a\n- b";
+        let (out, _) = duplicate_block(src, 0).unwrap();
+        assert_eq!(display_units(&out), ["a", "a", "b"]);
+        assert_eq!(out.matches("- a").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn delete_list_item_middle() {
+        let src = "- a\n- b\n- c";
+        let (out, _) = delete_block(src, 1).unwrap();
+        assert_eq!(display_units(&out), ["a", "c"]);
+    }
+
+    #[test]
+    fn delete_only_list_item() {
+        let src = "A\n\n- b\n\nC";
+        let (out, _) = delete_block(src, 1).unwrap();
+        assert_eq!(display_units(&out), ["A", "C"]);
+        assert!(!out.contains("- b"), "{out}");
+    }
+
+    #[test]
+    fn type_at_end_of_third_item_stays_on_item() {
+        let src = "- a\n- b\n- c";
+        let p = project(src);
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!("list");
+        };
+        let caret = items[2].display.end;
+        let mut src = src.to_string();
+        let mut at = caret;
+        for ch in ["a", "r", "l", "o"] {
+            let (out, next) = insert_text(&src, at, None, ch, Affinity::Inside);
+            src = out;
+            at = next;
+        }
+        let p2 = project(&src);
+        assert_eq!(p2.display, "a\nb\ncarlo", "{src}");
+        let BlockExtra::List { items, .. } = &p2.blocks[0].extra else {
+            panic!("list {}", src);
+        };
+        assert_eq!(&p2.display[items[2].display.clone()], "carlo");
+        assert_eq!(at, items[2].display.end, "caret jumped: {at} src={src}");
+    }
+
+    #[test]
+    fn type_at_start_of_third_item_stays_on_item() {
+        let src = "- a\n- b\n- c";
+        let p = project(src);
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!("list");
+        };
+        let caret = items[2].display.start;
+        let (out, at) = insert_text(src, caret, None, "arlo", Affinity::Inside);
+        let p2 = project(&out);
+        assert_eq!(p2.display, "a\nb\narloc", "{out}");
+        let BlockExtra::List { items, .. } = &p2.blocks[0].extra else {
+            panic!("{out}");
+        };
+        assert_eq!(&p2.display[items[2].display.clone()], "arloc");
+        assert!(
+            at > items[2].display.start && at <= items[2].display.end,
+            "caret {at} item={:?} out={out}",
+            items[2].display
+        );
+    }
+
+    fn empty_unit_count(src: &str) -> usize {
+        let p = project(src);
+        units(&p)
+            .into_iter()
+            .filter(|u| {
+                let d = unit_display(&p, *u);
+                p.display.get(d).unwrap_or("").trim().is_empty()
+            })
+            .count()
+    }
+
+    #[test]
+    fn move_empty_block_to_end() {
+        let src = "A\n\n\nB";
+        assert_eq!(empty_unit_count(src), 1, "need a visible empty: {src:?}");
+        let (out, _) = move_block(src, 1, 3).unwrap();
+        assert_eq!(display_units(&out), ["A", "B", ""]);
+        assert_eq!(empty_unit_count(&out), 1, "{out:?}");
+    }
+
+    #[test]
+    fn move_block_past_empty() {
+        let src = "A\n\n\nB";
+        // units: A, empty, B — move B above empty (gap 1)
+        let (out, _) = move_block(src, 2, 1).unwrap();
+        assert_eq!(display_units(&out), ["A", "B", ""]);
+        assert_eq!(empty_unit_count(&out), 1, "{out:?}");
+    }
+
+    #[test]
+    fn type_between_code_and_table_stays_one_paragraph() {
+        let src = "```\nfn main() {}\n```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        let p = project(src);
+        let kinds: Vec<_> = p.blocks.iter().map(|b| b.kind).collect();
+        let empty = p
+            .blocks
+            .iter()
+            .find(|b| b.display.start == b.display.end)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no empty between code/table: kinds={kinds:?} n={} display={:?} src={src:?}",
+                    p.blocks.len(),
+                    p.display
+                )
+            });
+        let caret = empty.display.start;
+        let empty_ix = p
+            .blocks
+            .iter()
+            .position(|b| b.display.start == b.display.end)
+            .unwrap();
+        let mut src = src.to_string();
+        let mut at = caret;
+        for ch in ["h", "i"] {
+            let before = project(&src);
+            let (out, next) = insert_text(&src, at, None, ch, Affinity::Inside);
+            let afterp = project(&out);
+            assert_eq!(
+                afterp.blocks.len(),
+                before.blocks.len(),
+                "typing {ch:?} must not invent a line: before_kinds={:?} after_kinds={:?} out={out:?} caret_in={at} caret_out={next} empty_ix={empty_ix}",
+                before.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+                afterp.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+            );
+            src = out;
+            at = next;
+        }
+        let p2 = project(&src);
+        assert!(
+            p2.display.contains("hi"),
+            "typed text: display={:?} src={src:?}",
+            p2.display
+        );
+        assert!(
+            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Code)),
+            "{src:?}"
+        );
+        assert!(
+            p2.blocks.iter().any(|b| matches!(b.kind, BlockKind::Table)),
+            "{src:?}"
+        );
+        let para = p2
+            .blocks
+            .iter()
+            .find(|b| b.kind == BlockKind::Paragraph && b.display.start != b.display.end)
+            .map(|b| p2.display[b.display.clone()].to_string());
+        assert_eq!(
+            para.as_deref(),
+            Some("hi"),
+            "src={src:?} display={:?}",
+            p2.display
+        );
+    }
+
+    #[test]
+    fn hash_stays_paragraph_until_space() {
+        let ranges = crate::document::parse_ranges("#");
+        assert_eq!(
+            ranges[0].kind,
+            BlockKind::Paragraph,
+            "parse_ranges: {:?}",
+            ranges
+        );
+        let p = project("#");
+        assert_eq!(
+            p.blocks[0].kind,
+            BlockKind::Paragraph,
+            "{:?}",
+            p.blocks[0].kind
+        );
+        assert_eq!(p.display, "#");
+        let p = project("##");
+        assert_eq!(p.blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(p.display, "##");
+        let p = project("# ");
+        assert!(
+            matches!(p.blocks[0].kind, BlockKind::Heading(1)),
+            "{:?}",
+            p.blocks[0].kind
+        );
+        let p = project("## Hello");
+        assert!(matches!(p.blocks[0].kind, BlockKind::Heading(2)));
+        assert_eq!(p.display, "Hello");
+    }
+
+    #[test]
+    fn type_hash_then_space_becomes_heading() {
+        let src = "Hello\n\n";
+        let p = project(src);
+        let empty = p
+            .blocks
+            .iter()
+            .find(|b| b.display.start == b.display.end)
+            .expect("empty");
+        let caret = empty.display.start;
+        let (out, at) = insert_text(src, caret, None, "#", Affinity::Inside);
+        let p2 = project(&out);
+        assert_eq!(
+            p2.display.trim_end(),
+            "Hello\n#",
+            "display={:?} out={out:?}",
+            p2.display,
+        );
+        assert!(
+            matches!(
+                p2.block_at_display(at).map(|b| b.kind),
+                Some(BlockKind::Paragraph)
+            ),
+            "lone hash is still a paragraph: {:?}",
+            p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        let (out2, at2) = insert_text(&out, at, None, " ", Affinity::Inside);
+        let p3 = project(&out2);
+        assert!(
+            p3.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading(1))),
+            "hash+space becomes heading: kinds={:?} out={out2:?}",
+            p3.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
+        let _ = at2;
+    }
+
+    #[test]
+    fn move_block_below_empty() {
+        let src = "A\n\n\nB\n\nC";
+        // units: A, empty, B, C — move B to after empty is already there;
+        // move C to just after empty (gap 2)
+        assert_eq!(display_units(src)[0], "A");
+        let (out, _) = move_block(src, 3, 2).unwrap();
+        assert_eq!(display_units(&out), ["A", "", "C", "B"]);
+    }
 }
-
-
-
-
-
-

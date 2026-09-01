@@ -2,13 +2,13 @@
 
 use std::ops::Range;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    fill, px, size, App, Bounds, Element, ElementId, Entity, EntityInputHandler, FocusHandle,
+    div, fill, px, size, App, Bounds, Element, ElementId, Entity, EntityInputHandler, FocusHandle,
     GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement as _,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point,
-    Styled, StyledText, TextLayout, Window, div,
+    Styled, StyledText, TextLayout, Window,
 };
-use gpui::prelude::FluentBuilder as _;
 
 use crate::display::{Marks, Projection};
 use crate::theme::Palette;
@@ -55,6 +55,13 @@ pub fn highlights(
         if m.code {
             h.color = Some(p.markdown_code);
             h.background_color = Some(p.background_element);
+        }
+        if m.underline {
+            h.underline = Some(gpui::UnderlineStyle {
+                thickness: px(1.),
+                color: Some(p.markdown_text),
+                wavy: false,
+            });
         }
         if m.link.is_some() {
             h.color = Some(p.markdown_link);
@@ -237,8 +244,9 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
         }))
         .ok()
         .flatten()?;
-        let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
-            .unwrap_or(px(16.));
+        let h =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
+                .unwrap_or(px(16.));
         let w = if self.block {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.layout.position_for_index((local + 1).min(len))
@@ -292,7 +300,7 @@ pub fn edit_text<V: EntityInputHandler>(
     placeholder: Option<&str>,
     font_family: Option<gpui::SharedString>,
     font_px: Option<gpui::Pixels>,
-    on_click: impl Fn(usize, bool, &mut Window, &mut App) + 'static,
+    on_click: impl Fn(usize, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     let text = text.into();
@@ -368,7 +376,13 @@ pub fn edit_text<V: EntityInputHandler>(
                 } else {
                     index_for_click(&layout, ev.position)
                 };
-                on_click(display_start + idx, ev.modifiers.shift, window, cx);
+                on_click(
+                    display_start + idx,
+                    ev.modifiers.shift,
+                    ev.click_count,
+                    window,
+                    cx,
+                );
             }
         })
         .on_mouse_move({

@@ -266,5 +266,4 @@ font_size = 18
         assert_eq!(cfg.editor.as_str(), "notion");
         assert!(!cfg.editor.is_modal());
     }
-
 }

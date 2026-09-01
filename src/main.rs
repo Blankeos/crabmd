@@ -12,13 +12,16 @@ mod slash;
 mod surface;
 mod syntax;
 mod theme;
+mod tree;
 mod undo;
 mod wysiwyg;
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use gpui::{point, px, size, AppContext as _, Styled as _, TitlebarOptions, WindowBounds, WindowOptions};
+use gpui::{
+    point, px, size, AppContext as _, Styled as _, TitlebarOptions, WindowBounds, WindowOptions,
+};
 use gpui_component::{ActiveTheme as _, Root};
 
 use crate::config::Config;

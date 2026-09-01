@@ -5,9 +5,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-use crate::document::{
-    gfm_options, parse_ranges, sole_image, AlertKind, BlockKind, PaintRange,
-};
+use crate::document::{gfm_options, parse_ranges, sole_image, AlertKind, BlockKind, PaintRange};
 use crate::notion;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -16,12 +14,18 @@ pub struct Marks {
     pub italic: bool,
     pub strike: bool,
     pub code: bool,
+    pub underline: bool,
     pub link: Option<u32>,
 }
 
 impl Marks {
     pub fn any(self) -> bool {
-        self.bold || self.italic || self.strike || self.code || self.link.is_some()
+        self.bold
+            || self.italic
+            || self.strike
+            || self.code
+            || self.underline
+            || self.link.is_some()
     }
 }
 
@@ -147,11 +151,7 @@ impl Projection {
                 .segments
                 .iter()
                 .find(|s| d >= s.display.start && d < s.display.end)
-                .or_else(|| {
-                    self.segments
-                        .iter()
-                        .find(|s| d == s.display.start)
-                })
+                .or_else(|| self.segments.iter().find(|s| d == s.display.start))
                 .map(|s| s.marks)
                 .unwrap_or_default(),
         }
@@ -216,7 +216,8 @@ impl Projection {
                                     seg.source.end
                                 };
                             }
-                            if affinity == Affinity::Inside && seg.marks.any() && !next.marks.any() {
+                            if affinity == Affinity::Inside && seg.marks.any() && !next.marks.any()
+                            {
                                 return seg.source.end;
                             }
                             if affinity == Affinity::Outside && seg.marks.any() {
@@ -303,7 +304,9 @@ impl Projection {
         let BlockExtra::List { items, .. } = &block.extra else {
             return None;
         };
-        let item = items.iter().find(|it| d >= it.display.start && d <= it.display.end)?;
+        let item = items
+            .iter()
+            .find(|it| d >= it.display.start && d <= it.display.end)?;
         Some((block, item))
     }
 
@@ -514,10 +517,7 @@ fn project_block(
         return BlockExtra::Text;
     }
     if let Some((alt, img_src)) = sole_image(slice) {
-        return BlockExtra::Image {
-            alt,
-            src: img_src,
-        };
+        return BlockExtra::Image { alt, src: img_src };
     }
     match r.kind {
         BlockKind::Rule => BlockExtra::Rule,
@@ -556,9 +556,11 @@ fn project_block(
             BlockExtra::Alert(kind)
         }
         BlockKind::Paragraph => {
-            // Incomplete list markers (`-`, `1.`) must show as literal text until
+            // Incomplete list/heading markers must show as literal text until
             // the user types the trailing space that Notion uses to confirm.
-            if crate::document::is_incomplete_list_marker(slice) {
+            if crate::document::is_incomplete_list_marker(slice)
+                || crate::document::is_incomplete_heading_marker(slice)
+            {
                 let line = slice.trim_end_matches(['\n', '\r']);
                 let abs = r.range.start..r.range.start + line.len();
                 emit_plain(display, segments, abs, line, Marks::default());
@@ -913,7 +915,15 @@ fn project_inlines(
                 });
             }
             Event::InlineHtml(t) | Event::Html(t) => {
-                emit_plain(display, segments, abs, t.as_ref(), Marks::default());
+                let tag = t.as_ref().trim();
+                let lower = tag.to_ascii_lowercase();
+                if lower == "<u>" || lower == "<u/>" {
+                    marks.underline = true;
+                } else if lower == "</u>" {
+                    marks.underline = false;
+                } else {
+                    emit_plain(display, segments, abs, t.as_ref(), Marks::default());
+                }
             }
             _ => {}
         }

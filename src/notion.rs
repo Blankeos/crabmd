@@ -167,7 +167,10 @@ pub fn strip_list(source: &str) -> String {
 fn original_line_prefix(line: &str) -> Option<String> {
     if let Some((_, checked, _)) = crate::document::split_task_line(line) {
         let mark = if checked { "x" } else { " " };
-        let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect::<String>();
+        let indent = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect::<String>();
         return Some(format!("{indent}- [{mark}] "));
     }
     let bytes = line.as_bytes();
@@ -252,10 +255,7 @@ mod tests {
         let c = Block::with_kind(BlockKind::Code, "```rust\nfn main() {}\n```");
         assert_eq!(edit_text(&c), "fn main() {}");
         assert_eq!(commit(&c, "fn main() {}"), "```rust\nfn main() {}\n```");
-        let a = Block::with_kind(
-            BlockKind::Alert(AlertKind::Note),
-            "> [!NOTE]\n> body",
-        );
+        let a = Block::with_kind(BlockKind::Alert(AlertKind::Note), "> [!NOTE]\n> body");
         assert_eq!(edit_text(&a), "body");
         let out = commit(&a, "body");
         assert!(out.contains("[!NOTE]"));

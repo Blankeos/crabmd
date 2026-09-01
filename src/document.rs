@@ -11,7 +11,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_id() -> u64 {
+pub(crate) fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -181,6 +181,12 @@ pub fn parse_ranges(src: &str) -> Vec<PaintRange> {
                 entry.2 = BlockKind::Paragraph;
             }
         }
+        if matches!(entry.2, BlockKind::Heading(_)) {
+            let slice = src.get(entry.0..entry.1).unwrap_or("");
+            if is_incomplete_heading_marker(slice) {
+                entry.2 = BlockKind::Paragraph;
+            }
+        }
     }
 
     let mut ranges = Vec::new();
@@ -225,14 +231,24 @@ pub fn is_incomplete_list_marker(slice: &str) -> bool {
         return false;
     }
     let t = line.trim_start();
-    matches!(t, "-" | "*" | "+")
-        || {
-            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
-            digits > 0
-                && digits == t.len().saturating_sub(1)
-                && (t.ends_with('.') || t.ends_with(')'))
-                && t[..digits].chars().all(|c| c.is_ascii_digit())
-        }
+    matches!(t, "-" | "*" | "+") || {
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0
+            && digits == t.len().saturating_sub(1)
+            && (t.ends_with('.') || t.ends_with(')'))
+            && t[..digits].chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+/// `#` / `##` / … without a following space — not yet a heading in Notion.
+pub fn is_incomplete_heading_marker(slice: &str) -> bool {
+    let line = slice.trim_end_matches(['\n', '\r']);
+    if line.contains('\n') {
+        return false;
+    }
+    let t = line.trim_start();
+    let n = t.chars().take_while(|c| *c == '#').count();
+    n >= 1 && n <= 6 && n == t.len()
 }
 
 fn contains_caret(range: &Range<usize>, caret: usize, src_len: usize) -> bool {

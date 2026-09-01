@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     actions, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb, AnyElement,
-    App, AppContext as _, ClipboardEntry, Context, Entity, EntityInputHandler, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
+    App, AppContext as _, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle,
+    DragMoveEvent, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -23,26 +24,26 @@ use gpui_component::{
 
 use crate::config::{self, Config, EditorKind};
 use crate::display::{
-    project, wrap_cols_for, Affinity, BlockExtra, CODE_LANGS, COLUMN_PX, Projection,
+    project, wrap_cols_for, Affinity, BlockExtra, Projection, CODE_LANGS, COLUMN_PX,
 };
 use crate::document::{
-    alert_icon_name, extract_links, parse_ranges, splice, toggle_task_line, BlockKind, PaintRange,
+    alert_icon_name, extract_links, parse_ranges, splice, BlockKind, PaintRange,
 };
-use crate::surface::{self, Hit};
-use crate::wysiwyg::{self, Mark};
 use crate::images;
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
-    after_caret_same_line, apply_motion, block_caret_range, delete_char_at, delete_range, extend_visual_line,
-    find_char, first_non_blank_in, join_next_lines, join_range, last_line_start,
-    line_start_n, logical_line_delete_range, logical_line_range, paragraph_jump, push_count,
-    replace_chars, replace_selection, search_next, search_prev, take_count, visual_line_range,
-    whichwrap, FindKind, Motion,
+    after_caret_same_line, apply_motion, block_caret_range, delete_char_at, delete_range,
+    extend_visual_line, find_char, first_non_blank_in, join_next_lines, join_range,
+    last_line_start, line_start_n, logical_line_delete_range, logical_line_range, paragraph_jump,
+    push_count, replace_chars, replace_selection, search_next, search_prev, take_count,
+    visual_line_range, whichwrap, word_range_at, FindKind, Motion,
 };
 use crate::slash::{self, SlashItem};
+use crate::surface::{self, Hit};
 use crate::syntax;
 use crate::theme::{self, Appearance, Palette};
 use crate::undo::{Snapshot, UndoStack};
+use crate::wysiwyg::{self, Mark};
 
 actions!(
     crabmd,
@@ -117,10 +118,12 @@ actions!(
         ToggleItalic,
         ToggleStrike,
         ToggleCode,
+        ToggleUnderline,
         ToggleLink,
         InsertSlash,
         DeleteWordBack,
         DeleteLineBack,
+        CutSelection,
     ]
 );
 
@@ -206,11 +209,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-b", ToggleBold, Some("Workspace")),
         KeyBinding::new("cmd-i", ToggleItalic, Some("Workspace")),
         KeyBinding::new("ctrl-i", ToggleItalic, Some("Workspace")),
+        KeyBinding::new("cmd-u", ToggleUnderline, Some("Workspace")),
+        KeyBinding::new("ctrl-u", ToggleUnderline, Some("Workspace")),
         KeyBinding::new("cmd-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("ctrl-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("cmd-shift-s", ToggleStrike, Some("Workspace")),
         KeyBinding::new("cmd-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
+        KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
+        KeyBinding::new("ctrl-x", CutSelection, Some("Workspace")),
         KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("alt-backspace", DeleteWordBack, Some("Workspace")),
@@ -250,10 +257,15 @@ struct FontInputs {
 
 impl FontInputs {
     fn new(config: &Config, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
-        let mk = |value: String, placeholder: &str, window: &mut Window, cx: &mut Context<Workspace>| {
-            let ph = placeholder.to_string();
-            cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(ph))
-        };
+        let mk =
+            |value: String, placeholder: &str, window: &mut Window, cx: &mut Context<Workspace>| {
+                let ph = placeholder.to_string();
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .default_value(value)
+                        .placeholder(ph)
+                })
+            };
         let ui_family = mk(config.ui_font.family.clone(), "UI font family", window, cx);
         let ui_size = mk(config.ui_font.size.to_string(), "13", window, cx);
         let markdown_family = mk(
@@ -277,12 +289,14 @@ impl FontInputs {
                     size: &Entity<InputState>,
                     cx: &mut Context<Workspace>,
                     subs: &mut Vec<gpui::Subscription>| {
-            subs.push(cx.subscribe(family, move |this, input, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    let family = input.read(cx).value().to_string();
-                    this.apply_font_family(slot, family, cx);
-                }
-            }));
+            subs.push(
+                cx.subscribe(family, move |this, input, ev: &InputEvent, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let family = input.read(cx).value().to_string();
+                        this.apply_font_family(slot, family, cx);
+                    }
+                }),
+            );
             subs.push(cx.subscribe(size, move |this, input, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     let raw = input.read(cx).value().to_string();
@@ -322,6 +336,7 @@ impl FontInputs {
 
 pub struct Workspace {
     path: PathBuf,
+    doc: crate::tree::Doc,
     source: String,
     caret: usize,
     sel: Option<Range<usize>>,
@@ -361,6 +376,9 @@ pub struct Workspace {
     titlebar_moving: bool,
     mouse_anchor: Option<usize>,
     mouse_dragging: bool,
+    block_dragging: Option<usize>,
+    block_drag_gap: Option<usize>,
+    block_menu: Option<usize>,
     loading: bool,
     fonts: FontInputs,
 }
@@ -378,8 +396,10 @@ impl Workspace {
 
         let empty_doc = source.trim().is_empty();
         let fonts = FontInputs::new(&config, window, cx);
+        let doc = crate::tree::Doc::from_gfm(&source);
         let mut this = Self {
             path,
+            doc,
             source,
             caret: 0,
             sel: None,
@@ -418,6 +438,9 @@ impl Workspace {
             titlebar_moving: false,
             mouse_anchor: None,
             mouse_dragging: false,
+            block_dragging: None,
+            block_drag_gap: None,
+            block_menu: None,
             loading: false,
             fonts,
         };
@@ -471,7 +494,20 @@ impl Workspace {
     }
 
     fn proj(&self) -> Projection {
-        project(&self.source)
+        self.doc.project()
+    }
+
+    fn sync_gfm(&mut self) {
+        self.source = self.doc.to_gfm();
+    }
+
+    fn commit_caret(&mut self, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.caret = caret.min(self.proj().display.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
     }
 
     fn ui_font_px(&self) -> gpui::Pixels {
@@ -581,8 +617,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let keep_insert = self.mode.is_insert() || self.is_notion();
-        self.source = source;
-        self.caret = project(&self.source).to_display(caret.min(self.source.len()));
+        self.doc = crate::tree::Doc::from_gfm(&source);
+        self.source = self.doc.to_gfm();
+        self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.visual_anchor = None;
         self.dirty = true;
@@ -615,11 +652,10 @@ impl Workspace {
     fn request_short_block_scroll(&self) {
         let p = self.proj();
         let d = self.caret;
-        let Some(ix) = p
-            .blocks
-            .iter()
-            .position(|b| d >= b.display.start && d <= b.display.end)
-        else {
+        let Some(ix) = wysiwyg::units(&p).iter().position(|u| {
+            let r = wysiwyg::unit_display(&p, *u);
+            d >= r.start && d <= r.end
+        }) else {
             return;
         };
         let viewport = self.scroll_handle.bounds();
@@ -696,7 +732,8 @@ impl Workspace {
     }
 
     fn apply_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        self.source = snap.source;
+        self.doc = crate::tree::Doc::from_gfm(&snap.source);
+        self.source = self.doc.to_gfm();
         self.caret = snap.caret.min(project(&self.source).display.len());
         self.sel = snap.sel;
         self.insert_origin = None;
@@ -744,9 +781,9 @@ impl Workspace {
             return;
         }
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::enter(&self.source, self.caret, self.affinity, hard);
-        self.source = next;
-        self.caret = caret.min(self.proj().display.len());
+        self.caret = self.doc.enter(self.caret, hard);
+        self.sync_gfm();
+        self.caret = self.caret.min(self.proj().display.len());
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
@@ -754,7 +791,35 @@ impl Workspace {
         self.sync_title(window);
     }
 
-    pub fn click_display(&mut self, d: usize, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn click_display(
+        &mut self,
+        d: usize,
+        shift: bool,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if click_count >= 2 && !shift {
+            let p = self.proj();
+            let d = d.min(p.display.len());
+            let range = if click_count >= 3 {
+                crate::motion::logical_line_range(&p.display, d)
+            } else {
+                word_range_at(&p.display, d)
+            };
+            if range.start < range.end {
+                self.caret = range.end;
+                self.mouse_anchor = Some(range.start);
+                self.sel = Some(range);
+                self.affinity = Affinity::Inside;
+                self.mouse_dragging = false;
+                self.clamp_caret();
+                self.follow_caret = false;
+                self.focus.focus(window, cx);
+                cx.notify();
+                return;
+            }
+        }
         if shift {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -808,8 +873,15 @@ impl Workspace {
         cx.notify();
     }
 
-    fn commit_edit(&mut self, source: String, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.source = source;
+    fn commit_edit(
+        &mut self,
+        source: String,
+        caret: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.doc = crate::tree::Doc::from_gfm(&source);
+        self.source = self.doc.to_gfm();
         self.caret = caret.min(self.proj().display.len());
         self.sel = None;
         self.dirty = true;
@@ -854,9 +926,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::apply_slash(&self.source, self.caret, item.template);
-        self.source = next;
-        self.caret = caret.min(self.proj().display.len());
+        self.caret = self.doc.apply_slash(self.caret, item.template);
+        self.sync_gfm();
+        self.caret = self.caret.min(self.proj().display.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
@@ -865,9 +937,23 @@ impl Workspace {
     }
 
     fn close_slash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (next, caret) = wysiwyg::clear_slash_query(&self.source, self.caret);
-        self.source = next;
-        self.caret = caret.min(self.proj().display.len());
+        let p = self.proj();
+        if let Some((display, _)) = {
+            let d = self.caret.min(p.display.len());
+            p.block_at_display(d).and_then(|block| {
+                let body = p.display.get(block.display.clone())?;
+                let local = d.saturating_sub(block.display.start).min(body.len());
+                let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let rel = body[line_start..local].rfind('/')?;
+                let d0 = block.display.start + line_start + rel;
+                let d1 = block.display.start + local;
+                Some((d0..d1, ()))
+            })
+        } {
+            self.push_doc_undo();
+            self.caret = self.doc.delete_display(display);
+            self.sync_gfm();
+        }
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.dirty = true;
@@ -915,12 +1001,7 @@ impl Workspace {
         self.refresh(window, cx);
     }
 
-    fn apply_buffer_motion(
-        &mut self,
-        motion: Motion,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_buffer_motion(&mut self, motion: Motion, window: &mut Window, cx: &mut Context<Self>) {
         self.move_caret(motion, false, window, cx);
     }
 
@@ -999,7 +1080,13 @@ impl Workspace {
         self.land(d, window, cx);
     }
 
-    fn click_range(&mut self, range: Range<usize>, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_range(
+        &mut self,
+        range: Range<usize>,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let start = range.start.min(self.source.len());
         let end = range.end.min(self.source.len());
         if shift {
@@ -1032,7 +1119,11 @@ impl Workspace {
             return;
         }
         let anchor = self.mouse_anchor.unwrap_or(self.caret);
-        let at = if range.start >= anchor { range.end } else { range.start };
+        let at = if range.start >= anchor {
+            range.end
+        } else {
+            range.start
+        };
         self.visual_anchor = Some(anchor);
         self.caret = at.min(self.source.len());
         if self.config.editor.is_modal() && !self.mode.is_insert() {
@@ -1055,7 +1146,10 @@ impl Workspace {
             self.cancel_search(window, cx);
             return;
         }
-        if self.pending_replace.is_some() || self.pending_find.is_some() || self.pending_bracket.is_some() {
+        if self.pending_replace.is_some()
+            || self.pending_find.is_some()
+            || self.pending_bracket.is_some()
+        {
             self.clear_pending();
             cx.notify();
             return;
@@ -1082,7 +1176,12 @@ impl Workspace {
         self.enter_insert(Caret::Offset(self.caret), window, cx);
     }
 
-    fn on_insert_after(&mut self, _: &InsertAfterCaret, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_after(
+        &mut self,
+        _: &InsertAfterCaret,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1098,7 +1197,12 @@ impl Workspace {
         self.enter_insert(Caret::Offset(off), window, cx);
     }
 
-    fn on_insert_line_start(&mut self, _: &InsertLineStart, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_line_start(
+        &mut self,
+        _: &InsertLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_modal_nav() {
             return;
         }
@@ -1110,7 +1214,12 @@ impl Workspace {
         self.enter_insert(Caret::Offset(off), window, cx);
     }
 
-    fn on_insert_line_end(&mut self, _: &InsertLineEnd, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_line_end(
+        &mut self,
+        _: &InsertLineEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_modal_nav() {
             return;
         }
@@ -1165,7 +1274,10 @@ impl Workspace {
         }
         if self.mode == Mode::VisualLine {
             window.prevent_default();
-            let sel = self.sel.clone().unwrap_or_else(|| visual_line_range(&self.source, self.caret));
+            let sel = self
+                .sel
+                .clone()
+                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
             let next = extend_visual_line(&self.source, sel, 1);
             self.sel = Some(next.clone());
             self.caret = next.end.min(self.source.len());
@@ -1181,7 +1293,10 @@ impl Workspace {
         }
         if self.mode == Mode::VisualLine {
             window.prevent_default();
-            let sel = self.sel.clone().unwrap_or_else(|| visual_line_range(&self.source, self.caret));
+            let sel = self
+                .sel
+                .clone()
+                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
             let next = extend_visual_line(&self.source, sel, -1);
             self.sel = Some(next.clone());
             self.caret = next.start;
@@ -1205,7 +1320,12 @@ impl Workspace {
         }
         self.apply_buffer_motion(Motion::WordEnd, window, cx);
     }
-    fn on_word_forward_ws(&mut self, _: &WordForwardWs, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_word_forward_ws(
+        &mut self,
+        _: &WordForwardWs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_buffer_motion(Motion::WordForwardWs, window, cx);
     }
     fn on_word_back_ws(&mut self, _: &WordBackWs, window: &mut Window, cx: &mut Context<Self>) {
@@ -1217,7 +1337,12 @@ impl Workspace {
     fn on_line_start(&mut self, _: &LineStart, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_buffer_motion(Motion::LineStart, window, cx);
     }
-    fn on_line_first_non_blank(&mut self, _: &LineFirstNonBlank, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_line_first_non_blank(
+        &mut self,
+        _: &LineFirstNonBlank,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_buffer_motion(Motion::LineFirstNonBlank, window, cx);
     }
     fn on_line_end(&mut self, _: &LineEnd, window: &mut Window, cx: &mut Context<Self>) {
@@ -1257,16 +1382,36 @@ impl Workspace {
         self.pending_count = push_count(self.pending_count, d);
         cx.notify();
     }
-    fn on_digit0(&mut self, _: &Digit0, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(0, window, cx); }
-    fn on_digit1(&mut self, _: &Digit1, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(1, window, cx); }
-    fn on_digit2(&mut self, _: &Digit2, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(2, window, cx); }
-    fn on_digit3(&mut self, _: &Digit3, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(3, window, cx); }
-    fn on_digit4(&mut self, _: &Digit4, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(4, window, cx); }
-    fn on_digit5(&mut self, _: &Digit5, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(5, window, cx); }
-    fn on_digit6(&mut self, _: &Digit6, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(6, window, cx); }
-    fn on_digit7(&mut self, _: &Digit7, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(7, window, cx); }
-    fn on_digit8(&mut self, _: &Digit8, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(8, window, cx); }
-    fn on_digit9(&mut self, _: &Digit9, window: &mut Window, cx: &mut Context<Self>) { self.on_digit(9, window, cx); }
+    fn on_digit0(&mut self, _: &Digit0, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(0, window, cx);
+    }
+    fn on_digit1(&mut self, _: &Digit1, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(1, window, cx);
+    }
+    fn on_digit2(&mut self, _: &Digit2, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(2, window, cx);
+    }
+    fn on_digit3(&mut self, _: &Digit3, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(3, window, cx);
+    }
+    fn on_digit4(&mut self, _: &Digit4, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(4, window, cx);
+    }
+    fn on_digit5(&mut self, _: &Digit5, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(5, window, cx);
+    }
+    fn on_digit6(&mut self, _: &Digit6, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(6, window, cx);
+    }
+    fn on_digit7(&mut self, _: &Digit7, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(7, window, cx);
+    }
+    fn on_digit8(&mut self, _: &Digit8, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(8, window, cx);
+    }
+    fn on_digit9(&mut self, _: &Digit9, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_digit(9, window, cx);
+    }
 
     fn delete_selection_or_char(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let range = if let Some(sel) = self.sel.clone() {
@@ -1304,7 +1449,10 @@ impl Workspace {
             self.sel = Some(range.clone());
             self.caret = range.end.min(self.source.len());
         } else {
-            let sel = self.sel.clone().unwrap_or_else(|| visual_line_range(&self.source, self.caret));
+            let sel = self
+                .sel
+                .clone()
+                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
             let next = extend_visual_line(&self.source, sel, 1);
             self.sel = Some(next.clone());
             self.caret = next.end.min(self.source.len());
@@ -1380,7 +1528,10 @@ impl Workspace {
         }
         self.clear_pending();
         if self.mode == Mode::VisualLine {
-            let sel = self.sel.clone().unwrap_or_else(|| visual_line_range(&self.source, self.caret));
+            let sel = self
+                .sel
+                .clone()
+                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
             let next = extend_visual_line(&self.source, sel, 1);
             self.sel = Some(next.clone());
             self.caret = next.end.min(self.source.len());
@@ -1463,15 +1614,10 @@ impl Workspace {
         if self.insert_origin.is_none() {
             self.insert_origin = Some(self.snapshot());
         }
-        let (next, caret) = wysiwyg::insert_text(
-            &self.source,
-            self.caret,
-            self.sel.clone(),
-            "/",
-            self.affinity,
-        );
-        self.source = next;
-        self.caret = caret.min(self.proj().display.len());
+        self.caret = self
+            .doc
+            .insert_text(self.caret, self.sel.clone(), "/", self.sticky);
+        self.sync_gfm();
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
@@ -1484,7 +1630,12 @@ impl Workspace {
         self.sync_title(window);
     }
 
-    fn on_delete_word_back(&mut self, _: &DeleteWordBack, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_word_back(
+        &mut self,
+        _: &DeleteWordBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1501,7 +1652,12 @@ impl Workspace {
         self.commit_edit(next, caret, window, cx);
     }
 
-    fn on_delete_line_back(&mut self, _: &DeleteLineBack, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_line_back(
+        &mut self,
+        _: &DeleteLineBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1546,26 +1702,21 @@ impl Workspace {
         window.prevent_default();
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
             self.push_doc_undo();
-            let p = self.proj();
-            let d0 = p.to_display(sel.start);
-            let d1 = p.to_display(sel.end);
-            let (next, caret) = wysiwyg::delete_display_range(&self.source, d0..d1);
-            self.commit_edit(next, caret, window, cx);
-            return;
-        }
-        if let Some((next, caret)) = wysiwyg::backspace(&self.source, self.caret, self.affinity) {
-            self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
-            return;
-        }
-        let p = self.proj();
-        let d = self.caret;
-        if d == 0 {
+            let d0 = sel.start.min(sel.end);
+            let d1 = sel.end.max(sel.start);
+            let caret = self.doc.delete_display(d0..d1);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
             return;
         }
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::delete_char(&self.source, self.caret, self.affinity);
-        self.commit_edit(next, caret, window, cx);
+        let caret = if let Some(c) = self.doc.backspace(self.caret) {
+            c
+        } else {
+            self.doc.delete_char(self.caret)
+        };
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn on_open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -1588,7 +1739,9 @@ impl Workspace {
         cx.notify();
     }
     fn submit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((query, backward)) = self.search.take() else { return };
+        let Some((query, backward)) = self.search.take() else {
+            return;
+        };
         self.focus.focus(window, cx);
         let q = if query.is_empty() {
             match &self.last_search {
@@ -1612,7 +1765,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((query, _)) = self.last_search.clone() else { return };
+        let Some((query, _)) = self.last_search.clone() else {
+            return;
+        };
         let p = self.proj();
         let from = self.caret;
         let found = if forward {
@@ -1719,7 +1874,9 @@ impl Workspace {
         self.on_find(FindKind::TillBack, window, cx);
     }
     fn commit_find(&mut self, ch: char, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((kind, count)) = self.pending_find.take() else { return };
+        let Some((kind, count)) = self.pending_find.take() else {
+            return;
+        };
         self.last_find = Some((kind, ch));
         self.perform_find(kind, ch, count, window, cx);
     }
@@ -1783,7 +1940,9 @@ impl Workspace {
         cx.notify();
     }
     fn commit_bracket(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dir) = self.pending_bracket.take() else { return };
+        let Some(dir) = self.pending_bracket.take() else {
+            return;
+        };
         let count = take_count(&mut self.pending_count);
         let p = self.proj();
         let d = self.caret;
@@ -1859,7 +2018,12 @@ impl Workspace {
         cx.notify();
     }
 
-    fn on_toggle_settings(&mut self, _: &ToggleSettings, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_toggle_settings(
+        &mut self,
+        _: &ToggleSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.toggle_settings(window, cx);
     }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1922,7 +2086,9 @@ impl Workspace {
         cx.notify();
     }
     fn submit_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self.command.take() else { return };
+        let Some(input) = self.command.take() else {
+            return;
+        };
         self.focus.focus(window, cx);
         match mode::parse_ex(&input) {
             ExCommand::Cancel => {}
@@ -1969,21 +2135,14 @@ impl Workspace {
 
     fn toggle_task(
         &mut self,
-        range: Range<usize>,
-        line_ix: usize,
+        block_ix: usize,
+        item_ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let start = range.start.min(self.source.len());
-        let end = range.end.min(self.source.len()).max(start);
-        let slice = &self.source[start..end];
-        let Some(new_src) = toggle_task_line(slice, line_ix) else {
-            return;
-        };
-        if !self.mode.is_insert() {
-            self.push_doc_undo();
-        }
-        self.source = splice(&self.source, start..end, &new_src);
+        self.push_doc_undo();
+        self.doc.toggle_task(block_ix, item_ix);
+        self.sync_gfm();
         self.dirty = true;
         self.status = "unsaved".into();
         self.sync_title(window);
@@ -2017,7 +2176,9 @@ impl Workspace {
         };
         let mut did = false;
         for entry in clip.entries() {
-            let ClipboardEntry::Image(image) = entry else { continue };
+            let ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
             let ext = image.format.extension();
             let preferred = images::timestamped_name(&images::now_stamp(), ext);
             match images::write_beside(&self.path, &preferred, &image.bytes) {
@@ -2439,13 +2600,7 @@ impl Workspace {
                             .child(file_name),
                     )
                     .when(dirty, |el| {
-                        el.child(
-                            div()
-                                .w(px(7.))
-                                .h(px(7.))
-                                .rounded_full()
-                                .bg(p.primary),
-                        )
+                        el.child(div().w(px(7.)).h(px(7.)).rounded_full().bg(p.primary))
                     }),
             )
             .into_any_element()
@@ -2636,12 +2791,13 @@ impl Workspace {
                                 .min_w_0()
                                 .gap_2()
                                 .items_center()
-                                .child(div().flex_1().min_w_0().child(Input::new(family).cleanable(true)))
                                 .child(
                                     div()
-                                        .w(px(72.))
-                                        .child(Input::new(size).cleanable(false)),
-                                ),
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(family).cleanable(true)),
+                                )
+                                .child(div().w(px(72.)).child(Input::new(size).cleanable(false))),
                         )
                 };
                 let p = &self.palette;
@@ -2781,6 +2937,7 @@ impl Workspace {
         display: std::ops::Range<usize>,
         text: &str,
         heading: bool,
+        heading_level: Option<u8>,
         placeholder: Option<&str>,
         wrap: bool,
         syntax_lang: Option<&str>,
@@ -2800,14 +2957,7 @@ impl Workspace {
         let local_sel = surface::clip_range(d_sel, display.clone());
         let local_marked = surface::clip_range(d_marked, display.clone());
         let runs = surface::mark_runs(&p, display.clone());
-        let mut hs = surface::highlights(
-            text.len(),
-            &runs,
-            local_sel,
-            local_marked,
-            &pal,
-            heading,
-        );
+        let mut hs = surface::highlights(text.len(), &runs, local_sel, local_marked, &pal, heading);
         if let Some(lang) = syntax_lang {
             hs.extend(syntax::highlights(lang, text, &pal));
             hs = surface::flatten(text.len(), hs);
@@ -2822,10 +2972,17 @@ impl Workspace {
                 self.buffer_font_px(),
             )
         } else {
-            (
-                self.config.markdown_font.family.clone(),
-                self.markdown_font_px(),
-            )
+            let base = self.config.markdown_font.size.clamp(8, 48) as f32;
+            let scale = match heading_level {
+                Some(1) => 2.0,
+                Some(2) => 1.5,
+                Some(3) => 1.25,
+                Some(4) => 1.0,
+                Some(5) => 0.875,
+                Some(6) => 0.85,
+                _ => 1.0,
+            };
+            (self.config.markdown_font.family.clone(), px(base * scale))
         };
         let font = Some(gpui::SharedString::from(family));
         let font_px = Some(size);
@@ -2846,8 +3003,10 @@ impl Workspace {
             font_px,
             {
                 let view = view.clone();
-                move |d, shift, window, cx| {
-                    view.update(cx, |this, cx| this.click_display(d, shift, window, cx));
+                move |d, shift, clicks, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.click_display(d, shift, clicks, window, cx)
+                    });
                 }
             },
             {
@@ -2864,7 +3023,11 @@ impl Workspace {
         let pal = self.palette.clone();
         let wrap = self.config.wrap_motions;
         let block = p.blocks[ix].clone();
-        let text = p.display.get(block.display.clone()).unwrap_or("").to_string();
+        let text = p
+            .display
+            .get(block.display.clone())
+            .unwrap_or("")
+            .to_string();
         let empty = text.trim().is_empty() && !block.extra.is_atomic();
         let caret_here = {
             let d = self.caret;
@@ -2877,6 +3040,10 @@ impl Workspace {
             None
         };
         let heading = matches!(block.kind, BlockKind::Heading(_));
+        let heading_level = match block.kind {
+            BlockKind::Heading(l) => Some(l),
+            _ => None,
+        };
         let is_code = matches!(block.kind, BlockKind::Code);
         let syntax_lang = match &block.extra {
             BlockExtra::Code { lang } if !lang.is_empty() => Some(lang.as_str()),
@@ -2886,13 +3053,17 @@ impl Workspace {
             block.display.clone(),
             &text,
             heading,
+            heading_level,
             placeholder,
             wrap && !matches!(block.kind, BlockKind::Code | BlockKind::Html),
             syntax_lang,
             is_code,
             cx,
         );
-        let slash = self.slash_is_open() && p.block_at_display(self.caret).map(|b| b.source == block.source).unwrap_or(false);
+        let slash = self.slash_is_open()
+            && p.block_at_display(self.caret)
+                .map(|b| b.source == block.source)
+                .unwrap_or(false);
         match &block.extra {
             BlockExtra::Alert(kind) => {
                 let color = pal.alert_color(*kind);
@@ -2958,14 +3129,46 @@ impl Workspace {
                     let start = block.display.start;
                     let view = cx.entity();
                     move |ev: &MouseDownEvent, window, cx| {
-                        view.update(cx, |this, cx| this.click_display(start, ev.modifiers.shift, window, cx));
+                        view.update(cx, |this, cx| {
+                            this.click_display(
+                                start,
+                                ev.modifiers.shift,
+                                ev.click_count,
+                                window,
+                                cx,
+                            )
+                        });
                     }
                 })
                 .into_any_element(),
-            BlockExtra::Image { alt, src } => self.render_image_hit(alt, src, block.display.start, cx),
+            BlockExtra::Image { alt, src } => {
+                self.render_image_hit(alt, src, block.display.start, cx)
+            }
+            BlockExtra::Heading(level) => {
+                let mut el = v_flex()
+                    .relative()
+                    .w_full()
+                    .min_w_0()
+                    .when(*level <= 2, |el| el.pt_2())
+                    .child(body);
+                if slash {
+                    el = el.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(28.))
+                                .left_0()
+                                .occlude()
+                                .child(self.render_slash_menu(cx)),
+                        )
+                        .with_priority(1),
+                    );
+                }
+                el.into_any_element()
+            }
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
-            BlockExtra::Heading(_) | BlockExtra::Text | BlockExtra::Html => {
+            BlockExtra::Text | BlockExtra::Html => {
                 let mut el = v_flex().relative().w_full().min_w_0().child(body);
                 if slash {
                     // `deferred` paints after later sibling blocks so the menu
@@ -2987,7 +3190,13 @@ impl Workspace {
         }
     }
 
-    fn render_image_hit(&self, alt: &str, src: &str, display_start: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_image_hit(
+        &self,
+        alt: &str,
+        src: &str,
+        display_start: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         v_flex()
@@ -2998,17 +3207,39 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, {
                 let view = cx.entity();
                 move |ev: &MouseDownEvent, window, cx| {
-                    view.update(cx, |this, cx| this.click_display(display_start, ev.modifiers.shift, window, cx));
+                    view.update(cx, |this, cx| {
+                        this.click_display(
+                            display_start,
+                            ev.modifiers.shift,
+                            ev.click_count,
+                            window,
+                            cx,
+                        )
+                    });
                 }
             })
             .when(path.exists(), |el| {
-                el.child(img(path.clone()).max_w_full().max_h(px(480.)).rounded(px(6.)))
+                el.child(
+                    img(path.clone())
+                        .max_w_full()
+                        .max_h(px(480.))
+                        .rounded(px(6.)),
+                )
             })
             .when(!path.exists(), |el| {
-                el.child(div().text_color(pal.text_muted).child(format!("missing image: {src}")))
+                el.child(
+                    div()
+                        .text_color(pal.text_muted)
+                        .child(format!("missing image: {src}")),
+                )
             })
             .when(!alt.is_empty(), |el| {
-                el.child(div().text_xs().text_color(pal.text_muted).child(alt.to_string()))
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(pal.text_muted)
+                        .child(alt.to_string()),
+                )
             })
             .into_any_element()
     }
@@ -3027,13 +3258,16 @@ impl Workspace {
                         let entity = entity.clone();
                         let label = if lang.is_empty() { "plain" } else { *lang };
                         let lang = lang.to_string();
-                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                            entity.update(cx, |this, cx| {
-                                if let Some((next, caret)) = wysiwyg::set_code_lang(&this.source, this.caret, &lang) {
-                                    this.commit_edit(next, caret, window, cx);
-                                }
-                            });
-                        }));
+                        menu =
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    if let Some((next, caret)) =
+                                        wysiwyg::set_code_lang(&this.source, this.caret, &lang)
+                                    {
+                                        this.commit_edit(next, caret, window, cx);
+                                    }
+                                });
+                            }));
                     }
                     menu
                 }
@@ -3051,24 +3285,40 @@ impl Workspace {
     ) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let block = p.blocks[ix].clone();
         let wrap = self.config.wrap_motions;
         v_flex()
             .w_full()
             .min_w_0()
             .gap_1()
             .children(items.iter().enumerate().map(|(i, item)| {
-                let text = p.display.get(item.display.clone()).unwrap_or("").to_string();
+                let text = p
+                    .display
+                    .get(item.display.clone())
+                    .unwrap_or("")
+                    .to_string();
                 let bullet = if let Some(checked) = item.checked {
-                    if checked { "☑".to_string() } else { "☐".to_string() }
+                    if checked {
+                        "☑".to_string()
+                    } else {
+                        "☐".to_string()
+                    }
                 } else if ordered {
                     format!("{}.", i + 1)
                 } else {
                     "•".to_string()
                 };
                 let indent = px((item.indent as f32) * 16.);
-                let edit = self.render_edit(item.display.clone(), &text, false, None, wrap, None, false, cx);
-                let src_range = block.source.clone();
+                let edit = self.render_edit(
+                    item.display.clone(),
+                    &text,
+                    false,
+                    None,
+                    None,
+                    wrap,
+                    None,
+                    false,
+                    cx,
+                );
                 h_flex()
                     .id(("li", item.display.start))
                     .w_full()
@@ -3084,10 +3334,10 @@ impl Workspace {
                             .when(item.checked.is_some(), |el| {
                                 el.cursor_pointer().on_mouse_down(MouseButton::Left, {
                                     let view = cx.entity();
-                                    let src_range = src_range.clone();
+                                    let block_ix = ix;
                                     move |_, window, cx| {
                                         view.update(cx, |this, cx| {
-                                            this.toggle_task(src_range.clone(), i, window, cx);
+                                            this.toggle_task(block_ix, i, window, cx);
                                         });
                                     }
                                 })
@@ -3132,8 +3382,14 @@ impl Workspace {
                         } else {
                             (0..0, r == 0)
                         };
-                        let text = p.display.get(disp.clone()).unwrap_or("").replace('\t', "").to_string();
-                        let edit = self.render_edit(disp, &text, header, None, wrap, None, false, cx);
+                        let text = p
+                            .display
+                            .get(disp.clone())
+                            .unwrap_or("")
+                            .replace('\t', "")
+                            .to_string();
+                        let edit = self
+                            .render_edit(disp, &text, header, None, None, wrap, None, false, cx);
                         div()
                             .id(("td", r * 100 + c))
                             .flex_1()
@@ -3143,7 +3399,10 @@ impl Workspace {
                             .border_r_1()
                             .border_b_1()
                             .border_color(pal.border)
-                            .when(header, |el| el.bg(pal.background_element).font_weight(FontWeight::SEMIBOLD))
+                            .when(header, |el| {
+                                el.bg(pal.background_element)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                            })
                             .child(edit)
                             .into_any_element()
                     }))
@@ -3173,7 +3432,14 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn table_btn(&self, id: &'static str, label: &'static str, col: bool, before: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn table_btn(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        col: bool,
+        before: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         Button::new(id)
             .ghost()
             .xsmall()
@@ -3184,24 +3450,45 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn table_insert(&mut self, col: bool, before: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn table_insert(
+        &mut self,
+        col: bool,
+        before: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let p = self.proj();
         let d = self.caret;
-        let Some((block, cell)) = p.table_cell_at(d) else { return };
-        let BlockExtra::Table { cells, cols, .. } = &block.extra else { return };
+        let Some((block, cell)) = p.table_cell_at(d) else {
+            return;
+        };
+        let BlockExtra::Table { cells, cols, .. } = &block.extra else {
+            return;
+        };
         let cols = *cols;
         let (mut headers, mut rows) = {
             // rebuild from display
             let mut headers = vec![String::new(); cols.max(1)];
             let mut body: Vec<Vec<String>> = Vec::new();
             for c in cells {
-                let text = p.display.get(c.display.clone()).unwrap_or("").replace('\t', "").to_string();
+                let text = p
+                    .display
+                    .get(c.display.clone())
+                    .unwrap_or("")
+                    .replace('\t', "")
+                    .to_string();
                 if c.header {
-                    if c.col < headers.len() { headers[c.col] = text; }
+                    if c.col < headers.len() {
+                        headers[c.col] = text;
+                    }
                 } else {
                     let br = c.row.saturating_sub(1);
-                    while body.len() <= br { body.push(vec![String::new(); cols.max(1)]); }
-                    if c.col < body[br].len() { body[br][c.col] = text; }
+                    while body.len() <= br {
+                        body.push(vec![String::new(); cols.max(1)]);
+                    }
+                    if c.col < body[br].len() {
+                        body[br][c.col] = text;
+                    }
                 }
             }
             (headers, body)
@@ -3213,9 +3500,16 @@ impl Workspace {
                 row.insert(at.min(row.len()), String::new());
             }
         } else {
-            let body_row = if cell.header { 0 } else { cell.row.saturating_sub(1) };
+            let body_row = if cell.header {
+                0
+            } else {
+                cell.row.saturating_sub(1)
+            };
             let at = if before { body_row } else { body_row + 1 };
-            rows.insert(at.min(rows.len()), vec![String::new(); headers.len().max(1)]);
+            rows.insert(
+                at.min(rows.len()),
+                vec![String::new(); headers.len().max(1)],
+            );
         }
         let gfm = crate::display::serialize_table(&headers, &rows);
         self.push_doc_undo();
@@ -3226,8 +3520,12 @@ impl Workspace {
     fn delete_current_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let p = self.proj();
         let d = self.caret;
-        let Some(block) = p.block_at_display(d) else { return };
-        if !matches!(block.kind, BlockKind::Table) { return; }
+        let Some(block) = p.block_at_display(d) else {
+            return;
+        };
+        if !matches!(block.kind, BlockKind::Table) {
+            return;
+        }
         self.push_doc_undo();
         let next = splice(&self.source, block.source.clone(), "");
         self.commit_edit(next, block.source.start, window, cx);
@@ -3252,6 +3550,7 @@ impl Workspace {
             .shadow_sm()
             .child(self.mark_btn("B", Mark::Bold, cx))
             .child(self.mark_btn("I", Mark::Italic, cx))
+            .child(self.mark_btn("U", Mark::Underline, cx))
             .child(self.mark_btn("S", Mark::Strike, cx))
             .child(self.mark_btn("<>", Mark::Code, cx))
             .child(
@@ -3316,14 +3615,29 @@ impl Workspace {
             .items_center()
             .gap_1()
             .child(div().text_xs().text_color(p.text_muted).child("url"))
-            .child(div().text_sm().text_color(p.markdown_text).child(format!("{}▌", self.link_draft)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(p.markdown_text)
+                    .child(format!("{}▌", self.link_draft)),
+            )
             .into_any_element()
     }
 
-    fn on_insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_newline(
+        &mut self,
+        _: &InsertNewline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.insert_newline(false, window, cx);
     }
-    fn on_insert_hard_break(&mut self, _: &InsertHardBreak, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_insert_hard_break(
+        &mut self,
+        _: &InsertHardBreak,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.insert_newline(true, window, cx);
     }
     fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -3332,9 +3646,22 @@ impl Workspace {
             return;
         }
         window.prevent_default();
-        if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, false) {
+        if let Some(caret) = self.doc.tab(self.caret, false) {
             self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+            return;
+        }
+        // Table cell navigation still uses the GFM helper.
+        let p = self.proj();
+        if matches!(
+            p.block_at_display(self.caret).map(|b| &b.extra),
+            Some(BlockExtra::Table { .. })
+        ) {
+            if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, false) {
+                self.push_doc_undo();
+                self.commit_edit(next, caret, window, cx);
+            }
         }
     }
     fn on_outdent_tab(&mut self, _: &OutdentTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -3343,9 +3670,21 @@ impl Workspace {
             return;
         }
         window.prevent_default();
-        if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, true) {
+        if let Some(caret) = self.doc.tab(self.caret, true) {
             self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+            return;
+        }
+        let p = self.proj();
+        if matches!(
+            p.block_at_display(self.caret).map(|b| &b.extra),
+            Some(BlockExtra::Table { .. })
+        ) {
+            if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, true) {
+                self.push_doc_undo();
+                self.commit_edit(next, caret, window, cx);
+            }
         }
     }
     fn on_toggle_bold(&mut self, _: &ToggleBold, window: &mut Window, cx: &mut Context<Self>) {
@@ -3360,6 +3699,14 @@ impl Workspace {
     fn on_toggle_code(&mut self, _: &ToggleCode, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_mark_action(Mark::Code, window, cx);
     }
+    fn on_toggle_underline(
+        &mut self,
+        _: &ToggleUnderline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_mark_action(Mark::Underline, window, cx);
+    }
     fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
         if self.sel.as_ref().is_none_or(|s| s.start == s.end) && !self.link_open {
             return;
@@ -3370,50 +3717,497 @@ impl Workspace {
         cx.notify();
     }
 
+    fn on_cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) else {
+            return;
+        };
+        window.prevent_default();
+        let p = self.proj();
+        let a = sel.start.min(sel.end).min(p.display.len());
+        let b = sel.end.max(sel.start).min(p.display.len());
+        if a >= b {
+            return;
+        }
+        let text = p.display.get(a..b).unwrap_or("").to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.push_doc_undo();
+        self.caret = self.doc.delete_display(a..b);
+        self.sync_gfm();
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
     fn render_surface(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if !cx.has_active_drag() {
+            self.block_dragging = None;
+            self.block_drag_gap = None;
+        }
+        if cx.has_active_drag() {
+            self.block_menu = None;
+        }
         self.hits.clear();
         let p = self.proj();
-        let n = p.blocks.len();
+        let us = wysiwyg::units(&p);
+        let n = us.len();
         let mut kids = Vec::new();
-        for i in 0..n {
-            let start = p.blocks[i].display.start;
-            let end = p.blocks[i].display.end;
+        for (ui, unit) in us.iter().copied().enumerate() {
             let view = cx.entity();
+            let group = SharedString::from(format!("row-{ui}"));
+            let dragging = self.block_dragging == Some(ui);
+            let disp = wysiwyg::unit_display(&p, unit);
+            let start = disp.start;
+            let end = disp.end;
+            let list_item = unit.item;
             kids.push(
                 div()
-                    .id(("blk", i))
+                    .id(("row", ui))
+                    .group(group.clone())
                     .relative()
                     .w(px(COLUMN_PX))
                     .max_w_full()
                     .min_w_0()
                     .mx_auto()
                     .px_8()
-                    .py_2()
+                    .when(list_item.is_some(), |el| el.py_1())
+                    .when(list_item.is_none(), |el| el.py_2())
+                    .when(dragging, |el| el.opacity(0.45))
                     .on_mouse_down(MouseButton::Left, {
                         let view = view.clone();
                         move |ev: &MouseDownEvent, window, cx| {
                             view.update(cx, |this, cx| {
-                                // Prefer a measured hit; otherwise land on this block.
+                                this.block_menu = None;
                                 let d = surface::index_for_point(&this.hits, ev.position)
                                     .unwrap_or_else(|| {
-                                        // Above the first measured hit in this block → start.
                                         let _ = start;
                                         end
                                     });
-                                this.click_display(d, ev.modifiers.shift, window, cx);
+                                this.click_display(
+                                    d,
+                                    ev.modifiers.shift,
+                                    ev.click_count,
+                                    window,
+                                    cx,
+                                );
                             });
                         }
                     })
-                    .child(self.render_block(i, cx))
-                    .children(self.selection_bubble_for_block(i, cx))
+                    .can_drop(|v, _, _| v.downcast_ref::<DragBlock>().is_some())
+                    .on_drag_move(
+                        cx.listener(move |this, e: &DragMoveEvent<DragBlock>, _, cx| {
+                            this.gap_from_row_bounds(ui, e.bounds, e.event.position.y, n, cx);
+                        }),
+                    )
+                    .on_drop(cx.listener(|this, drag: &DragBlock, window, cx| {
+                        this.drop_block_at(drag.ix, window, cx);
+                    }))
+                    .child(if let Some(item_ix) = list_item {
+                        self.render_list_item_row(unit.block, item_ix, cx)
+                    } else {
+                        self.render_block(unit.block, cx)
+                    })
+                    .child(self.render_drop_edge(ui, n, cx))
+                    .child(self.render_block_handle(ui, group, list_item.is_some(), cx))
+                    .children(self.render_handle_menu(ui, cx))
+                    .children(self.selection_bubble_for_unit(unit.block, list_item, cx))
                     .into_any_element(),
             );
         }
         let overscroll = self.overscroll_px();
         if overscroll > px(0.) {
-            kids.push(div().w_full().h(overscroll).flex_shrink_0().into_any_element());
+            kids.push(
+                div()
+                    .w_full()
+                    .h(overscroll)
+                    .flex_shrink_0()
+                    .into_any_element(),
+            );
         }
         kids
+    }
+
+    fn render_block_handle(
+        &self,
+        ix: usize,
+        group: SharedString,
+        list_item: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = &self.palette;
+        let muted = pal.text_muted;
+        let p = self.proj();
+        let us = wysiwyg::units(&p);
+        let preview = us
+            .get(ix)
+            .map(|u| {
+                let t = p
+                    .display
+                    .get(wysiwyg::unit_display(&p, *u))
+                    .unwrap_or("")
+                    .trim();
+                if t.is_empty() {
+                    "Empty".to_string()
+                } else {
+                    let mut s = t.lines().next().unwrap_or(t).to_string();
+                    if s.chars().count() > 40 {
+                        s = s.chars().take(40).collect();
+                        s.push('…');
+                    }
+                    s
+                }
+            })
+            .unwrap_or_else(|| "Block".into());
+        let drag = DragBlock {
+            ix,
+            preview,
+            bg: pal.background_panel,
+            fg: pal.markdown_text,
+            border: pal.border,
+        };
+        let force = self.block_dragging == Some(ix) || self.block_menu == Some(ix);
+        let view = cx.entity();
+        let handle = div()
+            .id(("grip", ix))
+            .p(px(2.))
+            .rounded(px(4.))
+            .cursor(CursorStyle::OpenHand)
+            .hover(|el| el.bg(pal.background_element))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click({
+                let view = view.clone();
+                move |_: &ClickEvent, _, cx| {
+                    view.update(cx, |this, cx| {
+                        if this.block_dragging.is_some() {
+                            return;
+                        }
+                        this.block_menu = if this.block_menu == Some(ix) {
+                            None
+                        } else {
+                            Some(ix)
+                        };
+                        cx.notify();
+                    });
+                }
+            })
+            .on_drag(drag, {
+                let view = view.clone();
+                move |drag, _, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.mouse_dragging = false;
+                        this.block_menu = None;
+                        this.block_dragging = Some(drag.ix);
+                        this.block_drag_gap = Some(drag.ix);
+                        cx.notify();
+                    });
+                    cx.new(|_| drag.clone())
+                }
+            })
+            .child(icon_el("grip-vertical", muted));
+
+        div()
+            .id(("grip-wrap", ix))
+            .absolute()
+            .left(px(2.))
+            .top(if list_item { px(2.) } else { px(10.) })
+            .opacity(if force { 1. } else { 0. })
+            .group_hover(group, |s| s.opacity(1.))
+            .child(handle)
+            .into_any_element()
+    }
+
+    fn render_handle_menu(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.block_menu != Some(ix) || cx.has_active_drag() {
+            return None;
+        }
+        let pal = &self.palette;
+        let err = pal.error;
+        let muted = pal.text_muted;
+        let text = pal.markdown_text;
+        let panel = pal.background_panel;
+        let border = pal.border;
+        let hover = pal.background_element;
+        Some(
+            deferred(
+                v_flex()
+                    .id(("grip-menu", ix))
+                    .absolute()
+                    .left(px(28.))
+                    .top(px(8.))
+                    .w(px(168.))
+                    .py_1()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel)
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        h_flex()
+                            .id(("grip-dup", ix))
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(hover))
+                            .on_mouse_down(MouseButton::Left, {
+                                let view = cx.entity();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.block_menu = None;
+                                        this.duplicate_block_at(ix, window, cx);
+                                    });
+                                }
+                            })
+                            .child(icon_el("copy", muted))
+                            .child(div().text_sm().text_color(text).child("Duplicate")),
+                    )
+                    .child(
+                        h_flex()
+                            .id(("grip-del", ix))
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(hover))
+                            .on_mouse_down(MouseButton::Left, {
+                                let view = cx.entity();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.block_menu = None;
+                                        this.delete_block_at(ix, window, cx);
+                                    });
+                                }
+                            })
+                            .child(icon_el("trash-2", err))
+                            .child(div().text_sm().text_color(err).child("Delete")),
+                    ),
+            )
+            .with_priority(3)
+            .into_any_element(),
+        )
+    }
+
+    fn render_list_item_row(
+        &mut self,
+        block_ix: usize,
+        item_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
+        let wrap = self.config.wrap_motions;
+        let block = p.blocks[block_ix].clone();
+        let BlockExtra::List { items, ordered } = &block.extra else {
+            return div().into_any_element();
+        };
+        let Some(item) = items.get(item_ix) else {
+            return div().into_any_element();
+        };
+        let text = p
+            .display
+            .get(item.display.clone())
+            .unwrap_or("")
+            .to_string();
+        let checked = item.checked;
+        let indent = px((item.indent as f32) * 16.);
+        let ordered = *ordered;
+        let edit = self.render_edit(
+            item.display.clone(),
+            &text,
+            false,
+            None,
+            None,
+            wrap,
+            None,
+            false,
+            cx,
+        );
+        h_flex()
+            .id(("li", item.display.start))
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_2()
+            .pl(indent)
+            .child(
+                div()
+                    .w(px(18.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(pal.markdown_list_item)
+                    .when(checked.is_some(), |el| {
+                        el.cursor_pointer().on_mouse_down(MouseButton::Left, {
+                            let view = cx.entity();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.toggle_task(block_ix, item_ix, window, cx);
+                                });
+                            }
+                        })
+                    })
+                    .child(match checked {
+                        Some(true) => {
+                            icon_el("square-check", pal.markdown_list_item).into_any_element()
+                        }
+                        Some(false) => icon_el("square", pal.markdown_list_item).into_any_element(),
+                        None if ordered => {
+                            div().child(format!("{}.", item_ix + 1)).into_any_element()
+                        }
+                        None => div().child("•").into_any_element(),
+                    }),
+            )
+            .child(div().flex_1().min_w_0().child(edit))
+            .into_any_element()
+    }
+
+    fn selection_bubble_for_unit(
+        &self,
+        block_ix: usize,
+        item: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if item.is_some() {
+            let p = self.proj();
+            let block = p.blocks.get(block_ix)?;
+            let BlockExtra::List { items, .. } = &block.extra else {
+                return None;
+            };
+            let it = items.get(item?)?;
+            let d = self
+                .sel
+                .as_ref()
+                .filter(|s| s.start != s.end)
+                .map(|s| p.to_display(s.start.min(s.end)))
+                .unwrap_or(self.caret);
+            if d < it.display.start || d > it.display.end {
+                return None;
+            }
+        }
+        self.selection_bubble_for_block(block_ix, cx)
+    }
+
+    fn render_drop_edge(&self, ix: usize, n: usize, cx: &mut Context<Self>) -> AnyElement {
+        if !cx.has_active_drag() {
+            return div().into_any_element();
+        }
+        let Some(from) = self.block_dragging else {
+            return div().into_any_element();
+        };
+        let Some(gap) = self.block_drag_gap else {
+            return div().into_any_element();
+        };
+        if gap == from || gap == from + 1 {
+            return div().into_any_element();
+        }
+        let at_top = gap == ix;
+        let at_bottom = gap == n && ix + 1 == n;
+        if !at_top && !at_bottom {
+            return div().into_any_element();
+        }
+        let pal = &self.palette;
+        h_flex()
+            .absolute()
+            .left_0()
+            .right_0()
+            .when(at_top, |el| el.top(px(-5.)))
+            .when(at_bottom, |el| el.bottom(px(-5.)))
+            .items_center()
+            .h(px(10.))
+            .occlude()
+            .child(
+                div()
+                    .size(px(8.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(pal.primary)
+                    .bg(pal.background),
+            )
+            .child(div().flex_1().h(px(2.)).rounded(px(1.)).bg(pal.primary))
+            .into_any_element()
+    }
+
+    fn delete_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.block_menu = None;
+        if let Some((next, caret)) = wysiwyg::delete_block(&self.source, ix) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+        }
+    }
+
+    fn duplicate_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.block_menu = None;
+        if let Some((next, caret)) = wysiwyg::duplicate_block(&self.source, ix) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+        }
+    }
+
+    fn drop_block_at(&mut self, from: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let gap = self.block_drag_gap.unwrap_or(from);
+        self.block_dragging = None;
+        self.block_drag_gap = None;
+        self.block_menu = None;
+        if let Some((next, caret)) = wysiwyg::move_block(&self.source, from, gap) {
+            self.push_doc_undo();
+            self.commit_edit(next, caret, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn gap_from_row_bounds(
+        &mut self,
+        row: usize,
+        bounds: Bounds<Pixels>,
+        y: Pixels,
+        n: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if y < bounds.origin.y || y > bounds.origin.y + bounds.size.height {
+            return;
+        }
+        let gap = if y < bounds.origin.y + bounds.size.height / 2. {
+            row
+        } else {
+            (row + 1).min(n)
+        };
+        if self.block_drag_gap != Some(gap) {
+            self.block_drag_gap = Some(gap);
+            cx.notify();
+        }
+    }
+
+    fn update_block_drag_gap(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let n = wysiwyg::units(&self.proj()).len();
+        let offset = self.scroll_handle.offset();
+        let mut gap = n;
+        for i in 0..n {
+            let Some(bounds) = self.scroll_handle.bounds_for_item(i) else {
+                continue;
+            };
+            let top = bounds.origin.y + offset.y;
+            let mid = top + bounds.size.height / 2.;
+            if y < mid {
+                gap = i;
+                break;
+            }
+            gap = i + 1;
+        }
+        if self.block_drag_gap != Some(gap) {
+            self.block_drag_gap = Some(gap);
+            cx.notify();
+        }
     }
 
     fn overscroll_px(&self) -> gpui::Pixels {
@@ -3426,7 +4220,7 @@ impl Workspace {
         if viewport <= px(0.) {
             return px(0.);
         }
-        let last = self.proj().blocks.len().saturating_sub(1);
+        let last = wysiwyg::units(&self.proj()).len().saturating_sub(1);
         let last_h = self
             .scroll_handle
             .bounds_for_item(last)
@@ -3437,9 +4231,9 @@ impl Workspace {
 
     fn toggle_mark_action(&mut self, mark: Mark, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
-            if let Some((next, range)) = wysiwyg::toggle_mark(&self.source, sel, mark) {
-                self.push_doc_undo();
-                self.source = next;
+            self.push_doc_undo();
+            if let Some(range) = self.doc.toggle_mark(sel, mark) {
+                self.sync_gfm();
                 self.caret = range.end.min(self.proj().display.len());
                 self.sel = Some(range);
                 self.dirty = true;
@@ -3453,6 +4247,7 @@ impl Workspace {
                 Mark::Italic => self.sticky.italic = !self.sticky.italic,
                 Mark::Strike => self.sticky.strike = !self.sticky.strike,
                 Mark::Code => self.sticky.code = !self.sticky.code,
+                Mark::Underline => self.sticky.underline = !self.sticky.underline,
             }
             cx.notify();
         }
@@ -3472,7 +4267,9 @@ impl Workspace {
         let mut utf8 = 0;
         let mut utf16 = 0;
         for ch in text.chars() {
-            if utf16 >= offset { break; }
+            if utf16 >= offset {
+                break;
+            }
             utf16 += ch.len_utf16();
             utf8 += ch.len_utf8();
         }
@@ -3483,11 +4280,46 @@ impl Workspace {
         let mut utf16 = 0;
         let mut utf8 = 0;
         for ch in text.chars() {
-            if utf8 >= offset { break; }
+            if utf8 >= offset {
+                break;
+            }
             utf8 += ch.len_utf8();
             utf16 += ch.len_utf16();
         }
         utf16
+    }
+}
+
+#[derive(Clone)]
+struct DragBlock {
+    ix: usize,
+    preview: String,
+    bg: gpui::Hsla,
+    fg: gpui::Hsla,
+    border: gpui::Hsla,
+}
+
+impl Render for DragBlock {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(self.border)
+            .bg(self.bg)
+            .shadow_lg()
+            .child(icon_el("grip-vertical", self.fg))
+            .child(
+                div()
+                    .max_w(px(220.))
+                    .text_sm()
+                    .text_color(self.fg)
+                    .whitespace_nowrap()
+                    .child(self.preview.clone()),
+            )
     }
 }
 
@@ -3498,7 +4330,6 @@ fn icon_el(name: &str, color: gpui::Hsla) -> Icon {
         .w(px(16.))
         .h(px(16.))
 }
-
 
 pub fn window_title(path: &Path, dirty: bool) -> String {
     let name = path
@@ -3579,9 +4410,8 @@ impl EntityInputHandler for Workspace {
         let p = self.proj();
         let start = Self::offset_from_utf16(&p.display, range_utf16.start);
         let end = Self::offset_from_utf16(&p.display, range_utf16.end);
-        *adjusted = Some(
-            Self::offset_to_utf16(&p.display, start)..Self::offset_to_utf16(&p.display, end),
-        );
+        *adjusted =
+            Some(Self::offset_to_utf16(&p.display, start)..Self::offset_to_utf16(&p.display, end));
         Some(p.display.get(start..end).unwrap_or("").to_string())
     }
 
@@ -3610,7 +4440,11 @@ impl EntityInputHandler for Workspace {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
         let marked = self.marked.as_ref()?;
         let p = self.proj();
         Some(
@@ -3655,19 +4489,23 @@ impl EntityInputHandler for Workspace {
             if self.insert_origin.is_none() {
                 self.insert_origin = Some(self.snapshot());
             }
-            let (next, caret) = if display_range.end == self.caret
-                && display_range.end - display_range.start == p.display[..display_range.end]
-                    .chars()
-                    .next_back()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(1)
+            self.caret = if display_range.end == self.caret
+                && display_range.end - display_range.start
+                    == p.display[..display_range.end]
+                        .chars()
+                        .next_back()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1)
             {
-                wysiwyg::delete_char(&self.source, self.caret, self.affinity)
+                if let Some(c) = self.doc.backspace(self.caret) {
+                    c
+                } else {
+                    self.doc.delete_char(self.caret)
+                }
             } else {
-                wysiwyg::delete_display_range(&self.source, display_range)
+                self.doc.delete_display(display_range)
             };
-            self.source = next;
-            self.caret = caret.min(self.proj().display.len());
+            self.sync_gfm();
             self.sel = None;
             self.marked = None;
             self.dirty = true;
@@ -3676,30 +4514,18 @@ impl EntityInputHandler for Workspace {
             self.sync_title(window);
             return;
         }
-        let mut insert = text.to_string();
-        if self.sticky.bold && !insert.contains("**") {
-            insert = format!("**{insert}**");
-        } else if self.sticky.italic && !insert.contains('*') {
-            insert = format!("*{insert}*");
-        } else if self.sticky.strike {
-            insert = format!("~~{insert}~~");
-        } else if self.sticky.code {
-            insert = format!("`{insert}`");
-        }
         if self.insert_origin.is_none() {
             self.insert_origin = Some(self.snapshot());
         }
-        // Point inserts go through wysiwyg so typing into an empty paragraph
-        // replaces the blank slot instead of collapsing `\n\n` into the next block.
-        let (next, caret) = if display_range.start == display_range.end {
-            crate::wysiwyg::insert_text(&self.source, self.caret, None, &insert, self.affinity)
+        self.caret = if display_range.start == display_range.end {
+            self.doc
+                .insert_text(self.caret, None, text, self.sticky)
         } else {
-            let src_range = p.display_range_to_source(display_range, self.affinity);
-            let next = splice(&self.source, src_range.clone(), &insert);
-            (next, src_range.start + insert.len())
+            self.doc.delete_display(display_range.clone());
+            self.doc
+                .insert_text(display_range.start, None, text, self.sticky)
         };
-        self.source = next;
-        self.caret = caret.min(self.proj().display.len());
+        self.sync_gfm();
         self.sel = None;
         self.marked = None;
         self.dirty = true;
@@ -3749,7 +4575,8 @@ impl EntityInputHandler for Workspace {
         let p = self.proj();
         let start = Self::offset_from_utf16(&p.display, range_utf16.start);
         for hit in &self.hits {
-            let len = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.len())).ok()?;
+            let len =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.len())).ok()?;
             if start >= hit.display_start && start <= hit.display_start + len {
                 let local = start.saturating_sub(hit.display_start);
                 let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3879,7 +4706,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_italic))
             .on_action(cx.listener(Self::on_toggle_strike))
             .on_action(cx.listener(Self::on_toggle_code))
+            .on_action(cx.listener(Self::on_toggle_underline))
             .on_action(cx.listener(Self::on_toggle_link))
+            .on_action(cx.listener(Self::on_cut_selection))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {
                     cx.stop_propagation();
@@ -3905,9 +4734,18 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .can_drop(|v, _, _| v.downcast_ref::<ExternalPaths>().is_some())
+            .can_drop(|v, _, _| {
+                v.downcast_ref::<ExternalPaths>().is_some()
+                    || v.downcast_ref::<DragBlock>().is_some()
+            })
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.import_paths(paths.paths(), window, cx);
+            }))
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<DragBlock>, _, cx| {
+                this.update_block_drag_gap(e.event.position.y, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &DragBlock, window, cx| {
+                this.drop_block_at(drag.ix, window, cx);
             }))
             .size_full()
             .bg(p.background)
@@ -3945,7 +4783,13 @@ impl Render for Workspace {
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                             if let Some(d) = surface::index_for_point(&this.hits, ev.position) {
-                                this.click_display(d, ev.modifiers.shift, window, cx);
+                                this.click_display(
+                                    d,
+                                    ev.modifiers.shift,
+                                    ev.click_count,
+                                    window,
+                                    cx,
+                                );
                             }
                         }),
                     )
@@ -3971,11 +4815,13 @@ impl Render for Workspace {
                                 .text_color(if insert { p.primary } else { p.text_muted })
                                 .child(mode_label),
                         )
-                        .child(div().text_xs().text_color(p.text_muted).child(format!(
-                            "{}{}",
-                            file_name,
-                            if dirty { " · unsaved" } else { "" }
-                        )))
+                        .child(
+                            div().text_xs().text_color(p.text_muted).child(format!(
+                                "{}{}",
+                                file_name,
+                                if dirty { " · unsaved" } else { "" }
+                            )),
+                        )
                     })
                     .when_some(command, |el, cmd| {
                         el.child(

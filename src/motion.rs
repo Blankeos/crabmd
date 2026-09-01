@@ -63,7 +63,10 @@ fn next_char(source: &str, offset: usize) -> Option<(usize, char)> {
 
 fn prev_char(source: &str, offset: usize) -> Option<(usize, char)> {
     let offset = clamp_off(source, offset);
-    source[..offset].chars().next_back().map(|c| (c.len_utf8(), c))
+    source[..offset]
+        .chars()
+        .next_back()
+        .map(|c| (c.len_utf8(), c))
 }
 
 /// Logical line bounds: `start..end` where `end` is the newline or `len`.
@@ -82,7 +85,11 @@ pub fn first_non_blank_in(source: &str, range: Range<usize>) -> usize {
     let skip = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
     let mut i = range.start;
     for _ in 0..skip {
-        i += source[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+        i += source[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
     }
     i.min(range.end)
 }
@@ -167,12 +174,7 @@ fn offset_at_col(source: &str, row: &Range<usize>, col: usize) -> usize {
     row.end
 }
 
-fn apply_once(
-    source: &str,
-    offset: usize,
-    motion: Motion,
-    wrap_cols: Option<usize>,
-) -> usize {
+fn apply_once(source: &str, offset: usize, motion: Motion, wrap_cols: Option<usize>) -> usize {
     let offset = clamp_off(source, offset);
     match motion {
         Motion::Left => {
@@ -230,6 +232,34 @@ fn apply_once(
         Motion::WordBackWs => word_back_ws(source, offset),
         Motion::WordEndWs => word_end_ws(source, offset),
     }
+}
+
+/// Byte range of the word (or punctuation run) under `offset`.
+/// Empty when the caret sits on whitespace / empty text.
+pub fn word_range_at(source: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_off(source, offset);
+    if source.is_empty() {
+        return 0..0;
+    }
+    let probe = if offset >= source.len() {
+        // Prefer the char before EOF so double-click at end selects the last word.
+        match prev_char(source, offset) {
+            Some((n, _)) => offset - n,
+            None => return offset..offset,
+        }
+    } else {
+        offset
+    };
+    let Some((_, c)) = next_char(source, probe) else {
+        return offset..offset;
+    };
+    let cls = class(c);
+    if cls == Class::Blank {
+        return offset..offset;
+    }
+    let start = skip_while_back(source, probe, |ch| class(ch) == cls);
+    let end = skip_while(source, probe, |ch| class(ch) == cls);
+    start..end
 }
 
 fn skip_while(source: &str, mut offset: usize, pred: impl Fn(char) -> bool) -> usize {
@@ -435,7 +465,11 @@ pub fn extend_visual_line(source: &str, sel: Range<usize>, dir: i8) -> Range<usi
     let start = sel.start.min(sel.end).min(source.len());
     let end = sel.start.max(sel.end).min(source.len());
     if dir >= 0 {
-        let at = if end < source.len() { end } else { end.saturating_sub(1) };
+        let at = if end < source.len() {
+            end
+        } else {
+            end.saturating_sub(1)
+        };
         let next = logical_line_delete_range(source, at);
         start.min(next.start)..end.max(next.end)
     } else {
@@ -459,7 +493,11 @@ pub fn delete_char_at(source: &str, offset: usize) -> (String, usize) {
     if offset >= source.len() {
         return (source.to_string(), offset);
     }
-    let n = source[offset..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+    let n = source[offset..]
+        .chars()
+        .next()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0);
     delete_range(source, offset..offset + n)
 }
 
@@ -469,7 +507,9 @@ pub fn logical_line_delete_range(source: &str, offset: usize) -> Range<usize> {
     let mut range = logical_line_range(source, offset);
     if range.end < source.len() && source.as_bytes()[range.end] == b'\n' {
         range.end += 1;
-    } else if range.start > 0 && source.as_bytes()[range.start - 1] == b'\n' && range.end == source.len()
+    } else if range.start > 0
+        && source.as_bytes()[range.start - 1] == b'\n'
+        && range.end == source.len()
     {
         range.start -= 1;
     }
@@ -546,7 +586,6 @@ pub fn take_count(pending: &mut Option<usize>) -> usize {
     pending.take().unwrap_or(1).max(1)
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FindKind {
     Forward,
@@ -592,7 +631,9 @@ pub fn find_char(
                 }
             }
             while i < bound.end {
-                let Some((n, c)) = next_char(source, i) else { break };
+                let Some((n, c)) = next_char(source, i) else {
+                    break;
+                };
                 if c == ch {
                     found += 1;
                     if found == count {
@@ -610,7 +651,9 @@ pub fn find_char(
             let mut found = 0usize;
             let mut i = offset;
             while i > bound.start {
-                let Some((n, c)) = prev_char(source, i) else { break };
+                let Some((n, c)) = prev_char(source, i) else {
+                    break;
+                };
                 let pos = i - n;
                 if c == ch {
                     found += 1;
@@ -812,7 +855,8 @@ fn next_paragraph(source: &str, offset: usize) -> usize {
         .unwrap_or(starts.len());
     // Advance to a blank line (or stay), then the next non-blank.
     let mut seen_blank = line_is_blank(source, logical_line_range(source, offset).start)
-        || (offset > 0 && source.as_bytes().get(offset.saturating_sub(1)) == Some(&b'\n')
+        || (offset > 0
+            && source.as_bytes().get(offset.saturating_sub(1)) == Some(&b'\n')
             && source.as_bytes().get(offset.saturating_sub(2)) == Some(&b'\n'));
     while ix < starts.len() {
         let s = starts[ix];
@@ -876,7 +920,11 @@ pub fn heading_jump(source: &str, offset: usize, dir: i8, count: usize) -> usize
 fn is_heading_line(source: &str, start: usize) -> bool {
     let line = &source[start..];
     let t = line.trim_start_matches([' ', '\t']);
-    t.starts_with('#') && t.as_bytes().get(1).map(|b| *b == b'#' || *b == b' ' || *b == b'\n').unwrap_or(true)
+    t.starts_with('#')
+        && t.as_bytes()
+            .get(1)
+            .map(|b| *b == b'#' || *b == b' ' || *b == b'\n')
+            .unwrap_or(true)
 }
 
 fn next_heading(source: &str, offset: usize) -> usize {
@@ -1099,7 +1147,11 @@ mod tests {
         let a = apply_motion(s, 0, Motion::Down, 1, None);
         assert_eq!(a, 4, "j from heading lands on the blank line");
         let b = apply_motion(s, a, Motion::Down, 1, None);
-        assert!(s[b..].starts_with("para"), "second j lands in para, got {:?}", &s[b..]);
+        assert!(
+            s[b..].starts_with("para"),
+            "second j lands in para, got {:?}",
+            &s[b..]
+        );
         assert_eq!(apply_motion(s, 0, Motion::Right, 20, Some(4)), 3);
         assert_eq!(apply_motion(s, 5, Motion::Left, 9, Some(4)), 5);
     }
@@ -1185,7 +1237,6 @@ mod tests {
         assert_eq!(after_caret("ab", 2), 2);
     }
 
-
     #[test]
     fn x_does_not_imply_block_delete() {
         let src = "# Title\n\npara";
@@ -1213,7 +1264,7 @@ mod tests {
         assert_eq!(t, 2); // t b lands on last a before b
         let tb = find_char(s, 4, 'b', FindKind::TillBack, 1, true).unwrap();
         assert_eq!(tb, 4); // T b from last a lands just after b
-        // Helix: f/t search the rest of the buffer, not the current line.
+                           // Helix: f/t search the rest of the buffer, not the current line.
         let s = "abca\nxyz";
         assert_eq!(find_char(s, 0, 'x', FindKind::Forward, 1, false), Some(5));
         assert_eq!(find_char(s, 5, 'a', FindKind::Backward, 1, false), Some(3));
@@ -1256,7 +1307,11 @@ mod tests {
         let p1 = paragraph_jump(s, 0, 1, 1);
         assert!(s[p1..].starts_with("para one"), "{:?}", &s[p1..]);
         let p2 = paragraph_jump(s, 0, 1, 2);
-        assert!(s[p2..].starts_with("## B") || s[p2..].starts_with("para two"), "{:?}", &s[p2..]);
+        assert!(
+            s[p2..].starts_with("## B") || s[p2..].starts_with("para two"),
+            "{:?}",
+            &s[p2..]
+        );
         let h = heading_jump(s, 0, 1, 1);
         assert!(s[h..].starts_with("## B"), "{:?}", &s[h..]);
         let back = heading_jump(s, h, -1, 1);
@@ -1295,5 +1350,21 @@ mod tests {
         assert_eq!(after_caret_same_line(s, 2), 2);
         // Unclamped after_caret would cross the newline:
         assert_eq!(after_caret(s, 2), 3);
+    }
+}
+
+#[cfg(test)]
+mod word_select_tests {
+    use super::word_range_at;
+
+    #[test]
+    fn word_range_selects_word_under_caret() {
+        assert_eq!(word_range_at("hello world", 1), 0..5);
+        assert_eq!(word_range_at("hello world", 4), 0..5);
+        assert_eq!(word_range_at("hello world", 5), 5..5); // space
+        assert_eq!(word_range_at("hello world", 6), 6..11);
+        assert_eq!(word_range_at("hello world", 11), 6..11);
+        assert_eq!(word_range_at("a", 0), 0..1);
+        assert_eq!(word_range_at("  ", 1), 1..1);
     }
 }

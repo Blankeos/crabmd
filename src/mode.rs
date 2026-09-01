@@ -45,7 +45,6 @@ pub enum Caret {
     Offset(usize),
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExCommand {
     Write,

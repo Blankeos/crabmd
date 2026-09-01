@@ -15,11 +15,7 @@ enum Kind {
     Function,
 }
 
-pub fn highlights(
-    lang: &str,
-    text: &str,
-    p: &Palette,
-) -> Vec<(Range<usize>, HighlightStyle)> {
+pub fn highlights(lang: &str, text: &str, p: &Palette) -> Vec<(Range<usize>, HighlightStyle)> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -84,20 +80,21 @@ fn scan_token(lang: &str, text: &str, bytes: &[u8], i: usize) -> Option<(usize, 
             return Some((end, Kind::Comment));
         }
         if c == '<' {
-            let end = text[i..]
-                .find('>')
-                .map(|n| i + n + 1)
-                .unwrap_or(text.len());
+            let end = text[i..].find('>').map(|n| i + n + 1).unwrap_or(text.len());
             return Some((end, Kind::Keyword));
         }
     }
-    if matches!(lang, "css" | "javascript" | "rust" | "go" | "c" | "cpp" | "csharp" | "json")
-        && text[i..].starts_with("//")
+    if matches!(
+        lang,
+        "css" | "javascript" | "rust" | "go" | "c" | "cpp" | "csharp" | "json"
+    ) && text[i..].starts_with("//")
     {
         return Some((eol(text, i), Kind::Comment));
     }
-    if matches!(lang, "css" | "javascript" | "rust" | "go" | "c" | "cpp" | "csharp" | "sql")
-        && text[i..].starts_with("/*")
+    if matches!(
+        lang,
+        "css" | "javascript" | "rust" | "go" | "c" | "cpp" | "csharp" | "sql"
+    ) && text[i..].starts_with("/*")
     {
         let end = text[i + 2..]
             .find("*/")
@@ -177,61 +174,231 @@ fn scan_string(text: &str, start: usize, quote: char) -> usize {
 }
 
 fn eol(text: &str, i: usize) -> usize {
-    text[i..]
-        .find('\n')
-        .map(|n| i + n)
-        .unwrap_or(text.len())
+    text[i..].find('\n').map(|n| i + n).unwrap_or(text.len())
 }
 
 fn is_keyword(lang: &str, word: &str) -> bool {
     match lang {
         "rust" => matches!(
             word,
-            "as" | "async" | "await" | "break" | "const" | "continue" | "crate" | "dyn"
-                | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if" | "impl"
-                | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub"
-                | "ref" | "return" | "self" | "Self" | "static" | "struct" | "super"
-                | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while"
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
         ),
         "python" => matches!(
             word,
-            "and" | "as" | "assert" | "async" | "await" | "break" | "class" | "continue"
-                | "def" | "del" | "elif" | "else" | "except" | "False" | "finally"
-                | "for" | "from" | "global" | "if" | "import" | "in" | "is" | "lambda"
-                | "None" | "not" | "or" | "pass" | "raise" | "return" | "True" | "try"
-                | "while" | "with" | "yield"
+            "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "False"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "None"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "True"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
         ),
         "javascript" => matches!(
             word,
-            "async" | "await" | "break" | "case" | "catch" | "class" | "const" | "continue"
-                | "debugger" | "default" | "delete" | "do" | "else" | "export" | "extends"
-                | "false" | "finally" | "for" | "function" | "if" | "import" | "in"
-                | "instanceof" | "let" | "new" | "null" | "return" | "static" | "super"
-                | "switch" | "this" | "throw" | "true" | "try" | "typeof" | "var"
-                | "void" | "while" | "yield" | "of"
+            "async"
+                | "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "let"
+                | "new"
+                | "null"
+                | "return"
+                | "static"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "yield"
+                | "of"
         ),
         "go" => matches!(
             word,
-            "break" | "case" | "chan" | "const" | "continue" | "default" | "defer"
-                | "else" | "fallthrough" | "for" | "func" | "go" | "goto" | "if"
-                | "import" | "interface" | "map" | "package" | "range" | "return"
-                | "select" | "struct" | "switch" | "type" | "var"
+            "break"
+                | "case"
+                | "chan"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "go"
+                | "goto"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
         ),
         "bash" => matches!(
             word,
-            "if" | "then" | "else" | "elif" | "fi" | "for" | "in" | "do" | "done"
-                | "case" | "esac" | "while" | "until" | "function" | "return" | "local"
-                | "export" | "unset"
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "for"
+                | "in"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "while"
+                | "until"
+                | "function"
+                | "return"
+                | "local"
+                | "export"
+                | "unset"
         ),
         "sql" => matches!(
             word,
-            "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "INSERT" | "INTO" | "VALUES"
-                | "UPDATE" | "SET" | "DELETE" | "CREATE" | "TABLE" | "JOIN" | "LEFT"
-                | "RIGHT" | "INNER" | "ON" | "AS" | "NULL" | "NOT" | "ORDER" | "BY"
-                | "GROUP" | "LIMIT" | "select" | "from" | "where" | "and" | "or"
-                | "insert" | "into" | "values" | "update" | "set" | "delete" | "create"
-                | "table" | "join" | "left" | "right" | "inner" | "on" | "as" | "null"
-                | "not" | "order" | "by" | "group" | "limit"
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "AND"
+                | "OR"
+                | "INSERT"
+                | "INTO"
+                | "VALUES"
+                | "UPDATE"
+                | "SET"
+                | "DELETE"
+                | "CREATE"
+                | "TABLE"
+                | "JOIN"
+                | "LEFT"
+                | "RIGHT"
+                | "INNER"
+                | "ON"
+                | "AS"
+                | "NULL"
+                | "NOT"
+                | "ORDER"
+                | "BY"
+                | "GROUP"
+                | "LIMIT"
+                | "select"
+                | "from"
+                | "where"
+                | "and"
+                | "or"
+                | "insert"
+                | "into"
+                | "values"
+                | "update"
+                | "set"
+                | "delete"
+                | "create"
+                | "table"
+                | "join"
+                | "left"
+                | "right"
+                | "inner"
+                | "on"
+                | "as"
+                | "null"
+                | "not"
+                | "order"
+                | "by"
+                | "group"
+                | "limit"
         ),
         "toml" | "yaml" => matches!(word, "true" | "false" | "null" | "yes" | "no"),
         "json" => matches!(word, "true" | "false" | "null"),
@@ -241,14 +408,53 @@ fn is_keyword(lang: &str, word: &str) -> bool {
         ),
         "c" | "cpp" | "csharp" => matches!(
             word,
-            "auto" | "break" | "case" | "char" | "const" | "continue" | "default"
-                | "do" | "double" | "else" | "enum" | "extern" | "float" | "for"
-                | "goto" | "if" | "int" | "long" | "register" | "return" | "short"
-                | "signed" | "sizeof" | "static" | "struct" | "switch" | "typedef"
-                | "union" | "unsigned" | "void" | "volatile" | "while" | "class"
-                | "namespace" | "new" | "delete" | "this" | "public" | "private"
-                | "protected" | "virtual" | "bool" | "true" | "false" | "using"
-                | "template" | "typename"
+            "auto"
+                | "break"
+                | "case"
+                | "char"
+                | "const"
+                | "continue"
+                | "default"
+                | "do"
+                | "double"
+                | "else"
+                | "enum"
+                | "extern"
+                | "float"
+                | "for"
+                | "goto"
+                | "if"
+                | "int"
+                | "long"
+                | "register"
+                | "return"
+                | "short"
+                | "signed"
+                | "sizeof"
+                | "static"
+                | "struct"
+                | "switch"
+                | "typedef"
+                | "union"
+                | "unsigned"
+                | "void"
+                | "volatile"
+                | "while"
+                | "class"
+                | "namespace"
+                | "new"
+                | "delete"
+                | "this"
+                | "public"
+                | "private"
+                | "protected"
+                | "virtual"
+                | "bool"
+                | "true"
+                | "false"
+                | "using"
+                | "template"
+                | "typename"
         ),
         _ => false,
     }
@@ -263,7 +469,11 @@ mod tests {
     fn rust_keywords_and_strings() {
         let p = theme::load_named("opencode").unwrap();
         let hs = highlights("rust", "fn main() { let x = \"hi\"; }", &p);
-        assert!(hs.iter().any(|(r, _)| &"fn main() { let x = \"hi\"; }"[r.clone()] == "fn"));
-        assert!(hs.iter().any(|(r, _)| &"fn main() { let x = \"hi\"; }"[r.clone()] == "\"hi\""));
+        assert!(hs
+            .iter()
+            .any(|(r, _)| &"fn main() { let x = \"hi\"; }"[r.clone()] == "fn"));
+        assert!(hs
+            .iter()
+            .any(|(r, _)| &"fn main() { let x = \"hi\"; }"[r.clone()] == "\"hi\""));
     }
 }
