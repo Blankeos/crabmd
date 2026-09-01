@@ -5,23 +5,23 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    actions, div, img, point, prelude::FluentBuilder as _, px, rgb, AnyElement, App,
-    AppContext as _, ClipboardEntry, Context, Entity, EntityInputHandler,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
-    Styled, UTF16Selection, Window,
+    actions, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb, AnyElement,
+    App, AppContext as _, ClipboardEntry, Context, Entity, EntityInputHandler, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     radio::Radio,
     switch::Switch,
     v_flex, Icon, Sizable as _, Theme, ThemeMode, ThemeTokens,
 };
 
-use crate::config::{self, Config, EditorKind, FONT_FAMILIES, FONT_SIZES};
+use crate::config::{self, Config, EditorKind};
 use crate::display::{
     project, wrap_cols_for, Affinity, BlockExtra, CODE_LANGS, COLUMN_PX, Projection,
 };
@@ -33,13 +33,14 @@ use crate::wysiwyg::{self, Mark};
 use crate::images;
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
-    after_caret, apply_motion, block_caret_range, delete_char_at, delete_range, extend_visual_line,
+    after_caret_same_line, apply_motion, block_caret_range, delete_char_at, delete_range, extend_visual_line,
     find_char, first_non_blank_in, join_next_lines, join_range, last_line_start,
-    line_start_n, logical_line_delete_range, logical_line_range, open_line_above, open_line_below,
-    paragraph_jump, push_count, replace_chars, replace_selection, search_next, search_prev,
-    take_count, visual_line_range, FindKind, Motion,
+    line_start_n, logical_line_delete_range, logical_line_range, paragraph_jump, push_count,
+    replace_chars, replace_selection, search_next, search_prev, take_count, visual_line_range,
+    whichwrap, FindKind, Motion,
 };
 use crate::slash::{self, SlashItem};
+use crate::syntax;
 use crate::theme::{self, Appearance, Palette};
 use crate::undo::{Snapshot, UndoStack};
 
@@ -117,6 +118,9 @@ actions!(
         ToggleStrike,
         ToggleCode,
         ToggleLink,
+        InsertSlash,
+        DeleteWordBack,
+        DeleteLineBack,
     ]
 );
 
@@ -136,8 +140,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("l", CharRight, Some("Normal")),
         KeyBinding::new("j", LineDown, Some("Normal")),
         KeyBinding::new("k", LineUp, Some("Normal")),
-        KeyBinding::new("j", LineDown, Some("Notion")),
-        KeyBinding::new("k", LineUp, Some("Notion")),
         KeyBinding::new("w", WordForward, Some("Normal")),
         KeyBinding::new("b", WordBack, Some("Normal")),
         KeyBinding::new("e", WordEnd, Some("Normal")),
@@ -178,8 +180,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Input")),
         KeyBinding::new(":", OpenCommand, Some("Normal")),
         KeyBinding::new("shift-;", OpenCommand, Some("Normal")),
-        KeyBinding::new("/", OpenSearch, Some("Normal")),
+        KeyBinding::new("/", OpenSearch, Some("Vim && Normal")),
         KeyBinding::new("shift-/", SearchBack, Some("Normal")),
+        KeyBinding::new("cmd-f", OpenSearch, Some("Workspace")),
+        KeyBinding::new("ctrl-f", OpenSearch, Some("Workspace")),
+        KeyBinding::new("/", InsertSlash, Some("Helix")),
+        KeyBinding::new("/", InsertSlash, Some("Notion")),
         KeyBinding::new("n", SearchNext, Some("Normal")),
         KeyBinding::new("shift-n", SearchPrev, Some("Normal")),
         KeyBinding::new("shift-j", JoinLines, Some("Normal")),
@@ -207,6 +213,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Workspace")),
+        KeyBinding::new("alt-backspace", DeleteWordBack, Some("Workspace")),
+        KeyBinding::new("cmd-backspace", DeleteLineBack, Some("Workspace")),
+        KeyBinding::new("ctrl-backspace", DeleteWordBack, Some("Workspace")),
+        KeyBinding::new("cmd-z", Undo, Some("Workspace")),
+        KeyBinding::new("ctrl-z", Undo, Some("Workspace")),
+        KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-z", Redo, Some("Workspace")),
     ]);
 }
 
@@ -216,6 +229,95 @@ enum SettingsPane {
     Editor,
     Theme,
     Font,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FontSlot {
+    Ui,
+    Markdown,
+    Buffer,
+}
+
+struct FontInputs {
+    ui_family: Entity<InputState>,
+    ui_size: Entity<InputState>,
+    markdown_family: Entity<InputState>,
+    markdown_size: Entity<InputState>,
+    buffer_family: Entity<InputState>,
+    buffer_size: Entity<InputState>,
+    _subs: Vec<gpui::Subscription>,
+}
+
+impl FontInputs {
+    fn new(config: &Config, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let mk = |value: String, placeholder: &str, window: &mut Window, cx: &mut Context<Workspace>| {
+            let ph = placeholder.to_string();
+            cx.new(|cx| InputState::new(window, cx).default_value(value).placeholder(ph))
+        };
+        let ui_family = mk(config.ui_font.family.clone(), "UI font family", window, cx);
+        let ui_size = mk(config.ui_font.size.to_string(), "13", window, cx);
+        let markdown_family = mk(
+            config.markdown_font.family.clone(),
+            "Markdown font family",
+            window,
+            cx,
+        );
+        let markdown_size = mk(config.markdown_font.size.to_string(), "15", window, cx);
+        let buffer_family = mk(
+            config.buffer_font.family.clone(),
+            "Code / buffer font family",
+            window,
+            cx,
+        );
+        let buffer_size = mk(config.buffer_font.size.to_string(), "14", window, cx);
+
+        let mut _subs = Vec::new();
+        let wire = |slot: FontSlot,
+                    family: &Entity<InputState>,
+                    size: &Entity<InputState>,
+                    cx: &mut Context<Workspace>,
+                    subs: &mut Vec<gpui::Subscription>| {
+            subs.push(cx.subscribe(family, move |this, input, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let family = input.read(cx).value().to_string();
+                    this.apply_font_family(slot, family, cx);
+                }
+            }));
+            subs.push(cx.subscribe(size, move |this, input, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let raw = input.read(cx).value().to_string();
+                    if let Ok(n) = raw.trim().parse::<u32>() {
+                        this.apply_font_size(slot, n, cx);
+                    }
+                }
+            }));
+        };
+        wire(FontSlot::Ui, &ui_family, &ui_size, cx, &mut _subs);
+        wire(
+            FontSlot::Markdown,
+            &markdown_family,
+            &markdown_size,
+            cx,
+            &mut _subs,
+        );
+        wire(
+            FontSlot::Buffer,
+            &buffer_family,
+            &buffer_size,
+            cx,
+            &mut _subs,
+        );
+
+        Self {
+            ui_family,
+            ui_size,
+            markdown_family,
+            markdown_size,
+            buffer_family,
+            buffer_size,
+            _subs,
+        }
+    }
 }
 
 pub struct Workspace {
@@ -257,6 +359,7 @@ pub struct Workspace {
     mouse_anchor: Option<usize>,
     mouse_dragging: bool,
     loading: bool,
+    fonts: FontInputs,
 }
 
 impl Workspace {
@@ -271,6 +374,7 @@ impl Workspace {
         apply_palette(&palette, cx);
 
         let empty_doc = source.trim().is_empty();
+        let fonts = FontInputs::new(&config, window, cx);
         let mut this = Self {
             path,
             source,
@@ -310,6 +414,7 @@ impl Workspace {
             mouse_anchor: None,
             mouse_dragging: false,
             loading: false,
+            fonts,
         };
 
         if empty_doc || !this.config.editor.is_modal() {
@@ -357,15 +462,27 @@ impl Workspace {
     }
 
     fn wrap_cols(&self) -> Option<usize> {
-        wrap_cols_for(self.config.font_size, self.config.wrap_motions)
+        wrap_cols_for(self.config.markdown_font.size, self.config.wrap_motions)
     }
 
     fn proj(&self) -> Projection {
         project(&self.source)
     }
 
+    fn ui_font_px(&self) -> gpui::Pixels {
+        px(self.config.ui_font.size.clamp(8, 48) as f32)
+    }
+
+    fn markdown_font_px(&self) -> gpui::Pixels {
+        px(self.config.markdown_font.size.clamp(8, 48) as f32)
+    }
+
+    fn buffer_font_px(&self) -> gpui::Pixels {
+        px(self.config.buffer_font.size.clamp(8, 48) as f32)
+    }
+
     fn font_px(&self) -> gpui::Pixels {
-        px(self.config.font_size.clamp(13, 20) as f32)
+        self.markdown_font_px()
     }
 
     fn paint_ranges(&self) -> Vec<PaintRange> {
@@ -497,11 +614,13 @@ impl Workspace {
     }
 
     fn finish_insert_undo(&mut self) {
-        let Some(origin) = self.insert_origin.take() else {
+        let Some(mut origin) = self.insert_origin.take() else {
             return;
         };
         let current = self.snapshot();
         if origin.source != current.source {
+            // Insert session started from Normal; undoing it should return there.
+            origin.mode = Mode::Normal;
             self.undo.push(origin);
         }
     }
@@ -515,7 +634,10 @@ impl Workspace {
         self.visual_anchor = self.sel.as_ref().map(|s| s.start);
         self.dirty = true;
         self.status = "unsaved".into();
-        if !self.config.editor.is_modal() || snap.mode == Mode::Insert {
+        // Notion stays in insert. Vim/Helix undo/redo always land in Normal —
+        // never bounce back into Insert just because the snapshot was taken
+        // during an insert session.
+        if !self.config.editor.is_modal() {
             self.enter_insert(Caret::Offset(self.caret), window, cx);
         } else {
             self.mode = Mode::Normal;
@@ -726,8 +848,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_modal_nav() && !(self.is_notion() && matches!(motion, Motion::Down | Motion::Up)) {
-            cx.propagate();
+        self.move_caret(motion, false, window, cx);
+    }
+
+    fn move_caret(
+        &mut self,
+        motion: Motion,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command.is_some() || self.search.is_some() || self.link_open {
             return;
         }
         window.prevent_default();
@@ -736,7 +867,13 @@ impl Workspace {
         let p = self.proj();
         let d = p.to_display(self.caret);
         let wrap = self.wrap_cols();
-        let next_d = apply_motion(&p.display, d, motion, count, wrap);
+        let mut next_d = apply_motion(&p.display, d, motion, count, wrap);
+        let insert_like = self.mode.is_insert() || self.is_notion();
+        if insert_like && next_d == d {
+            if let Some(w) = whichwrap(&p.display, d, motion) {
+                next_d = w;
+            }
+        }
         if motion == Motion::Right {
             let at_mark_end = p.marks_at(d, Affinity::Inside).any()
                 && !p.marks_at(next_d, Affinity::Inside).any();
@@ -748,8 +885,24 @@ impl Workspace {
         } else {
             self.affinity = Affinity::Inside;
         }
-        self.caret = p.to_source(next_d, self.affinity);
-        self.land(self.caret, window, cx);
+        let next = p.to_source(next_d, self.affinity);
+        if extend {
+            if self.is_modal_nav() && !self.mode.is_visual() {
+                self.mode = if self.config.editor == EditorKind::Helix {
+                    Mode::Select
+                } else {
+                    Mode::Visual
+                };
+            }
+            if self.visual_anchor.is_none() {
+                self.visual_anchor = Some(self.caret);
+            }
+            self.caret = next;
+            self.snap_visual_sel();
+            self.refresh_raw(window, cx);
+        } else {
+            self.land(next, window, cx);
+        }
         self.pending_d = false;
     }
 
@@ -864,7 +1017,8 @@ impl Workspace {
         let off = {
             let p = self.proj();
             let d = p.to_display(self.caret);
-            let d2 = after_caret(&p.display, d);
+            // Stay on this logical line — never jump to the next block.
+            let d2 = after_caret_same_line(&p.display, d);
             p.to_source(d2, Affinity::Inside)
         };
         self.enter_insert(Caret::Offset(off), window, cx);
@@ -900,11 +1054,7 @@ impl Workspace {
         }
         window.prevent_default();
         self.push_doc_undo();
-        let (next, caret) = if above {
-            open_line_above(&self.source, self.caret)
-        } else {
-            open_line_below(&self.source, self.caret)
-        };
+        let (next, caret) = wysiwyg::open_line(&self.source, self.caret, above);
         self.source = next;
         self.caret = caret;
         self.dirty = true;
@@ -1171,18 +1321,15 @@ impl Workspace {
     }
 
     fn on_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_modal_nav() {
-            return;
-        }
+        window.prevent_default();
+        self.finish_insert_undo();
         let current = self.snapshot();
         if let Some(prev) = self.undo.undo(current) {
             self.apply_snapshot(prev, window, cx);
         }
     }
     fn on_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_modal_nav() {
-            return;
-        }
+        window.prevent_default();
         let current = self.snapshot();
         if let Some(next) = self.undo.redo(current) {
             self.apply_snapshot(next, window, cx);
@@ -1230,6 +1377,75 @@ impl Workspace {
         }
     }
 
+    fn on_insert_slash(&mut self, _: &InsertSlash, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command.is_some() || self.search.is_some() || self.link_open {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if self.is_modal_nav() {
+            self.enter_insert(Caret::Offset(self.caret), window, cx);
+        }
+        if self.insert_origin.is_none() {
+            self.insert_origin = Some(self.snapshot());
+        }
+        let (next, caret) = wysiwyg::insert_text(
+            &self.source,
+            self.caret,
+            self.sel.clone(),
+            "/",
+            self.affinity,
+        );
+        self.source = next;
+        self.caret = caret.min(self.source.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        let q = self.slash_query().unwrap_or_default();
+        if q != self.last_slash_query {
+            self.last_slash_query = q;
+            self.slash_index = 0;
+        }
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
+    fn on_delete_word_back(&mut self, _: &DeleteWordBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        if d == 0 {
+            return;
+        }
+        let start_d = apply_motion(&p.display, d, Motion::WordBack, 1, None);
+        self.push_doc_undo();
+        let (next, caret) = wysiwyg::delete_display_range(&self.source, start_d..d);
+        self.commit_edit(next, caret, window, cx);
+    }
+
+    fn on_delete_line_back(&mut self, _: &DeleteLineBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        let p = self.proj();
+        let d = p.to_display(self.caret);
+        let start_d = logical_line_range(&p.display, d).start;
+        if start_d >= d {
+            // At line start — delete previous newline (join) via normal backspace.
+            self.on_block_backspace(&BlockBackspace, window, cx);
+            return;
+        }
+        self.push_doc_undo();
+        let (next, caret) = wysiwyg::delete_display_range(&self.source, start_d..d);
+        self.commit_edit(next, caret, window, cx);
+    }
+
     fn on_block_backspace(
         &mut self,
         _: &BlockBackspace,
@@ -1273,10 +1489,6 @@ impl Workspace {
         self.open_search(true, window, cx);
     }
     fn open_search(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_modal_nav() {
-            cx.propagate();
-            return;
-        }
         window.prevent_default();
         self.clear_pending();
         self.command = None;
@@ -1528,16 +1740,39 @@ impl Workspace {
         self.land(next, window, cx);
     }
 
-    fn set_font_family(&mut self, family: String, cx: &mut Context<Self>) {
-        self.config.font_family = family;
+    fn apply_font_family(&mut self, slot: FontSlot, family: String, cx: &mut Context<Self>) {
+        let family = family.trim().to_string();
+        if family.is_empty() {
+            return;
+        }
+        let target = match slot {
+            FontSlot::Ui => &mut self.config.ui_font.family,
+            FontSlot::Markdown => &mut self.config.markdown_font.family,
+            FontSlot::Buffer => &mut self.config.buffer_font.family,
+        };
+        if *target == family {
+            return;
+        }
+        *target = family;
         self.persist_config(cx);
         cx.notify();
     }
-    fn set_font_size(&mut self, size: u32, cx: &mut Context<Self>) {
-        self.config.font_size = size.clamp(13, 20);
+
+    fn apply_font_size(&mut self, slot: FontSlot, size: u32, cx: &mut Context<Self>) {
+        let size = size.clamp(8, 48);
+        let target = match slot {
+            FontSlot::Ui => &mut self.config.ui_font.size,
+            FontSlot::Markdown => &mut self.config.markdown_font.size,
+            FontSlot::Buffer => &mut self.config.buffer_font.size,
+        };
+        if *target == size {
+            return;
+        }
+        *target = size;
         self.persist_config(cx);
         cx.notify();
     }
+
     fn on_toggle_settings(&mut self, _: &ToggleSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_settings(window, cx);
     }
@@ -1904,6 +2139,59 @@ impl Workspace {
             return true;
         }
 
+        if key == "enter"
+            && !mods.control
+            && !mods.platform
+            && !mods.alt
+            && (self.mode.is_insert() || self.is_notion())
+            && self.command.is_none()
+            && self.search.is_none()
+            && !self.link_open
+        {
+            window.prevent_default();
+            self.insert_newline(mods.shift, window, cx);
+            return true;
+        }
+
+        let insert_like = self.mode.is_insert() || self.is_notion();
+        let can_nav = (self.is_modal_nav() || insert_like)
+            && self.command.is_none()
+            && self.search.is_none()
+            && !self.link_open
+            && self.pending_replace.is_none()
+            && self.pending_find.is_none()
+            && self.pending_bracket.is_none();
+        if can_nav {
+            if self.slash_is_open() && (key == "up" || key == "down") {
+                window.prevent_default();
+                if key == "up" {
+                    self.on_slash_prev(&SlashPrev, window, cx);
+                } else {
+                    self.on_slash_next(&SlashNext, window, cx);
+                }
+                return true;
+            }
+            let word = mods.alt || (mods.control && !mods.platform);
+            let motion = match key {
+                "left" if word => Some(Motion::WordBack),
+                "right" if word => Some(Motion::WordForward),
+                "left" if mods.platform => Some(Motion::LineStart),
+                "right" if mods.platform => Some(Motion::LineEnd),
+                "left" => Some(Motion::Left),
+                "right" => Some(Motion::Right),
+                "up" => Some(Motion::Up),
+                "down" => Some(Motion::Down),
+                "home" => Some(Motion::LineStart),
+                "end" => Some(Motion::LineEnd),
+                _ => None,
+            };
+            if let Some(motion) = motion {
+                window.prevent_default();
+                self.move_caret(motion, mods.shift, window, cx);
+                return true;
+            }
+        }
+
         if key == "v" && (mods.platform || mods.control) && !mods.alt && !mods.shift {
             if self.try_paste_image(window, cx) {
                 return true;
@@ -1921,13 +2209,12 @@ impl Workspace {
         let p = &self.palette;
         v_flex()
             .w(px(340.))
-            .mt_1()
             .py_1()
             .rounded(px(8.))
             .border_1()
             .border_color(p.border)
             .bg(p.background_panel)
-            .shadow_sm()
+            .shadow_lg()
             .children(items.into_iter().enumerate().map(|(i, item)| {
                 let active = i == selected;
                 div()
@@ -2024,6 +2311,8 @@ impl Workspace {
             .pl(inset)
             .pr_3()
             .items_center()
+            .font_family(self.config.ui_font.family.clone())
+            .text_size(self.ui_font_px())
             .bg(p.background_panel)
             .border_b_1()
             .border_color(p.border)
@@ -2239,56 +2528,74 @@ impl Workspace {
                     .into_any_element()
             }
             SettingsPane::Font => {
-                let family = self.config.font_family.clone();
-                let size = self.config.font_size;
+                let row = |label: &'static str,
+                           family: &Entity<InputState>,
+                           size: &Entity<InputState>,
+                           hint: &'static str,
+                           p: &crate::theme::Palette| {
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(label),
+                        )
+                        .child(div().text_xs().text_color(p.text_muted).child(hint))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_2()
+                                .items_center()
+                                .child(div().flex_1().min_w_0().child(Input::new(family).cleanable(true)))
+                                .child(
+                                    div()
+                                        .w(px(72.))
+                                        .child(Input::new(size).cleanable(false)),
+                                ),
+                        )
+                };
+                let p = &self.palette;
                 v_flex()
                     .w_full()
-                    .gap_3()
+                    .min_w_0()
+                    .gap_4()
                     .child(
                         div()
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Font"),
+                            .child("Fonts"),
                     )
                     .child(
                         div()
                             .text_sm()
                             .text_color(p.text_muted)
-                            .child("Monospace family and size for the raw GFM editor. Rendered blocks keep the UI font."),
+                            .child("UI · Markdown · Buffer (code). Family + size (px)."),
                     )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .children(FONT_FAMILIES.iter().enumerate().map(|(i, name)| {
-                                let selected = family == *name;
-                                let name_owned = (*name).to_string();
-                                Radio::new(("font-fam", i))
-                                    .label((*name).to_string())
-                                    .checked(selected)
-                                    .on_click(cx.listener(move |this, checked, _, cx| {
-                                        if *checked {
-                                            this.set_font_family(name_owned.clone(), cx);
-                                        }
-                                    }))
-                            })),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .children(FONT_SIZES.iter().enumerate().map(|(i, sz)| {
-                                let selected = size == *sz;
-                                let sz = *sz;
-                                Radio::new(("font-sz", i))
-                                    .label(sz.to_string())
-                                    .checked(selected)
-                                    .on_click(cx.listener(move |this, checked, _, cx| {
-                                        if *checked {
-                                            this.set_font_size(sz, cx);
-                                        }
-                                    }))
-                            })),
-                    )
+                    .child(row(
+                        "UI",
+                        &self.fonts.ui_family,
+                        &self.fonts.ui_size,
+                        "Titlebar, footer, settings",
+                        p,
+                    ))
+                    .child(row(
+                        "Markdown",
+                        &self.fonts.markdown_family,
+                        &self.fonts.markdown_size,
+                        "Paragraphs, headings, lists, quotes",
+                        p,
+                    ))
+                    .child(row(
+                        "Buffer",
+                        &self.fonts.buffer_family,
+                        &self.fonts.buffer_size,
+                        "Fenced code blocks",
+                        p,
+                    ))
                     .into_any_element()
             }
         };
@@ -2312,19 +2619,23 @@ impl Workspace {
             .child(
                 h_flex()
                     .id("settings-panel")
-                    .w(px(640.))
-                    .h(px(520.))
-                    .max_w_full()
+                    .w(px(560.))
+                    .h(px(480.))
+                    .max_w(relative(0.92))
+                    .max_h(relative(0.9))
                     .rounded(px(12.))
                     .border_1()
                     .border_color(p.border)
                     .bg(p.background_panel)
                     .shadow_lg()
                     .overflow_hidden()
+                    .font_family(self.config.ui_font.family.clone())
+                    .text_size(self.ui_font_px())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         v_flex()
-                            .w(px(168.))
+                            .w(px(148.))
+                            .flex_shrink_0()
                             .h_full()
                             .px_2()
                             .py_3()
@@ -2348,11 +2659,13 @@ impl Workspace {
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .px_5()
                             .py_4()
+                            .gap_2()
                             .child(
-                                h_flex().w_full().justify_end().child(
+                                h_flex().w_full().min_w_0().justify_end().child(
                                     Button::new("settings-done")
                                         .ghost()
                                         .xsmall()
@@ -2362,7 +2675,16 @@ impl Workspace {
                                         })),
                                 ),
                             )
-                            .child(content),
+                            .child(
+                                div()
+                                    .id("settings-content")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .w_full()
+                                    .overflow_y_scroll()
+                                    .overflow_x_hidden()
+                                    .child(content),
+                            ),
                     ),
             )
             .into_any_element()
@@ -2375,6 +2697,8 @@ impl Workspace {
         heading: bool,
         placeholder: Option<&str>,
         wrap: bool,
+        syntax_lang: Option<&str>,
+        _mono: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.proj();
@@ -2392,7 +2716,7 @@ impl Workspace {
         let local_sel = surface::clip_range(d_sel, display.clone());
         let local_marked = surface::clip_range(d_marked, display.clone());
         let runs = surface::mark_runs(&p, display.clone());
-        let hs = surface::highlights(
+        let mut hs = surface::highlights(
             text.len(),
             &runs,
             local_sel,
@@ -2400,10 +2724,27 @@ impl Workspace {
             &pal,
             heading,
         );
+        if let Some(lang) = syntax_lang {
+            hs.extend(syntax::highlights(lang, text, &pal));
+            hs = surface::flatten(text.len(), hs);
+        }
         let ime = local_caret.is_some() && (self.mode.is_insert() || self.is_notion());
         let block_caret = self.uses_block_caret();
         let view = cx.entity();
         let focus = self.focus.clone();
+        let (family, size) = if _mono {
+            (
+                self.config.buffer_font.family.clone(),
+                self.buffer_font_px(),
+            )
+        } else {
+            (
+                self.config.markdown_font.family.clone(),
+                self.markdown_font_px(),
+            )
+        };
+        let font = Some(gpui::SharedString::from(family));
+        let font_px = Some(size);
         surface::edit_text(
             view.clone(),
             focus,
@@ -2417,6 +2758,8 @@ impl Workspace {
             ime,
             &pal,
             placeholder,
+            font,
+            font_px,
             {
                 let view = view.clone();
                 move |d, shift, window, cx| {
@@ -2445,7 +2788,21 @@ impl Workspace {
             None
         };
         let heading = matches!(block.kind, BlockKind::Heading(_));
-        let body = self.render_edit(block.display.clone(), &text, heading, placeholder, wrap && !matches!(block.kind, BlockKind::Code | BlockKind::Html), cx);
+        let is_code = matches!(block.kind, BlockKind::Code);
+        let syntax_lang = match &block.extra {
+            BlockExtra::Code { lang } if !lang.is_empty() => Some(lang.as_str()),
+            _ => None,
+        };
+        let body = self.render_edit(
+            block.display.clone(),
+            &text,
+            heading,
+            placeholder,
+            wrap && !matches!(block.kind, BlockKind::Code | BlockKind::Html),
+            syntax_lang,
+            is_code,
+            cx,
+        );
         let slash = self.slash_is_open() && p.block_at_display(p.to_display(self.caret)).map(|b| b.source == block.source).unwrap_or(false);
         match &block.extra {
             BlockExtra::Alert(kind) => {
@@ -2486,6 +2843,7 @@ impl Workspace {
                 .into_any_element(),
             BlockExtra::Code { lang } => {
                 let caret = self.caret;
+                let family = self.config.buffer_font.family.clone();
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -2494,6 +2852,9 @@ impl Workspace {
                     .px_3()
                     .py_2()
                     .gap_1()
+                    .font_family(family)
+                    .text_size(self.buffer_font_px())
+                    .text_color(pal.markdown_code_block)
                     .child(self.render_lang_chip(lang, caret, cx))
                     .child(body)
                     .into_any_element()
@@ -2516,9 +2877,21 @@ impl Workspace {
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Heading(_) | BlockExtra::Text | BlockExtra::Html => {
-                let mut el = v_flex().w_full().min_w_0().child(body);
+                let mut el = v_flex().relative().w_full().min_w_0().child(body);
                 if slash {
-                    el = el.child(self.render_slash_menu(cx));
+                    // `deferred` paints after later sibling blocks so the menu
+                    // floats above the document instead of sitting underneath.
+                    el = el.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(28.))
+                                .left_0()
+                                .occlude()
+                                .child(self.render_slash_menu(cx)),
+                        )
+                        .with_priority(1),
+                    );
                 }
                 el.into_any_element()
             }
@@ -2605,7 +2978,7 @@ impl Workspace {
                     "•".to_string()
                 };
                 let indent = px((item.indent as f32) * 16.);
-                let edit = self.render_edit(item.display.clone(), &text, false, None, wrap, cx);
+                let edit = self.render_edit(item.display.clone(), &text, false, None, wrap, None, false, cx);
                 let src_range = block.source.clone();
                 h_flex()
                     .id(("li", item.display.start))
@@ -2671,7 +3044,7 @@ impl Workspace {
                             (0..0, r == 0)
                         };
                         let text = p.display.get(disp.clone()).unwrap_or("").replace('\t', "").to_string();
-                        let edit = self.render_edit(disp, &text, header, None, wrap, cx);
+                        let edit = self.render_edit(disp, &text, header, None, wrap, None, false, cx);
                         div()
                             .id(("td", r * 100 + c))
                             .flex_1()
@@ -2885,6 +3258,9 @@ impl Workspace {
         let n = p.blocks.len();
         let mut kids = Vec::new();
         for i in 0..n {
+            let start = p.blocks[i].display.start;
+            let end = p.blocks[i].display.end;
+            let view = cx.entity();
             kids.push(
                 div()
                     .id(("blk", i))
@@ -2893,7 +3269,22 @@ impl Workspace {
                     .min_w_0()
                     .mx_auto()
                     .px_8()
-                    .py_1()
+                    .py_2()
+                    .on_mouse_down(MouseButton::Left, {
+                        let view = view.clone();
+                        move |ev: &MouseDownEvent, window, cx| {
+                            view.update(cx, |this, cx| {
+                                // Prefer a measured hit; otherwise land on this block.
+                                let d = surface::index_for_point(&this.hits, ev.position)
+                                    .unwrap_or_else(|| {
+                                        // Above the first measured hit in this block → start.
+                                        let _ = start;
+                                        end
+                                    });
+                                this.click_display(d, ev.modifiers.shift, window, cx);
+                            });
+                        }
+                    })
                     .child(self.render_block(i, cx))
                     .into_any_element(),
             );
@@ -3125,12 +3516,18 @@ impl EntityInputHandler for Workspace {
         } else if self.sticky.code {
             insert = format!("`{insert}`");
         }
-        let src_range = p.display_range_to_source(display_range, self.affinity);
         if self.insert_origin.is_none() {
             self.insert_origin = Some(self.snapshot());
         }
-        let next = splice(&self.source, src_range.clone(), &insert);
-        let caret = src_range.start + insert.len();
+        // Point inserts go through wysiwyg so typing into an empty paragraph
+        // replaces the blank slot instead of collapsing `\n\n` into the next block.
+        let (next, caret) = if display_range.start == display_range.end {
+            crate::wysiwyg::insert_text(&self.source, self.caret, None, &insert, self.affinity)
+        } else {
+            let src_range = p.display_range_to_source(display_range, self.affinity);
+            let next = splice(&self.source, src_range.clone(), &insert);
+            (next, src_range.start + insert.len())
+        };
         self.source = next;
         self.caret = caret.min(self.source.len());
         self.sel = None;
@@ -3182,10 +3579,18 @@ impl EntityInputHandler for Workspace {
         let p = self.proj();
         let start = Self::offset_from_utf16(&p.display, range_utf16.start);
         for hit in &self.hits {
-            let local = start.saturating_sub(hit.display_start);
-            if start >= hit.display_start && start <= hit.display_start + hit.layout.len() {
-                let pos = hit.layout.position_for_index(local)?;
-                let h = hit.layout.line_height();
+            let len = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.len())).ok()?;
+            if start >= hit.display_start && start <= hit.display_start + len {
+                let local = start.saturating_sub(hit.display_start);
+                let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hit.layout.position_for_index(local)
+                }))
+                .ok()
+                .flatten()?;
+                let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hit.layout.line_height()
+                }))
+                .unwrap_or(px(16.));
                 return Some(gpui::Bounds::new(pos, gpui::size(px(2.), h)));
             }
         }
@@ -3276,6 +3681,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_slash_prev))
             .on_action(cx.listener(Self::on_slash_next))
             .on_action(cx.listener(Self::on_slash_apply))
+            .on_action(cx.listener(Self::on_insert_slash))
+            .on_action(cx.listener(Self::on_delete_word_back))
+            .on_action(cx.listener(Self::on_delete_line_back))
             .on_action(cx.listener(Self::on_block_backspace))
             .on_action(cx.listener(Self::on_toggle_settings))
             .on_action(cx.listener(Self::on_open_command))
@@ -3333,6 +3741,8 @@ impl Render for Workspace {
             }))
             .size_full()
             .bg(p.background)
+            .font_family(self.config.markdown_font.family.clone())
+            .text_size(self.markdown_font_px())
             .text_color(p.markdown_text)
             .child(self.render_titlebar(cx))
             .child(
@@ -3346,6 +3756,14 @@ impl Render for Workspace {
                     .track_scroll(&self.scroll_handle)
                     .py_10()
                     .gap_1()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                            if let Some(d) = surface::index_for_point(&this.hits, ev.position) {
+                                this.click_display(d, ev.modifiers.shift, window, cx);
+                            }
+                        }),
+                    )
                     .children(self.render_surface(cx)),
             )
             .child(
@@ -3358,6 +3776,8 @@ impl Render for Workspace {
                     .border_t_1()
                     .border_color(p.border)
                     .bg(p.background_panel)
+                    .font_family(self.config.ui_font.family.clone())
+                    .text_size(self.ui_font_px())
                     .when(command.is_none() && search.is_none(), |el| {
                         el.child(
                             div()

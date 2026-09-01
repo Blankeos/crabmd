@@ -451,13 +451,22 @@ fn parse_image_line(line: &str) -> Option<(String, String)> {
 }
 
 /// Toggle `- [ ]` / `- [x]` on `line_index`. None if that line is not a task.
+///
+/// Preserves a trailing newline on `source` so splicing a list block back into
+/// the document does not eat the blank-line separator before the next block
+/// (`item 2\n\n## Quote` must not become `item 2\n## Quote`).
 pub fn toggle_task_line(source: &str, line_index: usize) -> Option<String> {
+    let trailing_nl = source.ends_with('\n');
     let mut lines: Vec<String> = source.lines().map(|l| l.to_string()).collect();
     let line = lines.get(line_index)?;
     let (prefix, checked, rest) = split_task_line(line)?;
     let mark = if checked { " " } else { "x" };
     lines[line_index] = format!("{prefix}[{mark}]{rest}");
-    Some(lines.join("\n"))
+    let mut out = lines.join("\n");
+    if trailing_nl {
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// `(prefix, checked, rest)` where rest includes the space after `]`.
@@ -824,6 +833,22 @@ Visit <https://spec.commonmark.org>.
         let out = toggle_task_line(&out, 1).unwrap();
         assert_eq!(out, "- [x] open\n- [ ] done");
         assert!(toggle_task_line("- bullet", 0).is_none());
+    }
+
+    #[test]
+    fn toggle_task_keeps_trailing_newline() {
+        let src = "- [x] item 1\n- [x] item 2\n";
+        let out = toggle_task_line(src, 0).unwrap();
+        assert_eq!(out, "- [ ] item 1\n- [x] item 2\n");
+        // Splicing this into `list\n\n## Quote` must keep the blank separator.
+        let doc = format!("{src}\n## Quote\nbody\n");
+        let start = 0;
+        let end = src.len();
+        let spliced = splice(&doc, start..end, &out);
+        assert!(
+            spliced.contains("item 2\n\n## Quote"),
+            "separator collapsed: {spliced:?}"
+        );
     }
 
     #[test]

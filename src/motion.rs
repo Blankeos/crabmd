@@ -363,6 +363,33 @@ fn word_end_ws(source: &str, offset: usize) -> usize {
     i
 }
 
+/// Insert/Notion whichwrap: Left at column 0 crosses onto the previous line's
+/// end; Right at EOL crosses onto the next line's start.
+pub fn whichwrap(source: &str, offset: usize, motion: Motion) -> Option<usize> {
+    let offset = clamp_off(source, offset);
+    match motion {
+        Motion::Left => {
+            let line = logical_line_range(source, offset);
+            if offset > line.start || offset == 0 {
+                return None;
+            }
+            Some(offset - 1)
+        }
+        Motion::Right => {
+            let line = logical_line_range(source, offset);
+            if offset < line.end || offset >= source.len() {
+                return None;
+            }
+            if source.as_bytes()[offset] == b'\n' {
+                Some(offset + 1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Apply `count` repetitions of `motion` on the full buffer. `j`/`k` at the
 /// last/first visual row stay put (no leftover / no block edge).
 pub fn apply_motion(
@@ -477,6 +504,17 @@ pub fn after_caret(source: &str, offset: usize) -> usize {
     match next_char(source, offset) {
         Some((n, _)) => offset + n,
         None => offset,
+    }
+}
+
+/// Vim/Helix `a`: move one display char forward but never onto the next
+/// logical line (so end-of-block append does not jump to the next block).
+pub fn after_caret_same_line(source: &str, offset: usize) -> usize {
+    let offset = clamp_off(source, offset);
+    let line = logical_line_range(source, offset);
+    match next_char(source, offset) {
+        Some((n, c)) if c != '\n' && offset + n <= line.end => offset + n,
+        _ => offset.min(line.end),
     }
 }
 
@@ -1184,5 +1222,25 @@ mod tests {
         assert_eq!(search_prev(s, 1, "foo", true), Some(8..11)); // wrap
         assert_eq!(search_next(s, 0, "nope", true), None);
         assert_eq!(search_next(s, 0, "", true), None);
+    }
+
+    #[test]
+    fn whichwrap_crosses_lines_in_insert() {
+        let s = "aa\nbb";
+        assert_eq!(whichwrap(s, 3, Motion::Left), Some(2));
+        assert_eq!(whichwrap(s, 2, Motion::Right), Some(3));
+        assert_eq!(whichwrap(s, 1, Motion::Left), None);
+        assert_eq!(whichwrap(s, 0, Motion::Left), None);
+    }
+
+    #[test]
+    fn after_caret_same_line_stops_at_eol() {
+        let s = "ab\ncd";
+        // On 'b' (offset 1) → after it at 2 (EOL), not onto next line.
+        assert_eq!(after_caret_same_line(s, 1), 2);
+        // Already at EOL → stay.
+        assert_eq!(after_caret_same_line(s, 2), 2);
+        // Unclamped after_caret would cross the newline:
+        assert_eq!(after_caret(s, 2), 3);
     }
 }

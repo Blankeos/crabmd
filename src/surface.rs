@@ -99,6 +99,50 @@ pub fn highlights(
         }
     }
     out.sort_by_key(|(r, _)| r.start);
+    flatten(text_len, out)
+}
+
+/// GPUI `StyledText` runs cannot overlap. Merge stacked styles (heading +
+/// selection, syntax + selection, …) into sorted, disjoint ranges.
+pub fn flatten(
+    text_len: usize,
+    items: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut bounds = vec![0usize, text_len];
+    for (r, _) in &items {
+        bounds.push(r.start.min(text_len));
+        bounds.push(r.end.min(text_len));
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for w in bounds.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        if a >= b {
+            continue;
+        }
+        let mut style = HighlightStyle::default();
+        let mut any = false;
+        for (r, h) in &items {
+            if r.start < b && r.end > a {
+                style = style.highlight(*h);
+                any = true;
+            }
+        }
+        if any {
+            if let Some(last) = out.last_mut() {
+                if last.1 == style && last.0.end == a {
+                    last.0.end = b;
+                    continue;
+                }
+            }
+            out.push((a..b, style));
+        }
+    }
     out
 }
 
@@ -182,17 +226,28 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
         let Some(local) = self.local_caret else {
             return None;
         };
-        if self.layout.len() == 0 && local > 0 {
+        let Some(len) = layout_len(&self.layout) else {
+            return None;
+        };
+        if len == 0 && local > 0 {
             return None;
         }
-        let pos = self.layout.position_for_index(local.min(self.layout.len()))?;
-        let h = self.layout.line_height();
+        let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.layout.position_for_index(local.min(len))
+        }))
+        .ok()
+        .flatten()?;
+        let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
+            .unwrap_or(px(16.));
         let w = if self.block {
-            self.layout
-                .position_for_index((local + 1).min(self.layout.len()))
-                .map(|p| (p.x - pos.x).abs())
-                .unwrap_or(px(8.))
-                .max(px(6.))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.layout.position_for_index((local + 1).min(len))
+            }))
+            .ok()
+            .flatten()
+            .map(|p| (p.x - pos.x).abs())
+            .unwrap_or(px(8.))
+            .max(px(6.))
         } else {
             px(2.)
         };
@@ -235,6 +290,8 @@ pub fn edit_text<V: EntityInputHandler>(
     ime: bool,
     p: &Palette,
     placeholder: Option<&str>,
+    font_family: Option<gpui::SharedString>,
+    font_px: Option<gpui::Pixels>,
     on_click: impl Fn(usize, bool, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
@@ -258,6 +315,12 @@ pub fn edit_text<V: EntityInputHandler>(
             ));
         }
     }
+    hs.retain(|(r, _)| {
+        r.start < r.end
+            && r.end <= shown.len()
+            && shown.is_char_boundary(r.start)
+            && shown.is_char_boundary(r.end)
+    });
     let styled = StyledText::new(shown).with_highlights(hs);
     let layout = styled.layout().clone();
     hits.push(Hit {
@@ -265,18 +328,25 @@ pub fn edit_text<V: EntityInputHandler>(
         layout: layout.clone(),
     });
     let color = p.primary;
+    let click_empty = empty;
     div()
         .id(("edit", display_start))
         .relative()
         .w_full()
         .min_w_0()
         .min_h(px(8.))
+        .when_some(font_family, |el, fam| el.font_family(fam))
+        .when_some(font_px, |el, sz| el.text_size(sz))
         .when(wrap, |el| el.whitespace_normal())
         .when(!wrap, |el| el.whitespace_nowrap())
         .child(styled)
         .child(CaretLayer {
             layout: layout.clone(),
-            local_caret: if empty { None } else { caret_local },
+            local_caret: if empty {
+                caret_local.map(|_| 0)
+            } else {
+                caret_local
+            },
             block: block_caret,
             color,
             view,
@@ -287,7 +357,11 @@ pub fn edit_text<V: EntityInputHandler>(
             let layout = layout.clone();
             move |ev: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
-                let idx = layout.index_for_position(ev.position).unwrap_or_else(|e| e);
+                let idx = if click_empty {
+                    0
+                } else {
+                    index_for_click(&layout, ev.position)
+                };
                 on_click(display_start + idx, ev.modifiers.shift, window, cx);
             }
         })
@@ -297,21 +371,124 @@ pub fn edit_text<V: EntityInputHandler>(
                 if ev.pressed_button != Some(MouseButton::Left) {
                     return;
                 }
-                let idx = layout.index_for_position(ev.position).unwrap_or_else(|e| e);
+                if click_empty {
+                    on_drag(display_start, window, cx);
+                    return;
+                }
+                let idx = index_for_click(&layout, ev.position);
                 on_drag(display_start + idx, window, cx);
             }
         })
         .into_any_element()
 }
 
+/// `TextLayout::{bounds,len,index_for_position,…}` panic if measure/prepaint
+/// has not run. Swallow that for hit-testing during events / IME.
+fn layout_bounds(layout: &TextLayout) -> Option<Bounds<Pixels>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.bounds())).ok()
+}
+
+fn layout_len(layout: &TextLayout) -> Option<usize> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.len())).ok()
+}
+
+pub fn index_for_click(layout: &TextLayout, position: Point<Pixels>) -> usize {
+    let Some(len) = layout_len(layout) else {
+        return 0;
+    };
+    let idx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        layout.index_for_position(position).unwrap_or_else(|e| e)
+    }))
+    .unwrap_or(0)
+    .min(len);
+    let Some(pos) = (std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        layout.position_for_index(idx)
+    }))
+    .ok()
+    .flatten()) else {
+        return idx;
+    };
+    let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.line_height()))
+        .unwrap_or(px(16.));
+    if pos.y > position.y + h * 0.4 && idx > 0 {
+        let mut i = idx;
+        while i > 0 {
+            i -= 1;
+            if let Some(p2) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                layout.position_for_index(i)
+            }))
+            .ok()
+            .flatten()
+            {
+                if p2.y <= position.y + h * 0.4 {
+                    return i;
+                }
+            }
+        }
+    }
+    idx
+}
+
 pub fn index_for_point(hits: &[Hit], point: Point<Pixels>) -> Option<usize> {
+    if hits.is_empty() {
+        return None;
+    }
     for hit in hits {
-        let bounds = hit.layout.bounds();
+        let Some(bounds) = layout_bounds(&hit.layout) else {
+            continue;
+        };
         if point.y < bounds.top() || point.y > bounds.bottom() {
             continue;
         }
-        let idx = hit.layout.index_for_position(point).unwrap_or_else(|e| e);
+        let idx = index_for_click(&hit.layout, point);
         return Some(hit.display_start + idx);
     }
-    hits.last().map(|h| h.display_start + h.layout.len())
+    let mut best: Option<(Pixels, usize)> = None;
+    for hit in hits {
+        let Some(bounds) = layout_bounds(&hit.layout) else {
+            continue;
+        };
+        let len = layout_len(&hit.layout).unwrap_or(0);
+        let dist = if point.y < bounds.top() {
+            bounds.top() - point.y
+        } else {
+            point.y - bounds.bottom()
+        };
+        let d = if point.y > bounds.bottom() {
+            hit.display_start + len
+        } else {
+            hit.display_start
+        };
+        match best {
+            Some((b, _)) if dist >= b => {}
+            _ => best = Some((dist, d)),
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::rgb;
+
+    #[test]
+    fn flatten_merges_heading_and_selection() {
+        let heading = HighlightStyle {
+            font_weight: Some(gpui::FontWeight::SEMIBOLD),
+            color: Some(rgb(0x111111).into()),
+            ..Default::default()
+        };
+        let sel = HighlightStyle {
+            background_color: Some(rgb(0x3366ff).into()),
+            ..Default::default()
+        };
+        let out = flatten(8, vec![(0..8, heading), (2..5, sel)]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, 0..2);
+        assert_eq!(out[1].0, 2..5);
+        assert_eq!(out[1].1.background_color, sel.background_color);
+        assert_eq!(out[1].1.font_weight, heading.font_weight);
+        assert_eq!(out[2].0, 5..8);
+    }
 }

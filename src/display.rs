@@ -188,6 +188,13 @@ impl Projection {
         self.display.len()
     }
 
+    fn seg_is_break(seg: &Segment, display: &str) -> bool {
+        display
+            .get(seg.display.clone())
+            .map(|s| s.starts_with('\n'))
+            .unwrap_or(false)
+    }
+
     pub fn to_source(&self, d: usize, affinity: Affinity) -> usize {
         let d = d.min(self.display.len());
         if self.segments.is_empty() {
@@ -202,6 +209,13 @@ impl Projection {
                 if at_end {
                     if let Some(next) = self.segments.get(i + 1) {
                         if next.display.start == d {
+                            if Self::seg_is_break(next, &self.display) {
+                                return if seg.display.is_empty() {
+                                    seg.source.start
+                                } else {
+                                    seg.source.end
+                                };
+                            }
                             if affinity == Affinity::Inside && seg.marks.any() && !next.marks.any() {
                                 return seg.source.end;
                             }
@@ -213,13 +227,19 @@ impl Projection {
                     }
                     if affinity == Affinity::Outside && seg.marks.any() {
                         if let Some(next) = self.segments.get(i + 1) {
-                            return next.source.start;
+                            if !Self::seg_is_break(next, &self.display) {
+                                return next.source.start;
+                            }
                         }
-                        if let Some(block) = self.block_at_display(d.saturating_sub(1).max(seg.display.start)) {
+                        if let Some(block) = self.block_at_display(seg.display.start) {
                             return block.source.end.min(self.source_len);
                         }
                         return seg.source.end;
                     }
+                    if seg.display.is_empty() {
+                        return seg.source.start;
+                    }
+                    return seg.source.end;
                 }
                 if seg.display.len() == seg.source.len() && !seg.display.is_empty() {
                     let delta = d - seg.display.start;
@@ -309,6 +329,57 @@ pub fn project(src: &str) -> Projection {
 
     for (i, r) in ranges.iter().enumerate() {
         if r.is_blank(src) {
+            let last = i + 1 == ranges.len();
+            let nls = src[r.range.clone()].bytes().filter(|&b| b == b'\n').count();
+            if !(last || nls >= 2) {
+                prev_end = r.range.end;
+                continue;
+            }
+            // One visible empty paragraph per blank-line slot so Enter/o can
+            // grow a stack of empties instead of collapsing into one.
+            // trailing: nls empties; internal: nls-1 empties (nls>=2).
+            let count = if last {
+                nls.max(1)
+            } else {
+                nls.saturating_sub(1).max(1)
+            };
+            for j in 0..count {
+                if !blocks.is_empty() {
+                    let d0 = display.len();
+                    display.push('\n');
+                    let gap_start = if j == 0 {
+                        prev_end.min(src.len())
+                    } else {
+                        (r.range.start + j).min(r.range.end)
+                    };
+                    let gap_end = (r.range.start + j).min(r.range.end);
+                    segments.push(Segment {
+                        display: d0..display.len(),
+                        source: gap_start..gap_end.max(gap_start),
+                        marks: Marks::default(),
+                    });
+                }
+                let slot_start = (r.range.start + j).min(r.range.end);
+                let slot_end = if j + 1 == count {
+                    r.range.end
+                } else {
+                    (r.range.start + j + 1).min(r.range.end)
+                };
+                let src_range = slot_start..slot_end.max(slot_start);
+                let d0 = display.len();
+                let at = empty_insert_point(src, src_range.clone());
+                segments.push(Segment {
+                    display: d0..d0,
+                    source: at..at,
+                    marks: Marks::default(),
+                });
+                blocks.push(ProjBlock {
+                    kind: BlockKind::Paragraph,
+                    source: src_range,
+                    display: d0..d0,
+                    extra: BlockExtra::Text,
+                });
+            }
             prev_end = r.range.end;
             continue;
         }
@@ -372,6 +443,15 @@ pub fn project(src: &str) -> Projection {
     }
 }
 
+fn empty_insert_point(src: &str, range: Range<usize>) -> usize {
+    let slice = src.get(range.clone()).unwrap_or("");
+    if let Some(i) = slice.find('\n') {
+        (range.start + i + 1).min(range.end)
+    } else {
+        range.start
+    }
+}
+
 fn content_point(src: &str, r: &PaintRange) -> Range<usize> {
     let slice = r.slice(src);
     match r.kind {
@@ -413,16 +493,7 @@ fn project_block(
         BlockKind::Code => {
             let (lang, body) = notion::strip_fence(slice);
             let abs = body_abs_range(slice, &body, r.range.start);
-            emit_plain(
-                display,
-                segments,
-                abs,
-                &body,
-                Marks {
-                    code: true,
-                    ..Marks::default()
-                },
-            );
+            emit_plain(display, segments, abs, &body, Marks::default());
             BlockExtra::Code { lang }
         }
         BlockKind::Table => project_table(src, r, display, segments, links),
@@ -435,20 +506,50 @@ fn project_block(
         }
         BlockKind::Heading(level) => {
             project_inlines(src, r, display, segments, links);
+            restore_trailing_spaces(src, r.range.clone(), display, segments);
             BlockExtra::Heading(level)
         }
         BlockKind::Quote => {
             project_inlines(src, r, display, segments, links);
+            restore_trailing_spaces(src, r.range.clone(), display, segments);
             BlockExtra::Quote
         }
         BlockKind::Alert(kind) => {
             project_inlines(src, r, display, segments, links);
+            restore_trailing_spaces(src, r.range.clone(), display, segments);
             BlockExtra::Alert(kind)
         }
         BlockKind::Paragraph => {
             project_inlines(src, r, display, segments, links);
+            restore_trailing_spaces(src, r.range.clone(), display, segments);
             BlockExtra::Text
         }
+    }
+}
+
+/// pulldown-cmark drops trailing spaces from `Text` events; keep them so the
+/// caret can sit after a space at end of a block.
+fn restore_trailing_spaces(
+    src: &str,
+    block: Range<usize>,
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+) {
+    let slice = src.get(block.clone()).unwrap_or("");
+    let trimmed = slice.trim_end_matches(['\n', '\r']);
+    let content_end = block.start + trimmed.len();
+    let last = segments
+        .iter()
+        .rev()
+        .find(|s| s.source.end <= content_end && s.source.start >= block.start)
+        .map(|s| s.source.end)
+        .unwrap_or(block.start);
+    if last >= content_end {
+        return;
+    }
+    let gap = &src[last..content_end];
+    if !gap.is_empty() && gap.bytes().all(|b| b == b' ' || b == b'\t') {
+        emit_plain(display, segments, last..content_end, gap, Marks::default());
     }
 }
 
@@ -848,5 +949,43 @@ mod tests {
     fn wrap_cols_positive() {
         assert!(wrap_cols_for(15, true).unwrap() > 20);
         assert_eq!(wrap_cols_for(15, false), None);
+    }
+
+    #[test]
+    fn heading_end_stays_in_heading() {
+        let src = "# Hello\n\npara";
+        let p = project(src);
+        let end = p.blocks[0].display.end;
+        let off = p.to_source(end, Affinity::Inside);
+        assert!(
+            off <= p.blocks[0].source.end,
+            "mapped to {off} past heading {:?}",
+            p.blocks[0].source
+        );
+        assert_eq!(&src[..off], "# Hello");
+        assert_eq!(p.to_display(off), end);
+    }
+
+    #[test]
+    fn trailing_blank_is_empty_paragraph() {
+        let src = "# Hello\n\n";
+        let p = project(src);
+        assert!(
+            p.blocks.len() >= 2,
+            "blocks={:?} display={:?}",
+            p.blocks.iter().map(|b| b.kind).collect::<Vec<_>>(),
+            p.display
+        );
+        let last = p.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::Paragraph);
+        assert_eq!(last.display.start, last.display.end);
+    }
+
+    #[test]
+    fn trailing_spaces_kept() {
+        let p = project("hello ");
+        assert_eq!(p.display, "hello ");
+        let p = project("# Hi ");
+        assert_eq!(p.display, "Hi ");
     }
 }

@@ -38,7 +38,7 @@ Also not scored (helix-only chrome): view mode `z`/`Z`, space mode, match mode `
 | `gh` | Start of line | line start | yes |
 | `gl` | End of line | line end | yes |
 | `gs` | First non-whitespace of the line | first non-blank | yes |
-| `/` | Search for regex pattern | footer `/` prompt; literal match in the full buffer | yes |
+| `/` | Search for regex pattern | `cmd-f` / `ctrl-f` opens search; `/` inserts a slash (slash commands) | partial |
 | `?` | Search backward | footer `?` prompt | yes |
 | `n` | Next search match | wrap | yes |
 | `N` | Previous search match | wrap | yes |

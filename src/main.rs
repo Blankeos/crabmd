@@ -10,6 +10,7 @@ mod motion;
 mod notion;
 mod slash;
 mod surface;
+mod syntax;
 mod theme;
 mod undo;
 mod wysiwyg;
