@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ -n "$(git status --porcelain)" ]; then
+    echo "❗ Please commit all changes before bumping the version."
+    exit 1
+fi
+
+branch="$(git branch --show-current)"
+if [[ "$branch" != "main" ]]; then
+    echo "❗ Releases must be tagged from main (currently on '${branch:-detached HEAD}')."
+    echo "   git checkout main && git pull && just tag"
+    exit 1
+fi
+
+echo "🦋 Fetching origin/main..."
+git fetch --quiet origin main
+
+if ! git merge-base --is-ancestor origin/main HEAD; then
+    echo "❗ local main has diverged from origin/main. Pull/rebase first."
+    exit 1
+fi
+
+NAME=$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+CURRENT=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+
+if [ -n "${1:-}" ]; then
+    BUMP="$1"
+else
+    echo "🦋 What kind of change is this for $NAME?"
+    echo "Current version: $CURRENT"
+    echo "Choose patch, minor, or major:"
+    read -r BUMP
+fi
+
+case "$BUMP" in
+    patch)
+        NEW=$(echo "$CURRENT" | awk -F. '{$NF+=1; OFS="."; print $1,$2,$3}')
+        ;;
+    minor)
+        NEW=$(echo "$CURRENT" | awk -F. '{$(NF-1)+=1; $NF=0; OFS="."; print $1,$2,$3}')
+        ;;
+    major)
+        NEW=$(echo "$CURRENT" | awk -F. '{$1+=1; $2=0; $3=0; OFS="."; print $1,$2,$3}')
+        ;;
+    *)
+        echo "Please specify patch, minor, or major"
+        exit 1
+        ;;
+esac
+
+echo "🦋 Would tag and push $NAME $CURRENT -> $NEW"
+read -p "Proceed? [Y/n] " -r CONFIRM
+CONFIRM=${CONFIRM:-y}
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 0
+fi
+
+echo "🦋 Updating Cargo.toml to version ${NEW}"
+sed -i.bak "s/^version *= *\"[^\"]*\"/version = \"${NEW}\"/" Cargo.toml
+rm Cargo.toml.bak
+
+if [ -f "npm/package.json" ]; then
+    echo "🦋 Updating npm/package.json to version ${NEW}"
+    sed -i.bak \
+        "s/\"version\":[[:space:]]*\"[^\"]*\"/\"version\": \"${NEW}\"/" \
+        npm/package.json
+    rm npm/package.json.bak
+fi
+
+echo "🦋 Updating Cargo.lock..."
+cargo generate-lockfile
+
+echo "🦋 Regenerating CHANGELOG.md..."
+git cliff --offline --tag "v${NEW}" -o CHANGELOG.md
+
+echo "🦋 Committing version bump ${NEW}..."
+git add Cargo.toml Cargo.lock CHANGELOG.md
+if [ -f "npm/package.json" ]; then
+    git add npm/package.json
+fi
+git commit -m "release: ${NAME} v${NEW}"
+
+echo "🦋 Creating git tag v${NEW}"
+git tag "v${NEW}"
+
+echo "🦋 Pushing release commit and tag atomically..."
+git push --atomic origin main "v${NEW}"

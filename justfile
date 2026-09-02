@@ -18,3 +18,10 @@ dpreview *args:
 
 preview *args:
     ./target/release/crabmd {{args}}
+
+sync_readme:
+    cp README.md npm/README.md
+
+[doc('Release: bump versions, commit, and tag from main (just tag [patch|minor|major])')]
+tag bump="":
+    sh scripts/tag_and_release.sh {{ bump }}

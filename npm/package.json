@@ -1,0 +1,37 @@
+{
+  "name": "crabmd",
+  "version": "0.0.1",
+  "description": "A fast native GPUI markdown writer",
+  "main": "bin.js",
+  "bin": {
+    "crabmd": "./bin.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Blankeos/crabmd.git"
+  },
+  "keywords": [
+    "markdown",
+    "editor",
+    "gpui",
+    "wysiwyg",
+    "rust"
+  ],
+  "author": "Blankeos",
+  "license": "MIT",
+  "files": [
+    "install.js",
+    "bin.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=12"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

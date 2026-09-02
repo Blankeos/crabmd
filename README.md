@@ -10,6 +10,16 @@ just dev path.md
 
 If `path.md` does not exist, crabmd creates an empty markdown file and opens it.
 
+## Install
+
+```sh
+brew install blankeos/tap/crabmd
+npm install -g crabmd
+bun install -g crabmd
+cargo install crabmd --locked
+curl --proto "=https" --tlsv1.2 -LsSf https://github.com/Blankeos/crabmd/releases/latest/download/crabmd-installer.sh | sh
+```
+
 ## What it is
 
 - A GPUI app (Rust, no browser shell)

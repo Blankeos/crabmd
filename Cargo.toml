@@ -5,8 +5,20 @@ edition = "2021"
 license = "MIT"
 description = "A fast native GPUI markdown writer"
 authors = ["Carlo Taleon <blankeos>"]
-repository = "https://github.com/blankeos/crabmd"
-publish = false
+repository = "https://github.com/Blankeos/crabmd"
+homepage = "https://github.com/Blankeos/crabmd"
+readme = "README.md"
+keywords = ["markdown", "editor", "gpui", "wysiwyg"]
+categories = ["text-editors", "command-line-utilities"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/src/**/*.rs",
+    "/README.md",
+    "/LICENSE",
+    "/assets/**",
+    "/themes/**/*.json",
+]
 
 [[bin]]
 name = "crabmd"
