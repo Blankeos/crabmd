@@ -2139,36 +2139,41 @@ fn node_to_gfm(n: &Node, links: &[String]) -> String {
                 format!("> [!{}]\n{}", kind.as_str(), wrap_lines("> ", &body))
             }
         }
-        NodeKind::List { ordered, items } => items
-            .iter()
-            .enumerate()
-            .map(|(i, it)| {
-                let pad = "  ".repeat(it.indent);
-                let marker = if let Some(c) = it.checked {
-                    if c {
-                        "- [x] ".to_string()
+        NodeKind::List { ordered, items } => {
+            // Relative indent so a whole-list Tab cannot emit 4 leading spaces
+            // (CommonMark indented code). Outermost items always start at column 0.
+            let base = items.iter().map(|it| it.indent).min().unwrap_or(0);
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, it)| {
+                    let pad = "  ".repeat(it.indent.saturating_sub(base));
+                    let marker = if let Some(c) = it.checked {
+                        if c {
+                            "- [x] ".to_string()
+                        } else {
+                            "- [ ] ".to_string()
+                        }
+                    } else if *ordered {
+                        // Sibling index within this indent under the nearest shallower parent.
+                        let mut n = 0usize;
+                        for j in (0..i).rev() {
+                            if items[j].indent < it.indent {
+                                break;
+                            }
+                            if items[j].indent == it.indent {
+                                n += 1;
+                            }
+                        }
+                        format!("{}. ", n + 1)
                     } else {
-                        "- [ ] ".to_string()
-                    }
-                } else if *ordered {
-                    // Sibling index within this indent under the nearest shallower parent.
-                    let mut n = 0usize;
-                    for j in (0..i).rev() {
-                        if items[j].indent < it.indent {
-                            break;
-                        }
-                        if items[j].indent == it.indent {
-                            n += 1;
-                        }
-                    }
-                    format!("{}. ", n + 1)
-                } else {
-                    "- ".to_string()
-                };
-                format!("{pad}{marker}{}", inlines_to_gfm(&it.inlines, links))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+                        "- ".to_string()
+                    };
+                    format!("{pad}{marker}{}", inlines_to_gfm(&it.inlines, links))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
         NodeKind::Code { lang, text } => {
             format!("```{lang}\n{text}\n```")
         }
@@ -2659,6 +2664,53 @@ mod feature_tests {
         };
         assert_eq!(items3[0].indent, 1);
         assert_eq!(items3[1].indent, 1);
+    }
+
+    #[test]
+    fn tab_whole_list_does_not_emit_indented_code() {
+        let mut d = Doc::from_gfm("- bullet\n- two\n- three");
+        let len = d.project().display.len();
+        for _ in 0..3 {
+            assert!(d.tab_selection(0..len, false).is_some());
+        }
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!("still a list in the tree");
+        };
+        assert!(items.iter().all(|it| it.indent == 3), "{items:?}");
+        let gfm = d.to_gfm();
+        assert!(
+            !gfm.lines().any(|l| l.starts_with("    ")),
+            "4+ leading spaces become indented code: {gfm:?}"
+        );
+        let d2 = Doc::from_gfm(&gfm);
+        assert!(
+            matches!(d2.nodes[0].kind, NodeKind::List { .. }),
+            "re-parse must stay a list, got {:?} from {gfm:?}",
+            d2.nodes[0].kind
+        );
+    }
+
+    #[test]
+    fn nested_list_gfm_roundtrips_indent() {
+        let mut d = Doc::from_gfm("- a\n- b\n- c");
+        let p = d.project();
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!()
+        };
+        let b = items[1].display.start;
+        let c = items[2].display.start;
+        d.tab(b, false).expect("indent b");
+        d.tab(c, false).expect("indent c");
+        d.tab(c, false).expect("indent c again");
+        let gfm = d.to_gfm();
+        let d2 = Doc::from_gfm(&gfm);
+        assert!(
+            matches!(d2.nodes[0].kind, NodeKind::List { .. }),
+            "nested items must not become a code block: {gfm:?} {:?}",
+            d2.nodes[0].kind
+        );
+        assert!(gfm.contains("- a"), "{gfm:?}");
+        assert!(gfm.contains("- b") && gfm.contains("- c"), "{gfm:?}");
     }
 
     #[test]

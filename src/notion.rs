@@ -108,7 +108,10 @@ pub fn wrap_alert(kind: AlertKind, body: &str) -> String {
 
 pub fn strip_fence(source: &str) -> (String, String) {
     let t = source.trim();
-    let rest = t.strip_prefix("```").unwrap_or(t);
+    let Some(rest) = t.strip_prefix("```") else {
+        // Indented code has no fence; the first line is content, not a language.
+        return (String::new(), t.to_string());
+    };
     let mut lines = rest.lines();
     let first = lines.next().unwrap_or("");
     let lang = first.trim().to_string();
@@ -260,5 +263,15 @@ mod tests {
         let out = commit(&a, "body");
         assert!(out.contains("[!NOTE]"));
         assert!(out.contains("> body"));
+    }
+
+    #[test]
+    fn strip_fence_indented_code_is_not_a_language() {
+        let (lang, body) = strip_fence("    - bullet\n    - two");
+        assert_eq!(lang, "");
+        assert!(body.contains("- bullet"), "{body:?}");
+        let (lang, body) = strip_fence("```rust\nfn main() {}\n```");
+        assert_eq!(lang, "rust");
+        assert_eq!(body, "fn main() {}");
     }
 }

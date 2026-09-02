@@ -581,7 +581,13 @@ impl Workspace {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(&self.source, self.caret, self.sel.clone(), self.mode)
+        Snapshot::of(
+            &self.doc,
+            &self.source,
+            self.caret,
+            self.sel.clone(),
+            self.mode,
+        )
     }
 
     fn push_doc_undo(&mut self) {
@@ -756,9 +762,11 @@ impl Workspace {
     }
 
     fn apply_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        self.doc = crate::tree::Doc::from_gfm(&snap.source);
-        self.source = self.doc.to_gfm();
-        self.caret = snap.caret.min(project(&self.source).display.len());
+        // Restore the live tree. Re-parsing GFM is lossy (e.g. Tab-indented
+        // lists become indented code whose "language" is `- bullet`).
+        self.doc = snap.doc;
+        self.source = snap.source;
+        self.caret = snap.caret.min(self.doc.project().display.len());
         self.sel = snap.sel;
         self.insert_origin = None;
         self.clear_pending();
@@ -3850,8 +3858,10 @@ impl Workspace {
         }
         window.prevent_default();
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            self.finish_insert_undo();
+            let before = self.snapshot();
             if let Some(range) = self.doc.tab_selection(sel, false) {
-                self.push_doc_undo();
+                self.undo.push(before);
                 self.sync_gfm();
                 self.sel = Some(range);
                 self.dirty = true;
@@ -3861,8 +3871,10 @@ impl Workspace {
                 return;
             }
         }
+        self.finish_insert_undo();
+        let before = self.snapshot();
         if let Some(caret) = self.doc.tab(self.caret, false) {
-            self.push_doc_undo();
+            self.undo.push(before);
             self.sync_gfm();
             self.commit_caret(caret, window, cx);
             return;
@@ -3886,8 +3898,10 @@ impl Workspace {
         }
         window.prevent_default();
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            self.finish_insert_undo();
+            let before = self.snapshot();
             if let Some(range) = self.doc.tab_selection(sel, true) {
-                self.push_doc_undo();
+                self.undo.push(before);
                 self.sync_gfm();
                 self.sel = Some(range);
                 self.dirty = true;
@@ -3897,8 +3911,10 @@ impl Workspace {
                 return;
             }
         }
+        self.finish_insert_undo();
+        let before = self.snapshot();
         if let Some(caret) = self.doc.tab(self.caret, true) {
-            self.push_doc_undo();
+            self.undo.push(before);
             self.sync_gfm();
             self.commit_caret(caret, window, cx);
             return;
@@ -4704,13 +4720,20 @@ impl Workspace {
         self.link_draft.clear();
         let sel = self.sel.clone().unwrap_or(self.caret..self.caret);
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::apply_link(&self.source, sel, &url);
-        self.commit_edit(next, caret, window, cx);
+        self.caret = self.doc.apply_link(sel, &url);
+        self.sync_gfm();
+        self.caret = self.caret.min(self.proj().display.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
     }
 
-    fn open_link_url(&self, raw: &str, _cx: &mut App) {
+    fn open_link_url(&self, raw: &str, cx: &mut App) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
+            eprintln!("crabmd: open_link_url: empty url");
             return;
         }
         let url = if trimmed.starts_with("http://")
@@ -4722,6 +4745,7 @@ impl Workspace {
             format!("https://{trimmed}")
         };
         open_in_browser(&url);
+        cx.open_url(&url);
     }
 
     fn remove_link_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4735,8 +4759,14 @@ impl Workspace {
             return;
         };
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::apply_link(&self.source, sel, "");
-        self.commit_edit(next, caret, window, cx);
+        self.caret = self.doc.apply_link(sel, "");
+        self.sync_gfm();
+        self.caret = self.caret.min(self.proj().display.len());
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
     }
 
     fn offset_from_utf16(text: &str, offset: usize) -> usize {
@@ -5443,24 +5473,31 @@ impl Render for Workspace {
 }
 
 fn open_in_browser(url: &str) {
-    let mut cmd = if cfg!(target_os = "macos") {
-        let mut c = std::process::Command::new("/usr/bin/open");
-        c.arg(url);
-        c
-    } else if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    } else {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    let _ = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    // GPUI's open_url (NSWorkspace) is the primary launcher. Also try the
+    // shell path as a fallback: `open` detaches from the GUI process in a way
+    // `Command::spawn` from an app bundle sometimes does not, so wait for the
+    // fast `open` exit instead of leaving a zombie child.
+    for attempt in [&["/usr/bin/open", url][..], &["open", url][..]] {
+        match std::process::Command::new(attempt[0])
+            .arg(attempt[1])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "crabmd: open {:?} exited {}: {}",
+                    attempt,
+                    out.status,
+                    err.trim()
+                );
+            }
+            Err(e) => eprintln!("crabmd: failed to spawn {:?}: {e:#}", attempt),
+        }
+    }
 }
 
 #[allow(dead_code)]

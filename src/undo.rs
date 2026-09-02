@@ -1,23 +1,61 @@
-//! Document-level undo/redo. Snapshots of source + caret + selection + mode.
+//! Document-level undo/redo. Snapshots of the live tree + source + caret.
 
 use std::ops::Range;
 
 use crate::mode::Mode;
+use crate::tree::Doc;
 
 const DEFAULT_CAP: usize = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     pub source: String,
+    pub doc: Doc,
     pub caret: usize,
     pub sel: Option<Range<usize>>,
     pub mode: Mode,
 }
 
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.caret == other.caret
+            && self.sel == other.sel
+            && self.mode == other.mode
+            && self.doc.links == other.doc.links
+            && self.doc.nodes.len() == other.doc.nodes.len()
+            && self
+                .doc
+                .nodes
+                .iter()
+                .zip(&other.doc.nodes)
+                .all(|(a, b)| a.kind == b.kind)
+    }
+}
+
+impl Eq for Snapshot {}
+
 impl Snapshot {
     pub fn new(source: &str, caret: usize, sel: Option<Range<usize>>, mode: Mode) -> Self {
         Self {
             source: source.to_string(),
+            doc: Doc::from_gfm(source),
+            caret,
+            sel,
+            mode,
+        }
+    }
+
+    pub fn of(
+        doc: &Doc,
+        source: &str,
+        caret: usize,
+        sel: Option<Range<usize>>,
+        mode: Mode,
+    ) -> Self {
+        Self {
+            source: source.to_string(),
+            doc: doc.clone(),
             caret,
             sel,
             mode,
@@ -148,5 +186,38 @@ mod tests {
         s.push(snap(1));
         s.push(snap(1));
         assert_eq!(s.len_past(), 1);
+    }
+
+    #[test]
+    fn same_source_different_tree_is_not_duplicate() {
+        use crate::tree::NodeKind;
+
+        let a = crate::tree::Doc::from_gfm("- bullet");
+        let src = a.to_gfm();
+        let mut b = a.clone();
+        let len = b.project().display.len();
+        b.tab_selection(0..len, false);
+        assert_eq!(a.to_gfm(), b.to_gfm(), "normalized GFM stays a list");
+        let NodeKind::List { items, .. } = &b.nodes[0].kind else {
+            panic!();
+        };
+        assert_eq!(items[0].indent, 1);
+
+        let mut s = UndoStack::new(10);
+        s.push(Snapshot::of(&a, &src, 0, None, Mode::Normal));
+        s.push(Snapshot::of(&a, &src, 0, None, Mode::Normal));
+        assert_eq!(s.len_past(), 1, "identical tree is a duplicate");
+        s.push(Snapshot::of(&b, &src, 0, None, Mode::Normal));
+        assert_eq!(s.len_past(), 2, "indent-only change must be undoable");
+
+        let mut s = UndoStack::new(10);
+        s.push(Snapshot::of(&a, &src, 0, None, Mode::Normal));
+        let prev = s
+            .undo(Snapshot::of(&b, &src, 0, None, Mode::Normal))
+            .unwrap();
+        let NodeKind::List { items, .. } = &prev.doc.nodes[0].kind else {
+            panic!("undo restored a list");
+        };
+        assert_eq!(items[0].indent, 0);
     }
 }
