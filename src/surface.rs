@@ -323,7 +323,7 @@ pub fn edit_text<V: EntityInputHandler>(
     // Document/IME stay empty (`doc_len == 0`).
     let shown: gpui::SharedString = if empty {
         if ph.is_empty() {
-            gpui::SharedString::from("Ag")
+            gpui::SharedString::from("\u{200B}")
         } else {
             gpui::SharedString::from(ph.clone())
         }
@@ -352,7 +352,7 @@ pub fn edit_text<V: EntityInputHandler>(
             && shown.is_char_boundary(r.start)
             && shown.is_char_boundary(r.end)
     });
-    let styled = StyledText::new(shown).with_highlights(hs);
+    let styled = StyledText::new(shown.clone()).with_highlights(hs);
     let layout = styled.layout().clone();
     hits.push(Hit {
         display_start,
@@ -366,12 +366,11 @@ pub fn edit_text<V: EntityInputHandler>(
         .relative()
         .w_full()
         .min_w_0()
-        .overflow_hidden()
         .when_some(font_family, |el, fam| el.font_family(fam))
         .when_some(font_px, |el, sz| el.text_size(sz))
         .when(heading, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
-        .when(empty || !wrap, |el| el.whitespace_nowrap())
-        .when(!empty && wrap, |el| el.whitespace_normal())
+        .when(wrap, |el| el.whitespace_normal())
+        .when(!wrap, |el| el.whitespace_nowrap())
         .child(styled)
         .child(CaretLayer {
             layout: layout.clone(),

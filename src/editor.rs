@@ -3904,9 +3904,6 @@ impl Workspace {
                     .px_8()
                     .when(list_item.is_some(), |el| el.py_1())
                     .when(list_item.is_none(), |el| el.py_2())
-                    // Empty display is 0×0 without text; keep a modest hit
-                    // target. Visual line height comes from edit_text (font×φ).
-                    .when(disp.start == disp.end, |el| el.min_h(px(28.)))
                     .when(dragging, |el| el.opacity(0.45))
                     .on_mouse_down(MouseButton::Left, {
                         let view = view.clone();
