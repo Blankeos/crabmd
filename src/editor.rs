@@ -3938,7 +3938,7 @@ impl Workspace {
                     })
                     .child(self.render_drop_edge(ui, n, cx))
                     .child(self.render_block_handle(ui, group, list_item.is_some(), cx))
-                    .children(self.render_handle_menu(ui, cx))
+                    .children(self.render_handle_menu(ui, list_item.is_some(), cx))
                     .children(self.selection_bubble_for_unit(unit.block, list_item, cx))
                     .into_any_element(),
             );
@@ -3954,6 +3954,47 @@ impl Workspace {
             );
         }
         kids
+    }
+
+    fn unit_handle_top(&self, ix: usize, list_item: bool) -> gpui::Pixels {
+        if list_item {
+            // Row has py_1 (4px). Checkbox / bullet container is 22px tall (center at 4 + 11 = 15px).
+            // Handle is 20px tall (center at top + 10px). Center alignment: 15 - 10 = 5px.
+            return px(5.);
+        }
+        let p = self.proj();
+        let us = wysiwyg::units(&p);
+        let Some(unit) = us.get(ix) else {
+            return px(10.);
+        };
+        let Some(block) = p.blocks.get(unit.block) else {
+            return px(10.);
+        };
+        match &block.extra {
+            BlockExtra::Heading(level) => {
+                let base = self.config.markdown_font.size.clamp(8, 48) as f32;
+                let scale = match level {
+                    1 => 2.0,
+                    2 => 1.5,
+                    3 => 1.25,
+                    4 => 1.0,
+                    5 => 0.875,
+                    6 => 0.85,
+                    _ => 1.0,
+                };
+                let font_size = base * scale;
+                // Text line-height in GPUI (~1.3-1.4x font size) + visual baseline adjustment
+                let line_height = font_size * 1.35;
+                let pt = if *level <= 2 { 8.0 } else { 0.0 };
+                // Row has py_2 (8px). Content starts at 8px from row top.
+                // Center of the first text line is: 8 + pt + line_height / 2.
+                // Handle is 20px tall (16px icon + 2px padding each side).
+                // Center the handle with: line_center - 10 (+ 3px downward nudge for visual cap-height centering).
+                let top = 8.0 + pt + (line_height / 2.0) - 10.0 + 3.0;
+                px(top.max(0.0).round())
+            }
+            _ => px(10.),
+        }
     }
 
     fn render_block_handle(
@@ -4036,21 +4077,24 @@ impl Workspace {
             })
             .child(icon_el("grip-vertical", muted));
 
+        let top = self.unit_handle_top(ix, list_item);
+
         div()
             .id(("grip-wrap", ix))
             .absolute()
             .left(px(2.))
-            .top(if list_item { px(2.) } else { px(10.) })
+            .top(top)
             .opacity(if force { 1. } else { 0. })
             .group_hover(group, |s| s.opacity(1.))
             .child(handle)
             .into_any_element()
     }
 
-    fn render_handle_menu(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_handle_menu(&self, ix: usize, list_item: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.block_menu != Some(ix) || cx.has_active_drag() {
             return None;
         }
+        let top = self.unit_handle_top(ix, list_item);
         let pal = &self.palette;
         let err = pal.error;
         let muted = pal.text_muted;
@@ -4064,7 +4108,7 @@ impl Workspace {
                     .id(("grip-menu", ix))
                     .absolute()
                     .left(px(28.))
-                    .top(px(8.))
+                    .top(top)
                     .w(px(168.))
                     .py_1()
                     .rounded(px(8.))
