@@ -125,6 +125,7 @@ actions!(
         DeleteWordBack,
         DeleteLineBack,
         CutSelection,
+        SelectAll,
     ]
 );
 
@@ -219,6 +220,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
         KeyBinding::new("ctrl-x", CutSelection, Some("Workspace")),
+        KeyBinding::new("cmd-a", SelectAll, Some("Workspace")),
+        KeyBinding::new("ctrl-a", SelectAll, Some("Workspace")),
         KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("alt-backspace", DeleteWordBack, Some("Workspace")),
@@ -1679,11 +1682,52 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            self.push_doc_undo();
+            let d0 = sel.start.min(sel.end);
+            let d1 = sel.end.max(sel.start);
+            let caret = self.doc.delete_display(d0..d1);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+            return;
+        }
         let p = self.proj();
         let d = self.caret;
         if d == 0 {
             return;
         }
+
+        // Notion: like cmd-backspace, but word-granularity. Never cross the
+        // current block/item — clearing the last word leaves an empty slot;
+        // a second opt-backspace at the empty start joins/exits structurally.
+        if self.is_notion() {
+            let Some(block) = p.block_at_display(d) else {
+                return;
+            };
+            let unit_start = if let BlockExtra::List { items, .. } = &block.extra {
+                items
+                    .iter()
+                    .find(|it| d >= it.display.start && d <= it.display.end)
+                    .map(|it| it.display.start)
+                    .unwrap_or(block.display.start)
+            } else {
+                block.display.start
+            };
+            if d <= unit_start {
+                self.on_block_backspace(&BlockBackspace, window, cx);
+                return;
+            }
+            let start_d = apply_motion(&p.display, d, Motion::WordBack, 1, None).max(unit_start);
+            if start_d >= d {
+                return;
+            }
+            self.push_doc_undo();
+            let caret = self.doc.delete_display(start_d..d);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+            return;
+        }
+
         let start_d = apply_motion(&p.display, d, Motion::WordBack, 1, None);
         self.push_doc_undo();
         let (next, caret) = wysiwyg::delete_display_range(&self.source, start_d..d);
@@ -1701,17 +1745,54 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            self.push_doc_undo();
+            let d0 = sel.start.min(sel.end);
+            let d1 = sel.end.max(sel.start);
+            let caret = self.doc.delete_display(d0..d1);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+            return;
+        }
         if self.is_notion() {
-            let before = self.source.clone();
-            let caret_before = self.caret;
-            let (next, caret) = wysiwyg::delete_to_line_start(&self.source, self.caret);
-            if next == before && caret == caret_before {
-                // At line/block start — structural backspace (join / exit).
+            let p = self.proj();
+            let d = self.caret;
+            let Some(block) = p.block_at_display(d) else {
+                return;
+            };
+            let (unit_start, unit_end) = if let BlockExtra::List { items, .. } = &block.extra {
+                items
+                    .iter()
+                    .find(|it| d >= it.display.start && d <= it.display.end)
+                    .map(|it| (it.display.start, it.display.end))
+                    .unwrap_or((block.display.start, block.display.end))
+            } else {
+                (block.display.start, block.display.end)
+            };
+            if d <= unit_start {
+                self.on_block_backspace(&BlockBackspace, window, cx);
+                return;
+            }
+            // Delete from the start of the current visual line within the unit.
+            let body = &p.display[unit_start..unit_end.min(p.display.len())];
+            let local = d.saturating_sub(unit_start).min(body.len());
+            let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let start_d = unit_start + line_start;
+            if start_d >= d {
                 self.on_block_backspace(&BlockBackspace, window, cx);
                 return;
             }
             self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
+            // From the unit start: clear the whole unit (avoids leaving a stray
+            // last character when the caret sits on it after a code fence).
+            // Mid-line cmd-backspace still deletes only to the caret.
+            let caret = if start_d <= unit_start {
+                self.doc.delete_display(unit_start..unit_end)
+            } else {
+                self.doc.delete_display(start_d..d)
+            };
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
             return;
         }
         let p = self.proj();
@@ -3039,6 +3120,7 @@ impl Workspace {
             placeholder,
             font,
             font_px,
+            heading,
             {
                 let view = view.clone();
                 move |d, shift, clicks, window, cx| {
@@ -3778,6 +3860,17 @@ impl Workspace {
         self.sync_title(window);
     }
 
+    fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        window.prevent_default();
+        self.clear_pending();
+        let end = self.proj().display.len();
+        self.sel = Some(0..end);
+        self.caret = end;
+        self.visual_anchor = Some(0);
+        self.mouse_anchor = Some(0);
+        self.refresh(window, cx);
+    }
+
     fn render_surface(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if !cx.has_active_drag() {
             self.block_dragging = None;
@@ -3811,6 +3904,9 @@ impl Workspace {
                     .px_8()
                     .when(list_item.is_some(), |el| el.py_1())
                     .when(list_item.is_none(), |el| el.py_2())
+                    // Empty display is 0×0 without text; keep a modest hit
+                    // target. Visual line height comes from edit_text (font×φ).
+                    .when(disp.start == disp.end, |el| el.min_h(px(28.)))
                     .when(dragging, |el| el.opacity(0.45))
                     .on_mouse_down(MouseButton::Left, {
                         let view = view.clone();
@@ -3833,11 +3929,8 @@ impl Workspace {
                         }
                     })
                     .can_drop(|v, _, _| v.downcast_ref::<DragBlock>().is_some())
-                    .on_drag_move(
-                        cx.listener(move |this, e: &DragMoveEvent<DragBlock>, _, cx| {
-                            this.gap_from_row_bounds(ui, e.bounds, e.event.position.y, n, cx);
-                        }),
-                    )
+                    // Gap is owned by the surface-level scroll-aware handler —
+                    // per-row bounds fought it and showed dishonest edges.
                     .on_drop(cx.listener(|this, drag: &DragBlock, window, cx| {
                         this.drop_block_at(drag.ix, window, cx);
                     }))
@@ -3936,7 +4029,9 @@ impl Workspace {
                         this.mouse_dragging = false;
                         this.block_menu = None;
                         this.block_dragging = Some(drag.ix);
-                        this.block_drag_gap = Some(drag.ix);
+                        // None until the pointer actually picks a gap — avoids a
+                        // no-op drop when the user hasn't moved yet (gap==from).
+                        this.block_drag_gap = None;
                         cx.notify();
                     });
                     cx.new(|_| drag.clone())
@@ -4146,6 +4241,10 @@ impl Workspace {
         self.selection_bubble_for_block(block_ix, cx)
     }
 
+    fn drop_gap_is_live(from: usize, gap: usize, n: usize) -> bool {
+        gap <= n && from < n && gap != from && gap != from + 1
+    }
+
     fn render_drop_edge(&self, ix: usize, n: usize, cx: &mut Context<Self>) -> AnyElement {
         if !cx.has_active_drag() {
             return div().into_any_element();
@@ -4156,7 +4255,8 @@ impl Workspace {
         let Some(gap) = self.block_drag_gap else {
             return div().into_any_element();
         };
-        if gap == from || gap == from + 1 {
+        // Only paint gaps that move_unit / drop_block_at would accept.
+        if !Self::drop_gap_is_live(from, gap, n) {
             return div().into_any_element();
         }
         let at_top = gap == ix;
@@ -4203,58 +4303,86 @@ impl Workspace {
     }
 
     fn drop_block_at(&mut self, from: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let gap = self.block_drag_gap.unwrap_or(from);
+        let gap = self.block_drag_gap;
         self.block_dragging = None;
         self.block_drag_gap = None;
         self.block_menu = None;
-        if let Some((next, caret)) = wysiwyg::move_block(&self.source, from, gap) {
-            self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
-        } else {
+        let Some(gap) = gap else {
             cx.notify();
-        }
-    }
-
-    fn gap_from_row_bounds(
-        &mut self,
-        row: usize,
-        bounds: Bounds<Pixels>,
-        y: Pixels,
-        n: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if y < bounds.origin.y || y > bounds.origin.y + bounds.size.height {
+            return;
+        };
+        let n = wysiwyg::units(&self.proj()).len();
+        if !Self::drop_gap_is_live(from, gap, n) {
+            cx.notify();
             return;
         }
-        let gap = if y < bounds.origin.y + bounds.size.height / 2. {
-            row
+        self.push_doc_undo();
+        // Tree-native move preserves empty paragraph slots; GFM round-trip
+        // via move_block/commit_edit used to collapse them.
+        if let Some(caret) = self.doc.move_unit(from, gap) {
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
         } else {
-            (row + 1).min(n)
-        };
-        if self.block_drag_gap != Some(gap) {
-            self.block_drag_gap = Some(gap);
             cx.notify();
         }
     }
 
     fn update_block_drag_gap(&mut self, y: Pixels, cx: &mut Context<Self>) {
         let n = wysiwyg::units(&self.proj()).len();
+        let from = self.block_dragging;
         let offset = self.scroll_handle.offset();
-        let mut gap = n;
+
+        // Prefer the nearest row boundary within a snap window so the painted
+        // edge (drawn on the boundary) matches the gap we commit on drop.
+        // Fall back to midpoint targeting when far from every boundary.
+        let snap = px(14.);
+        let mut best_boundary: Option<(Pixels, usize)> = None;
+        let mut mid_gap = n;
+        let mut mid_resolved = false;
         for i in 0..n {
             let Some(bounds) = self.scroll_handle.bounds_for_item(i) else {
                 continue;
             };
             let top = bounds.origin.y + offset.y;
+            let bottom = top + bounds.size.height;
             let mid = top + bounds.size.height / 2.;
-            if y < mid {
-                gap = i;
-                break;
+
+            let d_top = (y - top).abs();
+            if d_top <= snap {
+                best_boundary = match best_boundary {
+                    Some((d, _)) if d <= d_top => best_boundary,
+                    _ => Some((d_top, i)),
+                };
             }
-            gap = i + 1;
+            if i + 1 == n {
+                let d_bot = (y - bottom).abs();
+                if d_bot <= snap {
+                    best_boundary = match best_boundary {
+                        Some((d, _)) if d <= d_bot => best_boundary,
+                        _ => Some((d_bot, n)),
+                    };
+                }
+            }
+
+            if !mid_resolved {
+                if y < mid {
+                    mid_gap = i;
+                    mid_resolved = true;
+                } else {
+                    mid_gap = i + 1;
+                }
+            }
         }
-        if self.block_drag_gap != Some(gap) {
-            self.block_drag_gap = Some(gap);
+
+        let raw = best_boundary.map(|(_, g)| g).unwrap_or(mid_gap);
+        // Honest: never hold a no-op gap. Indicator + drop both key off this.
+        let gap = match from {
+            Some(from) if Self::drop_gap_is_live(from, raw, n) => Some(raw),
+            Some(_) => None,
+            None => Some(raw),
+        };
+        if self.block_drag_gap != gap {
+            self.block_drag_gap = gap;
             cx.notify();
         }
     }
@@ -4798,6 +4926,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_underline))
             .on_action(cx.listener(Self::on_toggle_link))
             .on_action(cx.listener(Self::on_cut_selection))
+            .on_action(cx.listener(Self::on_select_all))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {
                     cx.stop_propagation();

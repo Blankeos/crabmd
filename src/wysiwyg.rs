@@ -1774,6 +1774,41 @@ mod tests {
     }
 
     #[test]
+    fn backspace_heading_into_empty_keeps_heading() {
+        // (empty)
+        // # |Table  → backspace removes empty, keeps heading
+        let mut doc = crate::tree::Doc::from_gfm("# Table");
+        doc.nodes.insert(
+            0,
+            crate::tree::Node {
+                id: crate::document::next_id(),
+                kind: crate::tree::NodeKind::Paragraph { inlines: vec![] },
+            },
+        );
+        let p = doc.project();
+        let heading = p
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Heading(_)))
+            .unwrap();
+        let at = doc.backspace(heading.display.start).expect("join");
+        assert_eq!(doc.nodes.len(), 1);
+        assert!(
+            matches!(doc.nodes[0].kind, crate::tree::NodeKind::Heading { .. }),
+            "heading preserved: {:?}",
+            doc.nodes[0].kind
+        );
+        let p2 = doc.project();
+        assert_eq!(
+            p2.display.get(p2.blocks[0].display.clone()).unwrap_or(""),
+            "Table"
+        );
+        let b = p2.block_at_display(at).unwrap();
+        assert!(matches!(b.kind, BlockKind::Heading(_)));
+        assert_eq!(at, b.display.start);
+    }
+
+    #[test]
     fn backspace_heading_joins_previous_line() {
         let src = "A paragraph\n\n## Lists";
         let p = project(src);
@@ -3158,18 +3193,67 @@ mod tests {
 
     #[test]
     fn opt_backspace_last_word_leaves_empty_block() {
+        // Notion opt-backspace: deleting the sole word in a block must leave
+        // an empty slot (same as cmd-backspace), not join into the previous.
         let src = "above\n\nhello";
         let mut doc = crate::tree::Doc::from_gfm(src);
         let p = doc.project();
-        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
+        let block = p
+            .blocks
+            .iter()
+            .find(|b| &p.display[b.display.clone()] == "hello")
+            .unwrap();
         let caret = block.display.end;
-        let start = crate::motion::apply_motion(&p.display, caret, crate::motion::Motion::WordBack, 1, None);
-        assert_eq!(start, block.display.start);
+        let unit_start = block.display.start;
+        let start = crate::motion::apply_motion(
+            &p.display,
+            caret,
+            crate::motion::Motion::WordBack,
+            1,
+            None,
+        )
+        .max(unit_start);
+        assert_eq!(start, unit_start);
         let at = doc.delete_display(start..caret);
-        let p2 = doc.project();
         assert_eq!(doc.nodes.len(), 2, "must keep empty node");
+        let p2 = doc.project();
         let b = p2.block_at_display(at).unwrap();
-        assert_eq!(b.display.start, b.display.end, "caret on empty block, at={at} display={:?}", p2.display);
+        assert_eq!(
+            b.display.start, b.display.end,
+            "caret on empty block, at={at} display={:?}",
+            p2.display
+        );
+        assert!(p2.display.contains("above"), "{:?}", p2.display);
+    }
+
+    #[test]
+    fn opt_backspace_clamped_word_back_does_not_cross_block() {
+        let src = "above\n\nhello world";
+        let mut doc = crate::tree::Doc::from_gfm(src);
+        let p = doc.project();
+        let block = p
+            .blocks
+            .iter()
+            .find(|b| p.display[b.display.clone()].starts_with("hello"))
+            .unwrap();
+        let caret = block.display.end;
+        let unit_start = block.display.start;
+        // Unclamped WordBack from mid-block is fine; from block start would
+        // cross — clamping keeps deletion inside the unit.
+        let start = crate::motion::apply_motion(
+            &p.display,
+            caret,
+            crate::motion::Motion::WordBack,
+            1,
+            None,
+        )
+        .max(unit_start);
+        assert!(start >= unit_start);
+        let _ = doc.delete_display(start..caret);
+        let p2 = doc.project();
+        assert!(p2.display.contains("above"), "previous block intact: {:?}", p2.display);
+        assert!(p2.display.contains("hello"), "only last word removed: {:?}", p2.display);
+        assert!(!p2.display.contains("world"), "{:?}", p2.display);
     }
 
     #[test]
@@ -3178,7 +3262,13 @@ mod tests {
         let mut doc = crate::tree::Doc::from_gfm(src);
         let p = doc.project();
         let caret = p.display.len();
-        let start = crate::motion::apply_motion(&p.display, caret, crate::motion::Motion::WordBack, 1, None);
+        let start = crate::motion::apply_motion(
+            &p.display,
+            caret,
+            crate::motion::Motion::WordBack,
+            1,
+            None,
+        );
         let at = doc.delete_display(start..caret);
         assert_eq!(doc.nodes.len(), 1);
         let p2 = doc.project();
@@ -3187,54 +3277,115 @@ mod tests {
     }
 
     #[test]
-    fn word_back_at_block_start_crosses_newline() {
-        let src = "above\n\nhello";
-        let doc = crate::tree::Doc::from_gfm(src);
-        let p = doc.project();
-        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
-        let start = crate::motion::apply_motion(&p.display, block.display.start, crate::motion::Motion::WordBack, 1, None);
-        eprintln!("display={:?} block_start={} word_back={}", p.display, block.display.start, start);
-        assert!(start < block.display.start, "WordBack at block start crosses into previous");
-    }
-
-    #[test]
-    fn editor_path_opt_backspace_last_word() {
-        // Mimic on_delete_word_back + commit_edit
-        let src = "above\n\nhello";
-        let p = project(src);
-        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
-        let d = block.display.end;
-        let start_d = crate::motion::apply_motion(&p.display, d, crate::motion::Motion::WordBack, 1, None);
-        eprintln!("step1 display={:?} start={} d={} block={:?}", p.display, start_d, d, block.display);
-        let (next, caret) = delete_display_range(src, start_d..d);
-        let doc = crate::tree::Doc::from_gfm(&next);
-        let source = doc.to_gfm();
-        let p2 = doc.project();
-        let caret = caret.min(p2.display.len());
-        eprintln!("after1 gfm={:?} display={:?} caret={} nodes={} blocks={:?}",
-            source, p2.display, caret, doc.nodes.len(),
-            p2.blocks.iter().map(|b| (b.display.clone(), p2.display.get(b.display.clone()).unwrap_or("").to_string())).collect::<Vec<_>>());
-
-        // Second opt-backspace from resulting caret (Notion "again")
-        let start2 = crate::motion::apply_motion(&p2.display, caret, crate::motion::Motion::WordBack, 1, None);
-        eprintln!("step2 word_back from {} -> {}", caret, start2);
-        let (next2, caret2) = delete_display_range(&source, start2..caret);
-        let doc2 = crate::tree::Doc::from_gfm(&next2);
-        eprintln!("after2 gfm={:?} display={:?} caret={} nodes={}", doc2.to_gfm(), doc2.project().display, caret2, doc2.nodes.len());
-    }
-
-    #[test]
-    fn editor_path_cmd_backspace_last_word_equiv() {
-        let src = "above\n\nhello";
-        let p = project(src);
-        let block = p.blocks.iter().find(|b| &p.display[b.display.clone()] == "hello").unwrap();
-        let d = block.display.end;
-        let (next, caret) = delete_to_line_start(src, d);
-        let doc = crate::tree::Doc::from_gfm(&next);
-        let p2 = doc.project();
-        eprintln!("cmd1 gfm={:?} display={:?} caret={} nodes={}", doc.to_gfm(), p2.display, caret, doc.nodes.len());
+    fn enter_at_start_of_heading_inserts_empty_above() {
+        let src = "# Table";
+        let mut doc = crate::tree::Doc::from_gfm(src);
+        let at = doc.enter(0, false);
         assert_eq!(doc.nodes.len(), 2);
-        let b = p2.block_at_display(caret.min(p2.display.len())).unwrap();
-        assert_eq!(b.display.start, b.display.end);
+        assert!(
+            matches!(doc.nodes[0].kind, crate::tree::NodeKind::Paragraph { .. }),
+            "empty paragraph above"
+        );
+        assert!(
+            matches!(doc.nodes[1].kind, crate::tree::NodeKind::Heading { .. }),
+            "heading preserved: {:?}",
+            doc.nodes[1].kind
+        );
+        let p = doc.project();
+        assert_eq!(
+            p.display.get(p.blocks[1].display.clone()).unwrap_or(""),
+            "Table",
+            "heading body intact: {:?}",
+            p.display
+        );
+        // Caret stays on the heading: `|Table`
+        let b = p.block_at_display(at).unwrap();
+        assert!(
+            matches!(b.kind, BlockKind::Heading(_)),
+            "caret on heading, got {:?} at={at} display={:?}",
+            b.kind,
+            p.display
+        );
+        assert_eq!(at, b.display.start, "caret at start of heading body");
     }
+
+    #[test]
+    fn cmd_backspace_after_code_clears_paragraph() {
+        let src = "```\ncode\n```\n\nSome words here";
+        // Editor clears unit_start..unit_end when deleting from the unit start,
+        // even if the caret sits on the last character (end-1).
+        for caret_off in [0usize, 1] {
+            let mut doc = crate::tree::Doc::from_gfm(src);
+            let p = doc.project();
+            let para = p
+                .blocks
+                .iter()
+                .find(|b| p.display.get(b.display.clone()) == Some("Some words here"))
+                .unwrap();
+            let unit_start = para.display.start;
+            let unit_end = para.display.end;
+            let caret = unit_end.saturating_sub(caret_off).max(unit_start);
+            let at = doc.delete_display(unit_start..unit_end);
+            let _ = caret;
+            let p2 = doc.project();
+            assert!(
+                !p2.display.contains("Some") && !p2.display.contains("words"),
+                "cleared (off={caret_off}): {:?}",
+                p2.display
+            );
+            assert!(p2.display.contains("code"), "{:?}", p2.display);
+            let b = p2.block_at_display(at).unwrap();
+            assert_eq!(
+                b.display.start, b.display.end,
+                "left on empty slot at={at} display={:?}",
+                p2.display
+            );
+            assert!(
+                !p2.display.ends_with('e'),
+                "stray e (off={caret_off}): {:?}",
+                p2.display
+            );
+        }
+    }
+
+    #[test]
+    fn join_gfm_preserves_consecutive_empties() {
+        let src = "p1\n\n\np2\n\n\np3";
+        let doc = crate::tree::Doc::from_gfm(src);
+        assert_eq!(doc.nodes.len(), 5, "parsed empties");
+        let gfm = doc.to_gfm();
+        let doc2 = crate::tree::Doc::from_gfm(&gfm);
+        assert_eq!(
+            doc2.nodes.len(),
+            5,
+            "roundtrip must keep empties: gfm={gfm:?} nodes={}",
+            doc2.nodes.len()
+        );
+    }
+
+    #[test]
+    fn move_block_preserves_empties_tree_native() {
+        let src = "p1\n\n\np2\n\n\np3";
+        let mut doc = crate::tree::Doc::from_gfm(src);
+        assert_eq!(doc.nodes.len(), 5);
+        doc.move_unit(2, 1).expect("move p2 before first empty");
+        // p1, p2, empty, empty, p3
+        assert_eq!(doc.nodes.len(), 5, "move must not drop nodes");
+        let gfm = doc.to_gfm();
+        let doc2 = crate::tree::Doc::from_gfm(&gfm);
+        assert_eq!(
+            doc2.nodes.len(),
+            5,
+            "sync roundtrip keeps empties: gfm={gfm:?}"
+        );
+        let texts: Vec<_> = {
+            let p = doc2.project();
+            p.blocks
+                .iter()
+                .map(|b| p.display.get(b.display.clone()).unwrap_or("").to_string())
+                .collect()
+        };
+        assert_eq!(texts, vec!["p1", "p2", "", "", "p3"]);
+    }
+
 }

@@ -16,6 +16,9 @@ use crate::theme::Palette;
 #[derive(Clone)]
 pub struct Hit {
     pub display_start: usize,
+    /// Document display length for this hit. May be 0 for empty blocks even
+    /// when `layout` contains a line-height probe character.
+    pub doc_len: usize,
     pub layout: TextLayout,
 }
 
@@ -225,7 +228,7 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _window: &mut Window,
         _cx: &mut App,
@@ -243,7 +246,8 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
             self.layout.position_for_index(local.min(len))
         }))
         .ok()
-        .flatten()?;
+        .flatten()
+        .unwrap_or(Point::new(bounds.origin.x, bounds.origin.y));
         let h =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
                 .unwrap_or(px(16.));
@@ -300,22 +304,47 @@ pub fn edit_text<V: EntityInputHandler>(
     placeholder: Option<&str>,
     font_family: Option<gpui::SharedString>,
     font_px: Option<gpui::Pixels>,
+    heading: bool,
     on_click: impl Fn(usize, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     let text = text.into();
     let empty = text.is_empty();
-    // Never put the placeholder in the IME/layout string — macOS will treat it
-    // as real text (replace/backspace then invents extra blocks).
-    let shown: gpui::SharedString = text.clone();
-    let placeholder_label = if empty {
+    let ph = if empty {
         placeholder.unwrap_or("").to_string()
     } else {
         String::new()
     };
+    // Empty `StyledText` is 0-tall and an absolutely positioned placeholder
+    // overflows neighbors (the heading-sized hint the user sees). Keep the
+    // strut *in-flow* in the same layout the caret uses:
+    // - placeholder text when focused (muted, nowrap → one line)
+    // - "Ag" font strut otherwise (ascent+descent, painted transparent)
+    // Document/IME stay empty (`doc_len == 0`).
+    let shown: gpui::SharedString = if empty {
+        if ph.is_empty() {
+            gpui::SharedString::from("Ag")
+        } else {
+            gpui::SharedString::from(ph.clone())
+        }
+    } else {
+        text.clone()
+    };
     let mut hs = highlights;
     if empty {
         hs.clear();
+        hs.push((
+            0..shown.len(),
+            HighlightStyle {
+                font_weight: heading.then_some(gpui::FontWeight::SEMIBOLD),
+                color: Some(if ph.is_empty() {
+                    p.primary.opacity(0.)
+                } else {
+                    p.text_muted
+                }),
+                ..Default::default()
+            },
+        ));
     }
     hs.retain(|(r, _)| {
         r.start < r.end
@@ -327,33 +356,23 @@ pub fn edit_text<V: EntityInputHandler>(
     let layout = styled.layout().clone();
     hits.push(Hit {
         display_start,
+        doc_len: if empty { 0 } else { text.len() },
         layout: layout.clone(),
     });
     let color = p.primary;
-    let muted = p.text_muted;
     let click_empty = empty;
-    let ph = placeholder_label.clone();
     div()
         .id(("edit", display_start))
         .relative()
         .w_full()
         .min_w_0()
-        .min_h(px(8.))
+        .overflow_hidden()
         .when_some(font_family, |el, fam| el.font_family(fam))
         .when_some(font_px, |el, sz| el.text_size(sz))
-        .when(wrap, |el| el.whitespace_normal())
-        .when(!wrap, |el| el.whitespace_nowrap())
+        .when(heading, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
+        .when(empty || !wrap, |el| el.whitespace_nowrap())
+        .when(!empty && wrap, |el| el.whitespace_normal())
         .child(styled)
-        .when(!ph.is_empty(), |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .text_color(muted)
-                    .child(ph),
-            )
-        })
         .child(CaretLayer {
             layout: layout.clone(),
             local_caret: if empty {
@@ -460,7 +479,7 @@ pub fn index_for_point(hits: &[Hit], point: Point<Pixels>) -> Option<usize> {
         if point.y < bounds.top() || point.y > bounds.bottom() {
             continue;
         }
-        let idx = index_for_click(&hit.layout, point);
+        let idx = index_for_click(&hit.layout, point).min(hit.doc_len);
         return Some(hit.display_start + idx);
     }
     let mut best: Option<(Pixels, usize)> = None;
@@ -468,14 +487,13 @@ pub fn index_for_point(hits: &[Hit], point: Point<Pixels>) -> Option<usize> {
         let Some(bounds) = layout_bounds(&hit.layout) else {
             continue;
         };
-        let len = layout_len(&hit.layout).unwrap_or(0);
         let dist = if point.y < bounds.top() {
             bounds.top() - point.y
         } else {
             point.y - bounds.bottom()
         };
         let d = if point.y > bounds.bottom() {
-            hit.display_start + len
+            hit.display_start + hit.doc_len
         } else {
             hit.display_start
         };
@@ -496,10 +514,7 @@ pub fn caret_screen_y(hits: &[Hit], display: usize) -> Option<(Pixels, Pixels)> 
             break;
         }
         fallback = Some(hit);
-        let Some(len) = layout_len(&hit.layout) else {
-            continue;
-        };
-        if display <= hit.display_start + len {
+        if display <= hit.display_start + hit.doc_len {
             return caret_y(hit, display);
         }
     }

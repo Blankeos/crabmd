@@ -124,7 +124,20 @@ impl Doc {
 
     pub fn from_gfm(src: &str) -> Self {
         if src.trim().is_empty() {
-            return Self::empty();
+            // Match GFM projection: `""`/`"\n"` → 1 empty, `"\n\n"` → 2, `"\n\n\n"` → 3.
+            let newlines = src.as_bytes().iter().filter(|&&b| b == b'\n').count();
+            let n = match newlines {
+                0 | 1 => 1,
+                n => n,
+            };
+            let mut nodes = Vec::with_capacity(n);
+            for _ in 0..n {
+                nodes.push(Node {
+                    id: next_id(),
+                    kind: NodeKind::Paragraph { inlines: vec![] },
+                });
+            }
+            return Self { nodes };
         }
         let p = project_gfm(src);
         let mut nodes = Vec::with_capacity(p.blocks.len());
@@ -323,6 +336,22 @@ impl Doc {
         if hard {
             return self.insert_text(caret, None, "\n", Marks::default());
         }
+        // Notion: Enter at the start of a heading inserts an empty block above
+        // and keeps the heading text (does not demote the body to a paragraph).
+        // Caret stays on the heading (`|Table`), not on the new empty line.
+        if loc.offset == 0 {
+            if matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. }) {
+                let ni = loc.node;
+                self.nodes.insert(
+                    ni,
+                    Node {
+                        id: next_id(),
+                        kind: NodeKind::Paragraph { inlines: vec![] },
+                    },
+                );
+                return self.caret_after(ni + 1, None, None, 0);
+            }
+        }
         let inlines = self.inlines_at(loc).to_vec();
         let (left, right) = split_inlines(&inlines, loc.offset);
         let empty_right = inlines_len(&right) == 0;
@@ -445,6 +474,18 @@ impl Doc {
             | NodeKind::Alert { .. }
             | NodeKind::Code { .. } => {
                 if loc.node > 0 {
+                    // Empty block above a heading: drop the empty slot and keep
+                    // the heading (`# Table`). Merging into an empty paragraph
+                    // would demote the heading to plain text.
+                    let prev_empty = matches!(
+                        &self.nodes[loc.node - 1].kind,
+                        NodeKind::Paragraph { inlines } if inlines_len(inlines) == 0
+                    );
+                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. }) {
+                        let heading = loc.node;
+                        self.nodes.remove(loc.node - 1);
+                        return Some(self.caret_after(heading - 1, None, None, 0));
+                    }
                     return Some(self.merge_nodes(loc.node - 1, loc.node));
                 }
                 let inlines = match &self.nodes[loc.node].kind {
@@ -1541,25 +1582,30 @@ fn join_gfm(nodes: &[Node], parts: &[String]) -> String {
             continue;
         }
         if !out.is_empty() || pending_empty > 0 {
-            let need = 2 + pending_empty.saturating_sub(if out.is_empty() { 1 } else { 0 });
+            // Between content: `a\n\nb` = 0 empties, `a\n\n\nb` = 1, … → 2 + pending.
+            // Leading empties: `\n\nLists` = 1 empty, `\n\n\nLists` = 2 → pending + 1.
             let need = if out.is_empty() {
-                pending_empty.saturating_sub(1)
+                pending_empty + 1
             } else {
-                1 + pending_empty.max(1)
+                2 + pending_empty
             };
             let have = out.bytes().rev().take_while(|&b| b == b'\n').count();
             let extra = need.saturating_sub(have);
             for _ in 0..extra {
                 out.push('\n');
             }
-            let _ = need;
         }
         out.push_str(part);
         pending_empty = 0;
     }
     if pending_empty > 0 {
         let need = if out.is_empty() {
-            pending_empty.saturating_sub(1)
+            // All-empty doc: 1 → "", 2 → "\n\n", 3 → "\n\n\n" (matches from_gfm).
+            if pending_empty <= 1 {
+                0
+            } else {
+                pending_empty
+            }
         } else {
             pending_empty + 1
         };
