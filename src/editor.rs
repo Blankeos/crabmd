@@ -4224,6 +4224,7 @@ impl Workspace {
                 div()
                     .w(px(28.))
                     .h(px(22.))
+                    .mt(px(2.))
                     .flex()
                     .items_center()
                     .justify_center()
