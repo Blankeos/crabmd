@@ -270,13 +270,15 @@ impl Doc {
         }
         // Multi-node: delete within start, drop middle nodes, delete prefix of end, maybe merge.
         self.delete_display(a..self.node_end(start.node, start.item));
-        let mut i = start.node + 1;
-        while i < end.node {
-            self.nodes.remove(i);
-            // end.node shifts
+        let num_to_drop = end.node.saturating_sub(start.node + 1);
+        for _ in 0..num_to_drop {
+            if start.node + 1 < self.nodes.len() {
+                self.nodes.remove(start.node + 1);
+            }
         }
-        let end = self.loc(b.saturating_sub(1).min(self.project().display.len().saturating_sub(1)));
-        if end.node > start.node {
+        let p = self.project();
+        let end = self.loc(b.saturating_sub(1).min(p.display.len().saturating_sub(1)));
+        if end.node > start.node && end.node < self.nodes.len() {
             let end_off = self.loc(b).offset;
             match &mut self.nodes[end.node].kind {
                 NodeKind::Code { text, .. } => {
@@ -295,6 +297,13 @@ impl Doc {
                 }
             }
             self.merge_nodes(start.node, end.node);
+        }
+        if self.nodes.is_empty() {
+            self.nodes.push(Node {
+                id: next_id(),
+                kind: NodeKind::Paragraph { inlines: vec![] },
+            });
+            return 0;
         }
         self.caret_after(start.node, start.item, start.cell, start.offset)
     }
@@ -602,14 +611,32 @@ impl Doc {
             .is_some_and(|s| !s.chars().any(char::is_whitespace));
         // Partially-marked contiguous words clear instead of stacking.
         let turn_on = !(all || (any && wordish));
-        let loc = self.loc(a);
-        let loc_b = self.loc(b);
-        if loc.node != loc_b.node || loc.item != loc_b.item {
-            return None;
+
+        let us = units(&p);
+        let mut affected = 0;
+        for u in us {
+            let u_disp = unit_display(&p, u);
+            let overlap_start = a.max(u_disp.start);
+            let overlap_end = b.min(u_disp.end);
+            if overlap_start < overlap_end {
+                let off0 = overlap_start - u_disp.start;
+                let off1 = overlap_end - u_disp.start;
+                let loc = Loc {
+                    node: u.block,
+                    item: u.item,
+                    cell: None,
+                    offset: off0,
+                };
+                let inlines = self.inlines_at_mut(loc);
+                apply_mark_range(inlines, off0, off1, mark, turn_on);
+                affected += 1;
+            }
         }
-        let inlines = self.inlines_at_mut(loc);
-        apply_mark_range(inlines, loc.offset, loc_b.offset, mark, turn_on);
-        Some(a..b)
+        if affected == 0 {
+            None
+        } else {
+            Some(a..b)
+        }
     }
 
     pub fn apply_slash(&mut self, caret: usize, template: &str) -> usize {
@@ -830,29 +857,69 @@ impl Doc {
         self.caret_after(at, None, None, 0)
     }
 
-    pub fn tab(&mut self, caret: usize, outdent: bool) -> Option<usize> {
-        let loc = self.loc(caret);
-        let NodeKind::List { items, .. } = &mut self.nodes[loc.node].kind else {
-            return None;
+    fn tab_item_at(&mut self, node: usize, ix: usize, outdent: bool) -> bool {
+        let NodeKind::List { items, .. } = &mut self.nodes[node].kind else {
+            return false;
         };
-        let ix = loc.item?;
+        if ix >= items.len() {
+            return false;
+        }
         if outdent {
             if items[ix].indent == 0 {
-                return None;
+                return false;
             }
             items[ix].indent -= 1;
+            true
         } else {
             let max = if ix == 0 {
-                0
+                items[ix].indent + 1
             } else {
                 items[ix - 1].indent + 1
             };
             if items[ix].indent >= max {
-                return None;
+                return false;
             }
             items[ix].indent += 1;
+            true
         }
-        Some(self.caret_after(loc.node, Some(ix), None, loc.offset))
+    }
+
+    pub fn tab(&mut self, caret: usize, outdent: bool) -> Option<usize> {
+        let loc = self.loc(caret);
+        let ix = loc.item?;
+        if self.tab_item_at(loc.node, ix, outdent) {
+            Some(self.caret_after(loc.node, Some(ix), None, loc.offset))
+        } else {
+            None
+        }
+    }
+
+    pub fn tab_selection(&mut self, sel: Range<usize>, outdent: bool) -> Option<Range<usize>> {
+        let a = sel.start.min(sel.end);
+        let b = sel.end.max(sel.start);
+        if a >= b {
+            return None;
+        }
+        let p = self.project();
+        let us = units(&p);
+        let mut modified = false;
+        for u in us {
+            let u_disp = unit_display(&p, u);
+            let overlap_start = a.max(u_disp.start);
+            let overlap_end = b.min(u_disp.end);
+            if overlap_start < overlap_end {
+                if let Some(item_ix) = u.item {
+                    if self.tab_item_at(u.block, item_ix, outdent) {
+                        modified = true;
+                    }
+                }
+            }
+        }
+        if modified {
+            Some(a..b)
+        } else {
+            None
+        }
     }
 
     fn maybe_shortcut(&mut self, node: usize, item: Option<usize>) {
@@ -1970,6 +2037,24 @@ mod feature_tests {
         let NodeKind::List { items, .. } = &d.nodes[0].kind else { panic!() };
         assert_eq!(items[1].indent, 0);
         assert!(d.tab(c, false).is_some());
+
+        // caret on first item should also be able to indent
+        let p_curr = d.project();
+        let BlockExtra::List { items: p_items, .. } = &p_curr.blocks[0].extra else { panic!() };
+        let c0 = p_items[0].display.start;
+        let c0 = d.tab(c0, false).expect("indent first item");
+        let NodeKind::List { items: items2, .. } = &d.nodes[0].kind else { panic!() };
+        assert_eq!(items2[0].indent, 1);
+        let _ = d.tab(c0, true).expect("outdent first item");
+        let _ = d.tab(c, true).expect("outdent second item");
+
+        // Multi-block tab selection
+        let p3 = d.project();
+        let len = p3.display.len();
+        d.tab_selection(0..len, false).expect("tab selection");
+        let NodeKind::List { items: items3, .. } = &d.nodes[0].kind else { panic!() };
+        assert_eq!(items3[0].indent, 1);
+        assert_eq!(items3[1].indent, 1);
     }
 
     #[test]
@@ -1979,6 +2064,29 @@ mod feature_tests {
         let NodeKind::List { items, .. } = &d.nodes[0].kind else { panic!() };
         assert_eq!(items[0].checked, Some(true));
         assert!(d.to_gfm().contains("- [x]"));
+    }
+
+    #[test]
+    fn toggle_mark_multiline() {
+        let mut d = Doc::from_gfm("Line one\n\nLine two");
+        let p = d.project();
+        let len = p.display.len();
+        let res = d.toggle_mark(0..len, Mark::Bold);
+        assert!(res.is_some());
+        let p2 = d.project();
+        assert!(p2.marks_at(0, Affinity::Inside).bold);
+        let second_line_start = p2.display.find("Line two").unwrap();
+        assert!(p2.marks_at(second_line_start, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn delete_all_does_not_panic() {
+        let mut d = Doc::from_gfm("# Hello\n\nWorld line 2\n\n- item 1\n- item 2");
+        let p = d.project();
+        let len = p.display.len();
+        let c = d.delete_display(0..len);
+        assert_eq!(c, 0);
+        assert!(!d.nodes.is_empty());
     }
 
     #[test]

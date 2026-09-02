@@ -305,7 +305,7 @@ pub fn edit_text<V: EntityInputHandler>(
     font_family: Option<gpui::SharedString>,
     font_px: Option<gpui::Pixels>,
     heading: bool,
-    on_click: impl Fn(usize, bool, usize, &mut Window, &mut App) + 'static,
+    on_click: impl Fn(usize, bool, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     let text = text.into();
@@ -394,9 +394,11 @@ pub fn edit_text<V: EntityInputHandler>(
                 } else {
                     index_for_click(&layout, ev.position)
                 };
+                let cmd_or_ctrl = ev.modifiers.platform || ev.modifiers.control;
                 on_click(
                     display_start + idx,
                     ev.modifiers.shift,
+                    cmd_or_ctrl,
                     ev.click_count,
                     window,
                     cx,

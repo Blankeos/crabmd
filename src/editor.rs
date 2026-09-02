@@ -126,6 +126,7 @@ actions!(
         DeleteLineBack,
         CutSelection,
         SelectAll,
+        QuitApp,
     ]
 );
 
@@ -231,6 +232,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some("Workspace")),
         KeyBinding::new("cmd-shift-z", Redo, Some("Workspace")),
         KeyBinding::new("ctrl-shift-z", Redo, Some("Workspace")),
+        KeyBinding::new("cmd-q", QuitApp, Some("Workspace")),
     ]);
 }
 
@@ -811,10 +813,34 @@ impl Workspace {
         &mut self,
         d: usize,
         shift: bool,
+        cmd: bool,
         click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.link_open {
+            self.link_open = false;
+            self.link_draft.clear();
+        }
+        if !shift {
+            let p = self.proj();
+            if let Some((range, url)) = p.link_at(d) {
+                if cmd {
+                    cx.open_url(url);
+                    return;
+                } else if click_count == 1 {
+                    // Clicking on a link selects the link and opens the link bubble
+                    self.caret = range.end;
+                    self.sel = Some(range);
+                    self.mouse_dragging = false;
+                    self.clamp_caret();
+                    self.follow_caret = false;
+                    self.focus.focus(window, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if click_count >= 2 && !shift {
             let p = self.proj();
             let d = d.min(p.display.len());
@@ -877,6 +903,10 @@ impl Workspace {
     }
 
     pub fn drag_display(&mut self, d: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_open {
+            self.link_open = false;
+            self.link_draft.clear();
+        }
         if !self.mouse_dragging {
             return;
         }
@@ -2259,13 +2289,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_dragging = false;
+        self.mouse_unit = None;
+        self.sel = None;
+        self.follow_caret = false;
         self.push_doc_undo();
         self.doc.toggle_task(block_ix, item_ix);
         self.sync_gfm();
         self.dirty = true;
         self.status = "unsaved".into();
         self.sync_title(window);
-        self.refresh_raw(window, cx);
+        self.clamp_caret();
+        if self.mode.extends_selection() {
+            self.snap_visual_sel();
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     fn insert_image_line(&mut self, filename: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -3123,9 +3162,9 @@ impl Workspace {
             heading,
             {
                 let view = view.clone();
-                move |d, shift, clicks, window, cx| {
+                move |d, shift, cmd, clicks, window, cx| {
                     view.update(cx, |this, cx| {
-                        this.click_display(d, shift, clicks, window, cx)
+                        this.click_display(d, shift, cmd, clicks, window, cx)
                     });
                 }
             },
@@ -3253,6 +3292,7 @@ impl Workspace {
                             this.click_display(
                                 start,
                                 ev.modifiers.shift,
+                                ev.modifiers.platform || ev.modifiers.control,
                                 ev.click_count,
                                 window,
                                 cx,
@@ -3331,6 +3371,7 @@ impl Workspace {
                         this.click_display(
                             display_start,
                             ev.modifiers.shift,
+                            ev.modifiers.platform || ev.modifiers.control,
                             ev.click_count,
                             window,
                             cx,
@@ -3456,6 +3497,7 @@ impl Workspace {
                                     let view = cx.entity();
                                     let block_ix = ix;
                                     move |_, window, cx| {
+                                        cx.stop_propagation();
                                         view.update(cx, |this, cx| {
                                             this.toggle_task(block_ix, i, window, cx);
                                         });
@@ -3659,6 +3701,10 @@ impl Workspace {
             return div().into_any_element();
         };
         let p = &self.palette;
+        let is_linked = self.sel.as_ref().is_some_and(|s| {
+            (s.start..s.end).any(|i| self.proj().marks_at(i, Affinity::Inside).link.is_some())
+        }) || self.proj().marks_at(self.caret, Affinity::Inside).link.is_some();
+
         h_flex()
             .gap_1()
             .px_2()
@@ -3682,6 +3728,17 @@ impl Workspace {
                         this.on_toggle_link(&ToggleLink, window, cx);
                     })),
             )
+            .when(is_linked, |el| {
+                el.child(
+                    Button::new("rm-link")
+                        .ghost()
+                        .xsmall()
+                        .label("Unlink")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.remove_link_action(window, cx);
+                        })),
+                )
+            })
             .when(self.link_open, |el| el.child(self.render_link_field(cx)))
             .into_any_element()
     }
@@ -3766,6 +3823,18 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            if let Some(range) = self.doc.tab_selection(sel, false) {
+                self.push_doc_undo();
+                self.sync_gfm();
+                self.sel = Some(range);
+                self.dirty = true;
+                self.status = "unsaved".into();
+                self.refresh(window, cx);
+                self.sync_title(window);
+                return;
+            }
+        }
         if let Some(caret) = self.doc.tab(self.caret, false) {
             self.push_doc_undo();
             self.sync_gfm();
@@ -3790,6 +3859,18 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            if let Some(range) = self.doc.tab_selection(sel, true) {
+                self.push_doc_undo();
+                self.sync_gfm();
+                self.sel = Some(range);
+                self.dirty = true;
+                self.status = "unsaved".into();
+                self.refresh(window, cx);
+                self.sync_title(window);
+                return;
+            }
+        }
         if let Some(caret) = self.doc.tab(self.caret, true) {
             self.push_doc_undo();
             self.sync_gfm();
@@ -3918,6 +3999,7 @@ impl Workspace {
                                 this.click_display(
                                     d,
                                     ev.modifiers.shift,
+                                    ev.modifiers.platform || ev.modifiers.control,
                                     ev.click_count,
                                     window,
                                     cx,
@@ -4233,6 +4315,7 @@ impl Workspace {
                         el.cursor_pointer().on_mouse_down(MouseButton::Left, {
                             let view = cx.entity();
                             move |_, window, cx| {
+                                cx.stop_propagation();
                                 view.update(cx, |this, cx| {
                                     this.toggle_task(block_ix, item_ix, window, cx);
                                 });
@@ -4482,6 +4565,37 @@ impl Workspace {
         self.commit_edit(next, caret, window, cx);
     }
 
+    fn open_link_url(&self, raw: &str, cx: &mut App) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let url = if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("mailto:")
+        {
+            trimmed.to_string()
+        } else {
+            format!("https://{trimmed}")
+        };
+        cx.open_url(&url);
+    }
+
+    fn remove_link_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_draft.clear();
+        let p = self.proj();
+        let sel = if let Some(s) = self.sel.clone().filter(|s| s.start != s.end) {
+            s
+        } else if let Some((range, _)) = p.link_at(self.caret) {
+            range
+        } else {
+            return;
+        };
+        self.push_doc_undo();
+        let (next, caret) = wysiwyg::apply_link(&self.source, sel, "");
+        self.commit_edit(next, caret, window, cx);
+    }
+
     fn offset_from_utf16(text: &str, offset: usize) -> usize {
         let mut utf8 = 0;
         let mut utf16 = 0;
@@ -4570,13 +4684,17 @@ impl Render for DragBlock {
             .border_color(self.border)
             .bg(self.bg)
             .shadow_lg()
-            .child(icon_el("grip-vertical", self.fg))
+            .max_w(px(240.))
+            .overflow_hidden()
+            .child(icon_el("grip-vertical", self.fg).flex_shrink_0())
             .child(
                 div()
-                    .max_w(px(220.))
+                    .flex_1()
+                    .min_w_0()
                     .text_sm()
                     .text_color(self.fg)
                     .whitespace_nowrap()
+                    .overflow_hidden()
                     .child(self.preview.clone()),
             )
     }
@@ -4969,6 +5087,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_link))
             .on_action(cx.listener(Self::on_cut_selection))
             .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {
                     cx.stop_propagation();
@@ -5048,6 +5167,7 @@ impl Render for Workspace {
                                 this.click_display(
                                     d,
                                     ev.modifiers.shift,
+                                    ev.modifiers.platform || ev.modifiers.control,
                                     ev.click_count,
                                     window,
                                     cx,

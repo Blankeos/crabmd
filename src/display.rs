@@ -206,6 +206,26 @@ impl Projection {
             })
     }
 
+    pub fn link_at(&self, d: usize) -> Option<(Range<usize>, &str)> {
+        let d = d.min(self.display.len());
+        let seg = self
+            .segments
+            .iter()
+            .find(|s| d >= s.display.start && d <= s.display.end && s.marks.link.is_some())?;
+        let id = seg.marks.link?;
+        let url = self.links.get(id as usize)?;
+        // Expand contiguous segments sharing this link id
+        let mut start = seg.display.start;
+        let mut end = seg.display.end;
+        for s in &self.segments {
+            if s.marks.link == Some(id) {
+                start = start.min(s.display.start);
+                end = end.max(s.display.end);
+            }
+        }
+        Some((start..end, url.as_str()))
+    }
+
     pub fn marks_at(&self, d: usize, affinity: Affinity) -> Marks {
         let d = d.min(self.display.len());
         match affinity {
