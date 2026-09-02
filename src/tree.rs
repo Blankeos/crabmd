@@ -102,6 +102,7 @@ pub struct Node {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     pub nodes: Vec<Node>,
+    pub links: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +120,7 @@ impl Doc {
                 id: next_id(),
                 kind: NodeKind::Paragraph { inlines: vec![] },
             }],
+            links: Vec::new(),
         }
     }
 
@@ -137,7 +139,10 @@ impl Doc {
                     kind: NodeKind::Paragraph { inlines: vec![] },
                 });
             }
-            return Self { nodes };
+            return Self {
+                nodes,
+                links: Vec::new(),
+            };
         }
         let p = project_gfm(src);
         let mut nodes = Vec::with_capacity(p.blocks.len());
@@ -147,7 +152,10 @@ impl Doc {
         if nodes.is_empty() {
             return Self::empty();
         }
-        Self { nodes }
+        Self {
+            nodes,
+            links: p.links,
+        }
     }
 
     pub fn project(&self) -> Projection {
@@ -157,9 +165,423 @@ impl Doc {
     pub fn to_gfm(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         for n in &self.nodes {
-            parts.push(node_to_gfm(n));
+            parts.push(node_to_gfm(n, &self.links));
         }
         join_gfm(&self.nodes, &parts)
+    }
+
+    pub fn gfm_range(&self, range: Range<usize>) -> String {
+        let nodes = self.nodes_for_range(range);
+        if nodes.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = nodes.iter().map(|n| node_to_gfm(n, &self.links)).collect();
+        join_gfm(&nodes, &parts)
+    }
+
+    pub fn paste_gfm(&mut self, caret: usize, gfm: &str) -> usize {
+        if gfm.is_empty() {
+            return caret;
+        }
+        let mut clip = Doc::from_gfm(gfm);
+        let src_links = std::mem::take(&mut clip.links);
+        for n in &mut clip.nodes {
+            n.id = next_id();
+            remap_node_links(n, &mut self.links, &src_links);
+        }
+        self.paste_nodes(caret, clip.nodes)
+    }
+
+    fn nodes_for_range(&self, range: Range<usize>) -> Vec<Node> {
+        let a = range.start.min(range.end);
+        let b = range.end.max(range.start);
+        if a == b {
+            return Vec::new();
+        }
+        let start = self.loc(a);
+        let end = self.loc(b);
+        if start.node == end.node {
+            return match self.slice_same_node(start, end) {
+                Some(n) => vec![n],
+                None => Vec::new(),
+            };
+        }
+        let mut out = Vec::new();
+        if let Some(n) = self.slice_node_from(start) {
+            out.push(n);
+        }
+        for i in start.node + 1..end.node {
+            out.push(Node {
+                id: next_id(),
+                kind: self.nodes[i].kind.clone(),
+            });
+        }
+        if end.offset > 0 || end.item.unwrap_or(0) > 0 {
+            if let Some(n) = self.slice_node_to(end) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    fn slice_same_node(&self, start: Loc, end: Loc) -> Option<Node> {
+        let kind = match &self.nodes[start.node].kind {
+            NodeKind::List { ordered, items } => {
+                let i0 = start.item.unwrap_or(0).min(items.len().saturating_sub(1));
+                let i1 = end.item.unwrap_or(i0).min(items.len().saturating_sub(1));
+                if i0 == i1 {
+                    let len = inlines_len(&items[i0].inlines);
+                    let full = start.offset == 0 && end.offset >= len;
+                    let sliced = slice_inlines(&items[i0].inlines, start.offset, end.offset);
+                    if full {
+                        NodeKind::List {
+                            ordered: *ordered,
+                            items: vec![ListItem {
+                                indent: items[i0].indent,
+                                checked: items[i0].checked,
+                                inlines: sliced,
+                            }],
+                        }
+                    } else {
+                        NodeKind::Paragraph { inlines: sliced }
+                    }
+                } else {
+                    let mut out = Vec::new();
+                    for i in i0..=i1 {
+                        let (off0, off1) = if i == i0 {
+                            (start.offset, inlines_len(&items[i].inlines))
+                        } else if i == i1 {
+                            (0, end.offset)
+                        } else {
+                            (0, inlines_len(&items[i].inlines))
+                        };
+                        if i == i1 && end.offset == 0 {
+                            continue;
+                        }
+                        out.push(ListItem {
+                            indent: items[i].indent,
+                            checked: items[i].checked,
+                            inlines: slice_inlines(&items[i].inlines, off0, off1),
+                        });
+                    }
+                    if out.is_empty() {
+                        return None;
+                    }
+                    NodeKind::List {
+                        ordered: *ordered,
+                        items: out,
+                    }
+                }
+            }
+            NodeKind::Code { lang, text } => {
+                let s = start.offset.min(text.len());
+                let e = end.offset.min(text.len()).max(s);
+                if s == 0 && e == text.len() {
+                    NodeKind::Code {
+                        lang: lang.clone(),
+                        text: text.clone(),
+                    }
+                } else {
+                    NodeKind::Paragraph {
+                        inlines: vec![Inline {
+                            text: text[s..e].to_string(),
+                            marks: Marks::default(),
+                        }],
+                    }
+                }
+            }
+            NodeKind::Paragraph { inlines }
+            | NodeKind::Heading { inlines, .. }
+            | NodeKind::Quote { inlines }
+            | NodeKind::Alert { inlines, .. } => {
+                let len = inlines_len(inlines);
+                let full = start.offset == 0 && end.offset >= len;
+                let sliced = slice_inlines(inlines, start.offset, end.offset);
+                slice_kind_keep(&self.nodes[start.node].kind, sliced, full)
+            }
+            NodeKind::Table { .. }
+            | NodeKind::Rule
+            | NodeKind::Image { .. }
+            | NodeKind::Html { .. } => self.nodes[start.node].kind.clone(),
+        };
+        Some(Node {
+            id: next_id(),
+            kind,
+        })
+    }
+
+    fn slice_node_from(&self, start: Loc) -> Option<Node> {
+        self.slice_same_node(
+            start,
+            Loc {
+                node: start.node,
+                item: self.last_item(start.node),
+                cell: None,
+                offset: self.node_text_len(start.node),
+            },
+        )
+    }
+
+    fn slice_node_to(&self, end: Loc) -> Option<Node> {
+        self.slice_same_node(
+            Loc {
+                node: end.node,
+                item: self.first_item(end.node),
+                cell: None,
+                offset: 0,
+            },
+            end,
+        )
+    }
+
+    fn paste_nodes(&mut self, caret: usize, mut nodes: Vec<Node>) -> usize {
+        let keep_empty = nodes.len() == 1;
+        nodes.retain(|n| !node_is_empty(n) || keep_empty);
+        if nodes.is_empty() {
+            return caret;
+        }
+        let loc = self.loc(caret);
+        if matches!(
+            self.nodes[loc.node].kind,
+            NodeKind::Code { .. } | NodeKind::Html { .. } | NodeKind::Table { .. }
+        ) {
+            let text = nodes_plain_text(&nodes);
+            return self.insert_text(caret, None, &text, Marks::default());
+        }
+        if matches!(self.nodes[loc.node].kind, NodeKind::List { .. })
+            && nodes
+                .iter()
+                .all(|n| matches!(n.kind, NodeKind::List { .. }))
+        {
+            let items = flatten_list_items(nodes);
+            return self.paste_list_items(loc, items);
+        }
+        if nodes.len() == 1 {
+            if let NodeKind::Paragraph { inlines } = &nodes[0].kind {
+                return self.insert_runs(caret, inlines.clone());
+            }
+        }
+        if node_is_empty(&self.nodes[loc.node]) && loc.item.is_none() {
+            let last = nodes.len() - 1;
+            let last_len = node_content_len(&nodes[last]);
+            let last_item = last_item_of(&nodes[last]);
+            self.nodes[loc.node] = nodes.remove(0);
+            let extra = nodes.len();
+            for (i, n) in nodes.into_iter().enumerate() {
+                self.nodes.insert(loc.node + 1 + i, n);
+            }
+            return self.caret_after(loc.node + extra, last_item, None, last_len);
+        }
+
+        let loc = self.loc(caret);
+        let in_list = matches!(self.nodes[loc.node].kind, NodeKind::List { .. });
+        let at_start = loc.offset == 0 && loc.item.unwrap_or(0) == 0;
+        let at_end = loc.offset >= self.content_len_at(loc) && self.is_last_slot(loc);
+
+        if in_list && !at_start && !at_end {
+            self.split_list_at(loc);
+        } else if !in_list && !at_start && !at_end {
+            self.split_text_node(loc);
+        }
+
+        let mut insert_ix = if at_start { loc.node } else { loc.node + 1 };
+        if at_end && can_merge_para(&self.nodes[loc.node], &nodes[0]) {
+            self.merge_kind_into(loc.node, nodes.remove(0));
+            insert_ix = loc.node + 1;
+            if nodes.is_empty() {
+                return self.caret_after(
+                    loc.node,
+                    self.last_item(loc.node),
+                    None,
+                    self.node_text_len(loc.node),
+                );
+            }
+        }
+        let last_len = nodes.last().map(node_content_len).unwrap_or(0);
+        let last_item = nodes.last().and_then(last_item_of);
+        let n = nodes.len();
+        for (i, node) in nodes.into_iter().enumerate() {
+            self.nodes.insert(insert_ix + i, node);
+        }
+        self.caret_after(insert_ix + n - 1, last_item, None, last_len)
+    }
+
+    fn insert_runs(&mut self, caret: usize, runs: Vec<Inline>) -> usize {
+        if runs.is_empty() {
+            return caret;
+        }
+        let loc = self.loc(caret);
+        if matches!(
+            self.nodes[loc.node].kind,
+            NodeKind::Code { .. } | NodeKind::Html { .. } | NodeKind::Rule | NodeKind::Image { .. }
+        ) {
+            return self.insert_text(caret, None, &inlines_text(&runs), Marks::default());
+        }
+        let mut off = loc.offset;
+        let node = loc.node;
+        let item = loc.item;
+        let cell = loc.cell;
+        for run in &runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            insert_inlines(
+                self.inlines_at_mut(Loc {
+                    node,
+                    item,
+                    cell,
+                    offset: off,
+                }),
+                off,
+                &run.text,
+                run.marks,
+            );
+            off += run.text.len();
+        }
+        self.caret_after(node, item, cell, off)
+    }
+
+    fn paste_list_items(&mut self, loc: Loc, items: Vec<ListItem>) -> usize {
+        if items.is_empty() {
+            return self.caret_after(loc.node, loc.item, None, loc.offset);
+        }
+        let last_len = inlines_len(&items.last().unwrap().inlines);
+        let n_items = items.len();
+        let insert_at;
+        {
+            let NodeKind::List { items: dest, .. } = &mut self.nodes[loc.node].kind else {
+                return self.caret_after(loc.node, loc.item, None, loc.offset);
+            };
+            let ix = loc.item.unwrap_or(0).min(dest.len().saturating_sub(1));
+            let item_len = inlines_len(&dest[ix].inlines);
+            insert_at = if item_len == 0 {
+                dest.remove(ix);
+                ix
+            } else if loc.offset == 0 {
+                ix
+            } else if loc.offset >= item_len {
+                ix + 1
+            } else {
+                let (left, right) = split_inlines(&dest[ix].inlines, loc.offset);
+                dest[ix].inlines = left;
+                let indent = dest[ix].indent;
+                dest.insert(
+                    ix + 1,
+                    ListItem {
+                        indent,
+                        checked: dest[ix].checked.map(|_| false),
+                        inlines: right,
+                    },
+                );
+                ix + 1
+            };
+            for (i, it) in items.into_iter().enumerate() {
+                dest.insert(insert_at + i, it);
+            }
+        }
+        self.caret_after(loc.node, Some(insert_at + n_items - 1), None, last_len)
+    }
+
+    fn split_text_node(&mut self, loc: Loc) {
+        let inlines = self.inlines_at(loc).to_vec();
+        let (left, right) = split_inlines(&inlines, loc.offset);
+        match &mut self.nodes[loc.node].kind {
+            NodeKind::Paragraph { inlines }
+            | NodeKind::Heading { inlines, .. }
+            | NodeKind::Quote { inlines }
+            | NodeKind::Alert { inlines, .. } => *inlines = left,
+            _ => return,
+        }
+        self.nodes.insert(
+            loc.node + 1,
+            Node {
+                id: next_id(),
+                kind: NodeKind::Paragraph { inlines: right },
+            },
+        );
+    }
+
+    fn split_list_at(&mut self, loc: Loc) {
+        let NodeKind::List { items, ordered } = &mut self.nodes[loc.node].kind else {
+            return;
+        };
+        let ix = loc.item.unwrap_or(0).min(items.len().saturating_sub(1));
+        let ordered = *ordered;
+        let (left, right) = split_inlines(&items[ix].inlines, loc.offset);
+        let indent = items[ix].indent;
+        let checked = items[ix].checked;
+        items[ix].inlines = left;
+        let mut after: Vec<ListItem> = items.drain(ix + 1..).collect();
+        after.insert(
+            0,
+            ListItem {
+                indent,
+                checked: checked.map(|_| false),
+                inlines: right,
+            },
+        );
+        if inlines_len(&items[ix].inlines) == 0 {
+            items.remove(ix);
+        }
+        let ni = loc.node;
+        if items.is_empty() {
+            self.nodes[ni].kind = NodeKind::Paragraph { inlines: vec![] };
+        }
+        self.nodes.insert(
+            ni + 1,
+            Node {
+                id: next_id(),
+                kind: NodeKind::List {
+                    ordered,
+                    items: after,
+                },
+            },
+        );
+    }
+
+    fn merge_kind_into(&mut self, keep: usize, incoming: Node) {
+        let right = match incoming.kind {
+            NodeKind::Paragraph { inlines }
+            | NodeKind::Heading { inlines, .. }
+            | NodeKind::Quote { inlines }
+            | NodeKind::Alert { inlines, .. } => inlines,
+            _ => return,
+        };
+        match &mut self.nodes[keep].kind {
+            NodeKind::Paragraph { inlines }
+            | NodeKind::Heading { inlines, .. }
+            | NodeKind::Quote { inlines }
+            | NodeKind::Alert { inlines, .. } => inlines.extend(right),
+            NodeKind::List { items, .. } => {
+                if let Some(last) = items.last_mut() {
+                    last.inlines.extend(right);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn content_len_at(&self, loc: Loc) -> usize {
+        match &self.nodes.get(loc.node).map(|n| &n.kind) {
+            Some(NodeKind::List { items, .. }) => items
+                .get(loc.item.unwrap_or(0))
+                .map(|i| inlines_len(&i.inlines))
+                .unwrap_or(0),
+            Some(NodeKind::Code { text, .. }) => text.len(),
+            Some(NodeKind::Html { raw }) => raw.len(),
+            Some(NodeKind::Paragraph { inlines })
+            | Some(NodeKind::Heading { inlines, .. })
+            | Some(NodeKind::Quote { inlines })
+            | Some(NodeKind::Alert { inlines, .. }) => inlines_len(inlines),
+            _ => 0,
+        }
+    }
+
+    fn is_last_slot(&self, loc: Loc) -> bool {
+        match &self.nodes.get(loc.node).map(|n| &n.kind) {
+            Some(NodeKind::List { items, .. }) => loc.item.unwrap_or(0) + 1 >= items.len(),
+            _ => true,
+        }
     }
 
     pub fn insert_text(
@@ -249,7 +671,8 @@ impl Doc {
             let off0 = start.offset;
             let off1 = {
                 let loc_b = self.loc(b);
-                if loc_b.node == start.node && loc_b.item == start.item && loc_b.cell == start.cell {
+                if loc_b.node == start.node && loc_b.item == start.item && loc_b.cell == start.cell
+                {
                     loc_b.offset
                 } else {
                     inlines_len(self.inlines_at(start))
@@ -391,8 +814,10 @@ impl Doc {
             NodeKind::Heading { .. } | NodeKind::Quote { .. } | NodeKind::Alert { .. }
         ) && empty_right
         {
-            if matches!(self.nodes[ni].kind, NodeKind::Quote { .. } | NodeKind::Alert { .. })
-                && inlines_len(self.inlines_at(loc)) == 0
+            if matches!(
+                self.nodes[ni].kind,
+                NodeKind::Quote { .. } | NodeKind::Alert { .. }
+            ) && inlines_len(self.inlines_at(loc)) == 0
             {
                 self.nodes[ni].kind = NodeKind::Paragraph { inlines: vec![] };
                 return self.caret_after(ni, None, None, 0);
@@ -603,8 +1028,26 @@ impl Doc {
             return None;
         }
         let p = self.project();
-        let all = (a..b).all(|i| mark.has(p.marks_at(i, Affinity::Inside)));
-        let any = (a..b).any(|i| mark.has(p.marks_at(i, Affinity::Inside)));
+        let us = units(&p);
+
+        // Check whether all actual text content inside the selection has the mark.
+        let mut total_chars = 0usize;
+        let mut marked_chars = 0usize;
+        for u in &us {
+            let u_disp = unit_display(&p, *u);
+            let overlap_start = a.max(u_disp.start);
+            let overlap_end = b.min(u_disp.end);
+            if overlap_start < overlap_end {
+                for i in overlap_start..overlap_end {
+                    total_chars += 1;
+                    if mark.has(p.marks_at(i, Affinity::Inside)) {
+                        marked_chars += 1;
+                    }
+                }
+            }
+        }
+        let all = total_chars > 0 && marked_chars == total_chars;
+        let any = marked_chars > 0;
         let wordish = p
             .display
             .get(a..b)
@@ -612,7 +1055,6 @@ impl Doc {
         // Partially-marked contiguous words clear instead of stacking.
         let turn_on = !(all || (any && wordish));
 
-        let us = units(&p);
         let mut affected = 0;
         for u in us {
             let u_disp = unit_display(&p, u);
@@ -669,10 +1111,15 @@ impl Doc {
         if loc.node != loc_b.node || loc.item != loc_b.item {
             return b;
         }
-        let p = self.project();
-        let id = p.links.len() as u32;
+        let id = if url.is_empty() {
+            None
+        } else {
+            let id = self.links.len() as u32;
+            self.links.push(url.to_string());
+            Some(id)
+        };
         let inlines = self.inlines_at_mut(loc);
-        set_link_range(inlines, loc.offset, loc_b.offset, if url.is_empty() { None } else { Some(id) });
+        set_link_range(inlines, loc.offset, loc_b.offset, id);
         b
     }
 
@@ -727,9 +1174,7 @@ impl Doc {
         let p = self.project();
         let us = units(&p);
         let at = unit.min(us.len().saturating_sub(1));
-        us.get(at)
-            .map(|u| unit_display(&p, *u).start)
-            .unwrap_or(0)
+        us.get(at).map(|u| unit_display(&p, *u).start).unwrap_or(0)
     }
 
     pub fn duplicate_unit(&mut self, unit: usize) -> usize {
@@ -1116,7 +1561,9 @@ impl Doc {
     fn node_text_len(&self, node: usize) -> usize {
         match &self.nodes[node].kind {
             NodeKind::Code { text, .. } => text.len(),
-            NodeKind::List { items, .. } => items.last().map(|i| inlines_len(&i.inlines)).unwrap_or(0),
+            NodeKind::List { items, .. } => {
+                items.last().map(|i| inlines_len(&i.inlines)).unwrap_or(0)
+            }
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
             | NodeKind::Quote { inlines }
@@ -1170,6 +1617,143 @@ impl Doc {
         }
         self.nodes.remove(drop);
         self.caret_after(keep, self.last_item(keep), None, keep_len)
+    }
+}
+
+fn slice_inlines(inlines: &[Inline], start: usize, end: usize) -> Vec<Inline> {
+    let end = end.max(start);
+    let (_, rest) = split_inlines(inlines, start);
+    let (mid, _) = split_inlines(&rest, end.saturating_sub(start));
+    mid
+}
+
+fn slice_kind_keep(kind: &NodeKind, inlines: Vec<Inline>, full: bool) -> NodeKind {
+    if !full {
+        return NodeKind::Paragraph { inlines };
+    }
+    match kind {
+        NodeKind::Heading { level, .. } => NodeKind::Heading {
+            level: *level,
+            inlines,
+        },
+        NodeKind::Quote { .. } => NodeKind::Quote { inlines },
+        NodeKind::Alert { kind, .. } => NodeKind::Alert {
+            kind: *kind,
+            inlines,
+        },
+        _ => NodeKind::Paragraph { inlines },
+    }
+}
+
+fn remap_inlines_links(inlines: &mut [Inline], dest: &mut Vec<String>, src: &[String]) {
+    for run in inlines {
+        if let Some(id) = run.marks.link {
+            let url = src.get(id as usize).cloned().unwrap_or_default();
+            let new_id = dest.len() as u32;
+            dest.push(url);
+            run.marks.link = Some(new_id);
+        }
+    }
+}
+
+fn remap_node_links(node: &mut Node, dest: &mut Vec<String>, src: &[String]) {
+    match &mut node.kind {
+        NodeKind::Paragraph { inlines }
+        | NodeKind::Heading { inlines, .. }
+        | NodeKind::Quote { inlines }
+        | NodeKind::Alert { inlines, .. } => remap_inlines_links(inlines, dest, src),
+        NodeKind::List { items, .. } => {
+            for it in items {
+                remap_inlines_links(&mut it.inlines, dest, src);
+            }
+        }
+        NodeKind::Table { headers, rows } => {
+            for cell in headers {
+                remap_inlines_links(cell, dest, src);
+            }
+            for row in rows {
+                for cell in row {
+                    remap_inlines_links(cell, dest, src);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn node_is_empty(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Paragraph { inlines }
+        | NodeKind::Heading { inlines, .. }
+        | NodeKind::Quote { inlines }
+        | NodeKind::Alert { inlines, .. } => inlines_len(inlines) == 0,
+        NodeKind::List { items, .. } => {
+            items.is_empty() || items.iter().all(|i| inlines_len(&i.inlines) == 0)
+        }
+        NodeKind::Code { text, .. } => text.is_empty(),
+        NodeKind::Html { raw } => raw.is_empty(),
+        NodeKind::Table { headers, rows } => {
+            headers.iter().all(|c| inlines_len(c) == 0) && rows.is_empty()
+        }
+        NodeKind::Rule | NodeKind::Image { .. } => false,
+    }
+}
+
+fn nodes_plain_text(nodes: &[Node]) -> String {
+    nodes
+        .iter()
+        .map(|n| match &n.kind {
+            NodeKind::Code { text, .. } => text.clone(),
+            NodeKind::Html { raw } => raw.clone(),
+            NodeKind::Paragraph { inlines }
+            | NodeKind::Heading { inlines, .. }
+            | NodeKind::Quote { inlines }
+            | NodeKind::Alert { inlines, .. } => inlines_text(inlines),
+            NodeKind::List { items, .. } => items
+                .iter()
+                .map(|i| inlines_text(&i.inlines))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            NodeKind::Image { alt, .. } => alt.clone(),
+            _ => String::new(),
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn flatten_list_items(nodes: Vec<Node>) -> Vec<ListItem> {
+    nodes
+        .into_iter()
+        .flat_map(|n| match n.kind {
+            NodeKind::List { items, .. } => items,
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn can_merge_para(left: &Node, right: &Node) -> bool {
+    matches!(left.kind, NodeKind::Paragraph { .. })
+        && matches!(right.kind, NodeKind::Paragraph { .. })
+}
+
+fn node_content_len(n: &Node) -> usize {
+    match &n.kind {
+        NodeKind::List { items, .. } => items.last().map(|i| inlines_len(&i.inlines)).unwrap_or(0),
+        NodeKind::Code { text, .. } => text.len(),
+        NodeKind::Html { raw } => raw.len(),
+        NodeKind::Paragraph { inlines }
+        | NodeKind::Heading { inlines, .. }
+        | NodeKind::Quote { inlines }
+        | NodeKind::Alert { inlines, .. } => inlines_len(inlines),
+        _ => 0,
+    }
+}
+
+fn last_item_of(n: &Node) -> Option<usize> {
+    match &n.kind {
+        NodeKind::List { items, .. } if !items.is_empty() => Some(items.len() - 1),
+        _ => None,
     }
 }
 
@@ -1536,15 +2120,19 @@ fn parse_shortcut(text: &str) -> Option<(NodeKind, String)> {
     None
 }
 
-fn node_to_gfm(n: &Node) -> String {
+fn node_to_gfm(n: &Node, links: &[String]) -> String {
     match &n.kind {
-        NodeKind::Paragraph { inlines } => inlines_to_gfm(inlines),
+        NodeKind::Paragraph { inlines } => inlines_to_gfm(inlines, links),
         NodeKind::Heading { level, inlines } => {
-            format!("{} {}", "#".repeat((*level).clamp(1, 6) as usize), inlines_to_gfm(inlines))
+            format!(
+                "{} {}",
+                "#".repeat((*level).clamp(1, 6) as usize),
+                inlines_to_gfm(inlines, links)
+            )
         }
-        NodeKind::Quote { inlines } => wrap_lines("> ", &inlines_to_gfm(inlines)),
+        NodeKind::Quote { inlines } => wrap_lines("> ", &inlines_to_gfm(inlines, links)),
         NodeKind::Alert { kind, inlines } => {
-            let body = inlines_to_gfm(inlines);
+            let body = inlines_to_gfm(inlines, links);
             if body.is_empty() {
                 format!("> [!{}]\n> ", kind.as_str())
             } else {
@@ -1577,7 +2165,7 @@ fn node_to_gfm(n: &Node) -> String {
                 } else {
                     "- ".to_string()
                 };
-                format!("{pad}{marker}{}", inlines_to_gfm(&it.inlines))
+                format!("{pad}{marker}{}", inlines_to_gfm(&it.inlines, links))
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1585,10 +2173,10 @@ fn node_to_gfm(n: &Node) -> String {
             format!("```{lang}\n{text}\n```")
         }
         NodeKind::Table { headers, rows } => {
-            let hs: Vec<String> = headers.iter().map(|c| inlines_to_gfm(c)).collect();
+            let hs: Vec<String> = headers.iter().map(|c| inlines_to_gfm(c, links)).collect();
             let rs: Vec<Vec<String>> = rows
                 .iter()
-                .map(|r| r.iter().map(|c| inlines_to_gfm(c)).collect())
+                .map(|r| r.iter().map(|c| inlines_to_gfm(c, links)).collect())
                 .collect();
             crate::display::serialize_table(&hs, &rs)
         }
@@ -1608,7 +2196,7 @@ fn wrap_lines(prefix: &str, body: &str) -> String {
         .join("\n")
 }
 
-fn inlines_to_gfm(inlines: &[Inline]) -> String {
+fn inlines_to_gfm(inlines: &[Inline], links: &[String]) -> String {
     let mut out = String::new();
     for run in inlines {
         let mut s = escape_md(&run.text);
@@ -1627,8 +2215,9 @@ fn inlines_to_gfm(inlines: &[Inline]) -> String {
         if run.marks.underline {
             s = format!("<u>{s}</u>");
         }
-        if let Some(_id) = run.marks.link {
-            s = format!("[{s}]()");
+        if let Some(id) = run.marks.link {
+            let url = links.get(id as usize).map(|u| u.as_str()).unwrap_or("");
+            s = format!("[{s}]({url})");
         }
         out.push_str(&s);
     }
@@ -1643,7 +2232,8 @@ fn join_gfm(nodes: &[Node], parts: &[String]) -> String {
     let mut out = String::new();
     let mut pending_empty = 0usize;
     for (n, part) in nodes.iter().zip(parts.iter()) {
-        let empty_para = matches!(n.kind, NodeKind::Paragraph { ref inlines } if inlines.is_empty());
+        let empty_para =
+            matches!(n.kind, NodeKind::Paragraph { ref inlines } if inlines.is_empty());
         if empty_para {
             pending_empty += 1;
             continue;
@@ -1688,7 +2278,7 @@ fn flatten(doc: &Doc) -> Projection {
     let mut display = String::new();
     let mut segments = Vec::new();
     let mut blocks = Vec::new();
-    let mut links = Vec::new();
+    let mut links = doc.links.clone();
     for (i, n) in doc.nodes.iter().enumerate() {
         if i > 0 {
             let d0 = display.len();
@@ -1791,9 +2381,7 @@ fn emit_node(
                     ordered: *ordered,
                     items: proj_items,
                 },
-                BlockKind::List {
-                    ordered: *ordered,
-                },
+                BlockKind::List { ordered: *ordered },
             )
         }
         NodeKind::Code { lang, text } => {
@@ -1804,10 +2392,7 @@ fn emit_node(
                 source: d0..display.len(),
                 marks: Marks::default(),
             });
-            (
-                BlockExtra::Code { lang: lang.clone() },
-                BlockKind::Code,
-            )
+            (BlockExtra::Code { lang: lang.clone() }, BlockKind::Code)
         }
         NodeKind::Table { headers, rows } => {
             let cols = headers.len().max(1);
@@ -1977,14 +2562,18 @@ mod tests {
         let mut c = d.insert_text(0, None, "#", Marks::default());
         assert_eq!(d.project().display, "#");
         c = d.insert_text(c, None, " ", Marks::default());
-        assert!(matches!(d.nodes[0].kind, NodeKind::Heading { level: 1, .. }));
+        assert!(matches!(
+            d.nodes[0].kind,
+            NodeKind::Heading { level: 1, .. }
+        ));
         assert_eq!(d.project().display, "");
         let _ = c;
     }
 
     #[test]
     fn type_between_code_and_table() {
-        let mut d = Doc::from_gfm("```\nfn main() {}\n```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let mut d =
+            Doc::from_gfm("```\nfn main() {}\n```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n");
         let p = d.project();
         let empty = p
             .blocks
@@ -1995,7 +2584,12 @@ mod tests {
         let n = p.blocks.len();
         let c = d.insert_text(caret, None, "hi", Marks::default());
         let p2 = d.project();
-        assert_eq!(p2.blocks.len(), n, "{:?}", p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>());
+        assert_eq!(
+            p2.blocks.len(),
+            n,
+            "{:?}",
+            p2.blocks.iter().map(|b| b.kind).collect::<Vec<_>>()
+        );
         assert!(p2.display.contains("hi"));
         let _ = c;
     }
@@ -2025,25 +2619,33 @@ mod feature_tests {
         let mut d = Doc::from_gfm("- a\n- b");
         let p = d.project();
         // caret on second item
-        let caret = p.blocks[0]
-            .extra
-            .clone();
-        let BlockExtra::List { items, .. } = caret else { panic!() };
+        let caret = p.blocks[0].extra.clone();
+        let BlockExtra::List { items, .. } = caret else {
+            panic!()
+        };
         let c = items[1].display.start;
         let c = d.tab(c, false).expect("indent");
-        let NodeKind::List { items, .. } = &d.nodes[0].kind else { panic!() };
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
         assert_eq!(items[1].indent, 1);
         let c = d.tab(c, true).expect("outdent");
-        let NodeKind::List { items, .. } = &d.nodes[0].kind else { panic!() };
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
         assert_eq!(items[1].indent, 0);
         assert!(d.tab(c, false).is_some());
 
         // caret on first item should also be able to indent
         let p_curr = d.project();
-        let BlockExtra::List { items: p_items, .. } = &p_curr.blocks[0].extra else { panic!() };
+        let BlockExtra::List { items: p_items, .. } = &p_curr.blocks[0].extra else {
+            panic!()
+        };
         let c0 = p_items[0].display.start;
         let c0 = d.tab(c0, false).expect("indent first item");
-        let NodeKind::List { items: items2, .. } = &d.nodes[0].kind else { panic!() };
+        let NodeKind::List { items: items2, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
         assert_eq!(items2[0].indent, 1);
         let _ = d.tab(c0, true).expect("outdent first item");
         let _ = d.tab(c, true).expect("outdent second item");
@@ -2052,7 +2654,9 @@ mod feature_tests {
         let p3 = d.project();
         let len = p3.display.len();
         d.tab_selection(0..len, false).expect("tab selection");
-        let NodeKind::List { items: items3, .. } = &d.nodes[0].kind else { panic!() };
+        let NodeKind::List { items: items3, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
         assert_eq!(items3[0].indent, 1);
         assert_eq!(items3[1].indent, 1);
     }
@@ -2061,7 +2665,9 @@ mod feature_tests {
     fn toggle_task_flips_checked() {
         let mut d = Doc::from_gfm("- [ ] todo");
         d.toggle_task(0, 0);
-        let NodeKind::List { items, .. } = &d.nodes[0].kind else { panic!() };
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
         assert_eq!(items[0].checked, Some(true));
         assert!(d.to_gfm().contains("- [x]"));
     }
@@ -2077,6 +2683,13 @@ mod feature_tests {
         assert!(p2.marks_at(0, Affinity::Inside).bold);
         let second_line_start = p2.display.find("Line two").unwrap();
         assert!(p2.marks_at(second_line_start, Affinity::Inside).bold);
+
+        // Test unbolding multi-line
+        let res2 = d.toggle_mark(0..len, Mark::Bold);
+        assert!(res2.is_some());
+        let p3 = d.project();
+        assert!(!p3.marks_at(0, Affinity::Inside).bold);
+        assert!(!p3.marks_at(second_line_start, Affinity::Inside).bold);
     }
 
     #[test]
@@ -2099,5 +2712,94 @@ mod feature_tests {
         let d2 = Doc::from_gfm(&gfm);
         let p = d2.project();
         assert!(p.marks_at(0, Affinity::Inside).underline);
+    }
+
+    #[test]
+    fn link_url_roundtrips() {
+        let d = Doc::from_gfm("[hello](https://example.com)");
+        let p = d.project();
+        let (_, url) = p.link_at(0).expect("link");
+        assert_eq!(url, "https://example.com");
+        let gfm = d.to_gfm();
+        assert!(gfm.contains("https://example.com"), "{gfm}");
+        let p2 = Doc::from_gfm(&gfm).project();
+        assert_eq!(p2.link_at(0).map(|(_, u)| u), Some("https://example.com"));
+    }
+
+    #[test]
+    fn apply_link_stores_url() {
+        let mut d = Doc::from_gfm("hello");
+        d.apply_link(0..5, "https://zed.dev");
+        let p = d.project();
+        assert_eq!(p.link_at(1).map(|(_, u)| u), Some("https://zed.dev"));
+        assert!(d.to_gfm().contains("https://zed.dev"));
+    }
+
+    #[test]
+    fn copy_heading_pastes_as_heading() {
+        let src = Doc::from_gfm("# Hello\n\npara");
+        let p = src.project();
+        let gfm = src.gfm_range(p.blocks[0].display.clone());
+        assert!(gfm.starts_with("# "), "{gfm}");
+        let mut d = Doc::empty();
+        d.paste_gfm(0, &gfm);
+        assert!(matches!(
+            d.nodes[0].kind,
+            NodeKind::Heading { level: 1, .. }
+        ));
+        assert_eq!(d.project().display, "Hello");
+    }
+
+    #[test]
+    fn copy_bold_pastes_marks() {
+        let src = Doc::from_gfm("**hi**");
+        let gfm = src.gfm_range(0..src.project().display.len());
+        let mut d = Doc::from_gfm("x");
+        d.paste_gfm(1, &gfm);
+        let p = d.project();
+        assert_eq!(p.display, "xhi");
+        assert!(p.marks_at(1, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn copy_list_item_stays_list() {
+        let src = Doc::from_gfm("- a\n- b");
+        let p = src.project();
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let gfm = src.gfm_range(items[0].display.clone());
+        assert!(gfm.starts_with("- "), "{gfm}");
+        assert!(!gfm.contains("- b"), "{gfm}");
+        let mut d = Doc::empty();
+        d.paste_gfm(0, &gfm);
+        assert!(matches!(d.nodes[0].kind, NodeKind::List { .. }));
+    }
+
+    #[test]
+    fn paste_list_into_list_appends_items() {
+        let mut d = Doc::from_gfm("- a\n- b");
+        let p = d.project();
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let caret = items[0].display.end;
+        d.paste_gfm(caret, "- c");
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!();
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(inlines_text(&items[1].inlines), "c");
+    }
+
+    #[test]
+    fn paste_heading_after_paragraph() {
+        let mut d = Doc::from_gfm("Hello");
+        d.paste_gfm(5, "# Title");
+        assert!(matches!(d.nodes[0].kind, NodeKind::Paragraph { .. }));
+        assert!(matches!(
+            d.nodes[1].kind,
+            NodeKind::Heading { level: 1, .. }
+        ));
     }
 }

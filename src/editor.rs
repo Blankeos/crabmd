@@ -125,6 +125,8 @@ actions!(
         DeleteWordBack,
         DeleteLineBack,
         CutSelection,
+        CopySelection,
+        PasteClipboard,
         SelectAll,
         QuitApp,
     ]
@@ -221,6 +223,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
         KeyBinding::new("ctrl-x", CutSelection, Some("Workspace")),
+        KeyBinding::new("cmd-c", CopySelection, Some("Workspace")),
+        KeyBinding::new("ctrl-c", CopySelection, Some("Workspace")),
+        KeyBinding::new("cmd-v", PasteClipboard, Some("Workspace")),
+        KeyBinding::new("ctrl-v", PasteClipboard, Some("Workspace")),
         KeyBinding::new("cmd-a", SelectAll, Some("Workspace")),
         KeyBinding::new("ctrl-a", SelectAll, Some("Workspace")),
         KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
@@ -826,7 +832,7 @@ impl Workspace {
             let p = self.proj();
             if let Some((range, url)) = p.link_at(d) {
                 if cmd {
-                    cx.open_url(url);
+                    self.open_link_url(url, cx);
                     return;
                 } else if click_count == 1 {
                     // Clicking on a link selects the link and opens the link bubble
@@ -2376,6 +2382,15 @@ impl Workspace {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
 
+        // Let cmd/ctrl-c/x/v reach Copy/Cut/Paste actions (including overlays).
+        if matches!(key, "c" | "x" | "v")
+            && (mods.platform || mods.control)
+            && !mods.alt
+            && !mods.shift
+        {
+            return false;
+        }
+
         if self.link_open {
             window.prevent_default();
             match key {
@@ -2597,11 +2612,6 @@ impl Workspace {
             }
         }
 
-        if key == "v" && (mods.platform || mods.control) && !mods.alt && !mods.shift {
-            if self.try_paste_image(window, cx) {
-                return true;
-            }
-        }
         false
     }
 
@@ -2680,8 +2690,8 @@ impl Workspace {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |_, _, _, cx| {
-                            cx.open_url(&url);
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_link_url(&url, cx);
                         }),
                     )
                     .child(
@@ -3701,9 +3711,14 @@ impl Workspace {
             return div().into_any_element();
         };
         let p = &self.palette;
-        let is_linked = self.sel.as_ref().is_some_and(|s| {
-            (s.start..s.end).any(|i| self.proj().marks_at(i, Affinity::Inside).link.is_some())
-        }) || self.proj().marks_at(self.caret, Affinity::Inside).link.is_some();
+        let linked_url: Option<String> = if let Some(s) = self.sel.as_ref() {
+            (s.start..s.end)
+                .find_map(|i| self.proj().link_at(i).map(|(_, u)| u.to_string()))
+                .or_else(|| self.proj().link_at(self.caret).map(|(_, u)| u.to_string()))
+        } else {
+            self.proj().link_at(self.caret).map(|(_, u)| u.to_string())
+        };
+        let is_linked = linked_url.is_some();
 
         h_flex()
             .gap_1()
@@ -3728,6 +3743,17 @@ impl Workspace {
                         this.on_toggle_link(&ToggleLink, window, cx);
                     })),
             )
+            .when_some(linked_url.clone(), |el, url| {
+                el.child(
+                    Button::new("go-link")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::default().path(crate::assets::path("arrow-up-right")))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_link_url(&url, cx);
+                        })),
+                )
+            })
             .when(is_linked, |el| {
                 el.child(
                     Button::new("rm-link")
@@ -3923,16 +3949,128 @@ impl Workspace {
             return;
         };
         window.prevent_default();
-        let p = self.proj();
-        let a = sel.start.min(sel.end).min(p.display.len());
-        let b = sel.end.max(sel.start).min(p.display.len());
-        if a >= b {
+        if !self.write_selection_clipboard(sel.start, sel.end, cx) {
             return;
         }
-        let text = p.display.get(a..b).unwrap_or("").to_string();
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.push_doc_undo();
+        let a = sel.start.min(sel.end);
+        let b = sel.end.max(sel.start);
         self.caret = self.doc.delete_display(a..b);
+        self.sync_gfm();
+        self.sel = None;
+        self.dirty = true;
+        self.status = "unsaved".into();
+        self.refresh(window, cx);
+        self.sync_title(window);
+    }
+
+    fn on_copy_selection(
+        &mut self,
+        _: &CopySelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.prevent_default();
+        if self.link_open {
+            if !self.link_draft.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(self.link_draft.clone()));
+            }
+            return;
+        }
+        if let Some(buf) = self.command.as_ref() {
+            if !buf.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(buf.clone()));
+            }
+            return;
+        }
+        if let Some((buf, _)) = self.search.as_ref() {
+            if !buf.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(buf.clone()));
+            }
+            return;
+        }
+        let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) else {
+            return;
+        };
+        self.write_selection_clipboard(sel.start, sel.end, cx);
+    }
+
+    fn write_selection_clipboard(&self, start: usize, end: usize, cx: &mut Context<Self>) -> bool {
+        let p = self.proj();
+        let a = start.min(end).min(p.display.len());
+        let b = start.max(end).min(p.display.len());
+        if a >= b {
+            return false;
+        }
+        let display = p.display.get(a..b).unwrap_or("").to_string();
+        let gfm = self.doc.gfm_range(a..b);
+        if gfm.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(display));
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(display, gfm));
+        }
+        true
+    }
+
+    fn on_paste_clipboard(
+        &mut self,
+        _: &PasteClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.prevent_default();
+        if self.try_paste_image(window, cx) {
+            return;
+        }
+        let Some(clip) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(raw) = clip.text() else {
+            return;
+        };
+        let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
+        }
+        if self.link_open {
+            self.link_draft.push_str(&text.replace('\n', ""));
+            cx.notify();
+            return;
+        }
+        if let Some(buf) = self.command.as_mut() {
+            buf.push_str(&text.replace('\n', ""));
+            cx.notify();
+            return;
+        }
+        if let Some((buf, _)) = self.search.as_mut() {
+            buf.push_str(&text.replace('\n', ""));
+            cx.notify();
+            return;
+        }
+        let gfm = match clip.metadata() {
+            Some(meta) if !meta.is_empty() && !meta.trim_start().starts_with('{') => meta.clone(),
+            _ => text.clone(),
+        };
+        self.paste_rich(&text, &gfm, window, cx);
+    }
+
+    fn paste_rich(&mut self, text: &str, gfm: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_doc_undo();
+        if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+            let a = sel.start.min(sel.end);
+            let b = sel.end.max(sel.start);
+            self.caret = self.doc.delete_display(a..b);
+            self.sel = None;
+        }
+        let in_code = self
+            .proj()
+            .block_at_display(self.caret)
+            .is_some_and(|b| matches!(b.kind, BlockKind::Code));
+        if in_code {
+            self.caret = self.doc.insert_text(self.caret, None, text, self.sticky);
+        } else {
+            self.caret = self.doc.paste_gfm(self.caret, gfm);
+        }
         self.sync_gfm();
         self.sel = None;
         self.dirty = true;
@@ -4172,7 +4310,12 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_handle_menu(&self, ix: usize, list_item: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_handle_menu(
+        &self,
+        ix: usize,
+        list_item: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.block_menu != Some(ix) || cx.has_active_drag() {
             return None;
         }
@@ -4565,7 +4708,7 @@ impl Workspace {
         self.commit_edit(next, caret, window, cx);
     }
 
-    fn open_link_url(&self, raw: &str, cx: &mut App) {
+    fn open_link_url(&self, raw: &str, _cx: &mut App) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return;
@@ -4578,7 +4721,7 @@ impl Workspace {
         } else {
             format!("https://{trimmed}")
         };
-        cx.open_url(&url);
+        open_in_browser(&url);
     }
 
     fn remove_link_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4895,8 +5038,7 @@ impl EntityInputHandler for Workspace {
             self.insert_origin = Some(self.snapshot());
         }
         self.caret = if display_range.start == display_range.end {
-            self.doc
-                .insert_text(self.caret, None, text, self.sticky)
+            self.doc.insert_text(self.caret, None, text, self.sticky)
         } else {
             self.doc.delete_display(display_range.clone());
             self.doc
@@ -5086,6 +5228,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_toggle_underline))
             .on_action(cx.listener(Self::on_toggle_link))
             .on_action(cx.listener(Self::on_cut_selection))
+            .on_action(cx.listener(Self::on_copy_selection))
+            .on_action(cx.listener(Self::on_paste_clipboard))
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
@@ -5296,6 +5440,27 @@ impl Render for Workspace {
             )
             .when(settings_open, |el| el.child(self.render_settings(cx)))
     }
+}
+
+fn open_in_browser(url: &str) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("/usr/bin/open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/c", "start", "", url]);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[allow(dead_code)]

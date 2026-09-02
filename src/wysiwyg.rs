@@ -13,7 +13,7 @@ use crate::display::{
 use crate::document::{delete_block_index, splice, BlockKind};
 use crate::notion;
 
-pub use crate::tree::{units, unit_display, Mark, Unit};
+pub use crate::tree::{unit_display, units, Mark, Unit};
 
 fn block_ix(p: &Projection, d: usize) -> usize {
     p.block_at_display(d)
@@ -3251,8 +3251,16 @@ mod tests {
         assert!(start >= unit_start);
         let _ = doc.delete_display(start..caret);
         let p2 = doc.project();
-        assert!(p2.display.contains("above"), "previous block intact: {:?}", p2.display);
-        assert!(p2.display.contains("hello"), "only last word removed: {:?}", p2.display);
+        assert!(
+            p2.display.contains("above"),
+            "previous block intact: {:?}",
+            p2.display
+        );
+        assert!(
+            p2.display.contains("hello"),
+            "only last word removed: {:?}",
+            p2.display
+        );
         assert!(!p2.display.contains("world"), "{:?}", p2.display);
     }
 
@@ -3387,5 +3395,4 @@ mod tests {
         };
         assert_eq!(texts, vec!["p1", "p2", "", "", "p3"]);
     }
-
 }
