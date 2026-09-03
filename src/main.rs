@@ -110,8 +110,10 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config) {
                 ..Default::default()
             };
 
+            cx.activate(true);
             cx.spawn(async move |cx| {
                 cx.open_window(window_options, |window, cx| {
+                    window.activate_window();
                     let view = Workspace::view(path, source, palette, config, window, cx);
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
