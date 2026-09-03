@@ -36,25 +36,27 @@ pub fn is_video_src(src: &str) -> bool {
         .is_some_and(|e| VIDEO_EXTS.iter().any(|ok| e.eq_ignore_ascii_case(ok)))
 }
 
+/// First `src="…"` / `src='…'` / `src=…` attribute in `tag_text`.
+fn first_src_attr(tag_text: &str) -> Option<String> {
+    tag_attr(tag_text, "src")
+}
+
 /// `<video src="clip.mp4">…</video>` (or bare `<video src=…>`) -> src.
+/// Falls back to a nested `<source src=…>` child, and to any `src` after
+/// the `<video` tag — GitHub asset URLs carry no file extension, so callers
+/// must NOT require one (extension checks happen separately via
+/// `is_video_src` for markdown `![]()` targets only).
 pub fn parse_video_src(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     let tag = lower.find("<video")?;
     let rest = &raw[tag..];
-    let src_ix = rest.to_ascii_lowercase().find("src")?;
-    let after = rest[src_ix + 3..].trim_start();
-    let after = after.strip_prefix('=')?.trim_start();
-    let quote = after.as_bytes().first()?;
-    if *quote == b'"' || *quote == b'\'' {
-        let end = after[1..].find(*quote as char)?;
-        Some(after[1..1 + end].to_string())
-    } else {
-        let end = after
-            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .unwrap_or(after.len());
-        let src = after[..end].trim();
-        (!src.is_empty()).then(|| src.to_string())
+    if let Some(src) = first_src_attr(rest) {
+        return Some(src);
     }
+    // `<video><source src="clip.mp4"></video>` — no `src` on the tag itself.
+    let lower_rest = rest.to_ascii_lowercase();
+    let source_tag = lower_rest.find("<source")?;
+    first_src_attr(&rest[source_tag..])
 }
 
 /// `<img src="pic.png" …>` (anywhere in the raw HTML) -> (src, alt).
@@ -335,6 +337,24 @@ mod tests {
             Some("clip.mp4".to_string())
         );
         assert_eq!(parse_video_src("![a](b.png)"), None);
+    }
+
+    #[test]
+    fn video_tag_extensionless_and_source_child() {
+        // GitHub asset URLs carry no extension — the `<video>` tag itself
+        // is the signal; callers must not require one.
+        assert_eq!(
+            parse_video_src(r#"<video src="https://github.com/solidjs-community/solid-primitives/assets/38070918/7c4fa01f-7959-4a67-9588-e28448f7f20d"></video>"#),
+            Some("https://github.com/solidjs-community/solid-primitives/assets/38070918/7c4fa01f-7959-4a67-9588-e28448f7f20d".to_string())
+        );
+        assert_eq!(
+            parse_video_src(r#"<video controls><source src="clip.mp4" type="video/mp4"></video>"#),
+            Some("clip.mp4".to_string())
+        );
+        assert_eq!(
+            parse_video_src(r#"<video data-src="clip.mp4"></video>"#),
+            None,
+        );
     }
 
     #[test]

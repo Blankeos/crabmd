@@ -2291,6 +2291,13 @@ impl Workspace {
     }
 
     fn on_insert_slash(&mut self, _: &InsertSlash, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            // The Alt/Path toolbar (or settings) owns `/` — typing a path
+            // like `assets/clip.mp4` must reach the focused input instead
+            // of inserting a slash block into the markdown behind it.
+            cx.propagate();
+            return;
+        }
         if self.command.is_some()
             || self.search.is_some()
             || self.link_open
@@ -5318,9 +5325,14 @@ impl Workspace {
     /// Deliberately NOT `gpui-video-player`: that crate needs a system
     /// GStreamer install, spawns a thread + playbin pipeline per video, and
     /// assumes tight NV12 layouts — too static/inflexible inside a scrolling
-    /// doc and hostile to a self-contained bundle. Instead the card shows
-    /// file meta and `Play` opens the system player (or browser for remote),
-    /// with the same click-to-edit toolbar as images.
+    /// doc and hostile to a self-contained bundle. (The FFmpeg fork
+    /// `gpui-video` trades GStreamer for FFmpeg dev libraries + CPAL —
+    /// same bundle problem.) There is also no HTML renderer in the GPUI
+    /// ecosystem (awesome-gpui lists no webview/HTML crate), so remote pages
+    /// and `<iframe>` stay as cards. Instead the block renders a 16:9
+    /// preview tile like a GitHub README embed — `Play` opens the system
+    /// player (or browser for remote) — with the same click-to-edit
+    /// toolbar as images.
     fn render_video_hit(
         &self,
         alt: &str,
@@ -5355,9 +5367,17 @@ impl Workspace {
             format!("missing video: {src}")
         };
         let src_owned = src.to_string();
+        let url_owned = src.to_string();
         let path_owned = path.clone();
         let alt_owned = alt.to_string();
         let missing = !playable;
+        let title = if missing {
+            "Missing video".to_string()
+        } else if remote {
+            "Video · remote".to_string()
+        } else {
+            "Video".to_string()
+        };
         v_flex()
             .w_full()
             .min_w_0()
@@ -5379,80 +5399,117 @@ impl Workspace {
                 }
             })
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
-                    .p_4()
-                    .gap_3()
-                    .items_center()
+                    .min_w_0()
+                    .overflow_hidden()
                     .rounded(px(8.))
                     .border_1()
                     .border_color(if selected { pal.primary } else { pal.border })
-                    .bg(pal.background_element.opacity(0.5))
-                    .child(icon_el(
-                        "play",
-                        if selected { pal.primary } else { pal.text_muted },
-                    ))
+                    .bg(pal.background_panel)
+                    // 16:9-ish preview tile (fixed height keeps every embed
+                    // aligned in the scroll). Clicking it plays.
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(pal.markdown_text)
-                                    .child(if missing {
-                                        "Missing video"
-                                    } else if remote {
-                                        "Video · remote"
-                                    } else {
-                                        "Video"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(pal.text_muted)
-                                    .child(if missing {
-                                        format!("{src} — not found beside this file; edit the path below")
-                                    } else {
-                                        caption
-                                    }),
-                            ),
-                    )
-                    .when(playable, |el| {
-                        el.child(
-                            Button::new(("video-play", display_start))
-                                .xsmall()
-                                .label("Play")
-                                .on_click({
+                        div()
+                            .w_full()
+                            .h(px(220.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui::black().opacity(0.85))
+                            .child(icon_el_px(
+                                if playable { "play" } else { "image" },
+                                gpui::white().opacity(if playable { 0.9 } else { 0.4 }),
+                                px(40.),
+                            ))
+                            .when(playable, |el| {
+                                el.on_mouse_down(MouseButton::Left, {
                                     let src = src_owned.clone();
                                     let path = path_owned.clone();
-                                    cx.listener(move |_, _, _, cx| {
-                                        open_video_src(&src, &path, cx);
-                                    })
-                                }),
-                        )
-                    })
-                    .child(
-                        Button::new(("video-edit", display_start))
-                            .ghost()
-                            .xsmall()
-                            .label(if selected { "Editing…" } else { "Edit" })
-                            .on_click({
-                                let src = src_owned.clone();
-                                let alt = alt_owned.clone();
-                                cx.listener(move |this, _, window, cx| {
-                                    this.select_media_knob(
-                                        display_start,
-                                        alt.clone(),
-                                        src.clone(),
-                                        window,
-                                        cx,
-                                    );
+                                    let view = cx.entity();
+                                    move |_: &MouseDownEvent, _, cx| {
+                                        let src = src.clone();
+                                        let path = path.clone();
+                                        view.update(cx, |_, cx| {
+                                            open_video_src(&src, &path, cx);
+                                        });
+                                    }
                                 })
                             }),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .p_3()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                v_flex().flex_1().min_w_0().gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(pal.markdown_text)
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(pal.text_muted)
+                                            .child(if missing {
+                                                format!("{src} — not found beside this file; edit the path below")
+                                            } else {
+                                                caption
+                                            }),
+                                    ),
+                            )
+                            .when(playable, |el| {
+                                el.child(
+                                    Button::new(("video-play", display_start))
+                                        .xsmall()
+                                        .label("Play")
+                                        .on_click({
+                                            let src = src_owned.clone();
+                                            let path = path_owned.clone();
+                                            cx.listener(move |_, _, _, cx| {
+                                                open_video_src(&src, &path, cx);
+                                            })
+                                        }),
+                                )
+                            })
+                            .when(remote, |el| {
+                                el.child(
+                                    Button::new(("video-open", display_start))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Open")
+                                        .on_click({
+                                            let url = url_owned.clone();
+                                            cx.listener(move |_, _, _, cx| {
+                                                cx.open_url(&url);
+                                            })
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new(("video-edit", display_start))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if selected { "Editing…" } else { "Edit" })
+                                    .on_click({
+                                        let src = src_owned.clone();
+                                        let alt = alt_owned.clone();
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.select_media_knob(
+                                                display_start,
+                                                alt.clone(),
+                                                src.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                    }),
+                            ),
                     ),
             )
             .when(selected, |el| {
@@ -5463,13 +5520,17 @@ impl Workspace {
 
     /// Generic HTML blocks (`<iframe>`, `<details>`, raw `<div>`…): a small
     /// card with the tag name, a one-line source preview, and a draggable
-    /// handle. Clicking the handle selects the block and loads its `src`
-    /// (when it has one) into the path toolbar so it can be edited in place.
+    /// handle. GPUI has no HTML renderer (awesome-gpui lists no webview /
+    /// HTML crate), so these stay as cards — with `Open` for remote
+    /// `src`/`href` and the path toolbar for editing. Clicking the handle
+    /// selects the block and loads its `src` (when it has one) into the
+    /// path toolbar so it can be edited in place.
     fn render_html_block(&self, raw: &str, display_start: usize, cx: &mut Context<Self>) -> AnyElement {
         let pal = &self.palette;
         let selected = self.media_sel == Some(display_start);
         let tag = images::html_tag(raw).unwrap_or_else(|| "html".to_string());
         let src = images::parse_html_src(raw).unwrap_or_default();
+        let remote = images::is_remote_src(&src);
         let preview = raw.lines().next().unwrap_or("").trim().chars().take(88).collect::<String>();
         v_flex()
             .w_full()
@@ -5521,7 +5582,21 @@ impl Workspace {
                             .text_xs()
                             .text_color(pal.text_muted)
                             .child("⠿"),
-                    ),
+                    )
+                    .when(remote, |el| {
+                        el.child(
+                            Button::new(("html-open", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label("Open")
+                                .on_click({
+                                    let url = src.clone();
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.open_url(&url);
+                                    })
+                                }),
+                        )
+                    }),
             )
             .when(selected, |el| {
                 el.child(self.render_media_toolbar(false, display_start, cx))

@@ -46,6 +46,54 @@ pub const ITEMS: &[SlashItem] = &[
         icon: "heading",
     },
     SlashItem {
+        keys: &["h4", "heading4"],
+        label: "Heading 4",
+        hint: "####",
+        template: "#### ",
+        kind: BlockKind::Heading(4),
+        icon: "heading",
+    },
+    SlashItem {
+        keys: &["h5", "heading5"],
+        label: "Heading 5",
+        hint: "#####",
+        template: "##### ",
+        kind: BlockKind::Heading(5),
+        icon: "heading",
+    },
+    SlashItem {
+        keys: &["h6", "heading6"],
+        label: "Heading 6",
+        hint: "######",
+        template: "###### ",
+        kind: BlockKind::Heading(6),
+        icon: "heading",
+    },
+    SlashItem {
+        keys: &["image", "img", "photo", "picture"],
+        label: "Image",
+        hint: "![]()",
+        template: "![](image.png)",
+        kind: BlockKind::Paragraph,
+        icon: "image",
+    },
+    SlashItem {
+        keys: &["video", "movie", "clip", "mp4"],
+        label: "Video",
+        hint: "clip.mp4",
+        template: "![](clip.mp4)",
+        kind: BlockKind::Paragraph,
+        icon: "play",
+    },
+    SlashItem {
+        keys: &["mermaid", "diagram", "graph", "flowchart"],
+        label: "Mermaid diagram",
+        hint: "```mermaid",
+        template: "```mermaid\n\n```",
+        kind: BlockKind::Code,
+        icon: "diagram",
+    },
+    SlashItem {
         keys: &["ul", "list", "bullet"],
         label: "Bullet list",
         hint: "-",
@@ -221,5 +269,36 @@ mod tests {
             .all(|h| h.label.to_ascii_lowercase().contains("head")
                 || h.keys.iter().any(|k| k.contains("head"))));
         assert_eq!(hits[0].icon, "heading");
+    }
+
+    #[test]
+    fn headings_up_to_six() {
+        for (q, template) in [
+            ("h4", "#### "),
+            ("h5", "##### "),
+            ("h6", "###### "),
+            ("heading4", "#### "),
+            ("heading6", "###### "),
+        ] {
+            let hits = filter(q);
+            assert!(
+                hits.iter().any(|i| i.template == template),
+                "missing {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_and_mermaid_options() {
+        let img = filter("image");
+        assert!(img.iter().any(|i| i.label == "Image"));
+        assert!(filter("img")[0].template.contains("![]("));
+        let vid = filter("video");
+        assert!(vid.iter().any(|i| i.label == "Video"));
+        assert!(filter("mp4").iter().any(|i| i.template.contains(".mp4")));
+        let mer = filter("mermaid");
+        assert!(mer.iter().any(|i| i.label == "Mermaid diagram"));
+        assert!(mer[0].template.contains("```mermaid"));
+        assert!(filter("diagram").iter().any(|i| i.label == "Mermaid diagram"));
     }
 }
