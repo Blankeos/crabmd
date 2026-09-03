@@ -12,7 +12,7 @@
 //! leave off, so `Mp4VideoReader::open` + `next_frame` just works everywhere.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,14 @@ enum Slot {
     Loading,
     Ready(VideoClip, Vec<u64>),
     Failed(String),
+    /// Probed a remote URL that turned out not to be video (image, HTML…).
+    /// Distinct from `Failed` so callers can fall back to image/link UI
+    /// instead of showing a video error card.
+    NotVideo,
 }
+
+/// Marker error from the probe path (never surfaced in UI).
+pub const NOT_VIDEO: &str = "not-video";
 
 /// Per-clip playhead. `generation` invalidates stale timer loops when the
 /// user pauses/seeks or the clip is replaced.
@@ -103,6 +110,17 @@ impl VideoStore {
             Err(e) => Slot::Failed(e),
         };
         self.slots.insert(key, slot);
+    }
+
+    /// Record that `key` (a probed remote URL) is not video. Future
+    /// `begin` calls return `false` so the probe runs once.
+    pub fn mark_not_video(&mut self, key: String) {
+        self.slots.insert(key, Slot::NotVideo);
+    }
+
+    /// True once the probe concluded the URL is not video.
+    pub fn is_not_video(&self, key: &str) -> bool {
+        matches!(self.slots.get(key), Some(Slot::NotVideo))
     }
 
     pub fn play_state(&self, key: &str) -> (bool, usize) {
@@ -305,6 +323,66 @@ pub fn remote_cache_path(url: &str) -> std::path::PathBuf {
         .join(format!("{hash:016x}.mp4"))
 }
 
+/// Download `url` (following redirects, e.g. GitHub asset → signed S3)
+/// into the temp cache. Skips the fetch when a non-empty file is cached.
+pub fn download_remote(url: &str) -> Result<PathBuf, String> {
+    let tmp = remote_cache_path(url);
+    if tmp.exists() && tmp.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        return Ok(tmp);
+    }
+    if let Some(dir) = tmp.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let out = std::process::Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--max-time",
+            "90",
+            "--silent",
+            "--show-error",
+            url,
+            "-o",
+            &tmp.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("download failed ({e}); is curl installed?"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "download failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(tmp)
+}
+
+/// Magic-byte sniff: MP4/MOV/M4V (`ftyp`), WebM/Matroska (EBML), Ogg
+/// (`OggS`), AVI (`RIFF…AVI `). Extensionless URLs (GitHub assets) need
+/// this — the tag/extension can't tell video from image.
+pub fn is_video_bytes(b: &[u8]) -> bool {
+    if b.len() < 12 {
+        return false;
+    }
+    // MP4/MOV/M4V: `....ftyp`
+    if &b[4..8] == b"ftyp" {
+        return true;
+    }
+    // WebM/Matroska: EBML header `1A 45 DF A3`
+    if b.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return true;
+    }
+    // Ogg (ogv): `OggS`
+    if b.starts_with(b"OggS") {
+        return true;
+    }
+    // AVI: `RIFF....AVI `
+    if b.starts_with(b"RIFF") && &b[8..12] == b"AVI " {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +425,24 @@ mod tests {
     fn fmt_time_labels() {
         assert_eq!(fmt_time(3_500_000), "0:03");
         assert_eq!(fmt_time(75_000_000), "1:15");
+    }
+
+    #[test]
+    fn video_magic_sniff() {
+        // MP4 ftyp
+        let mut mp4 = vec![0u8; 16];
+        mp4[4..8].copy_from_slice(b"ftyp");
+        assert!(is_video_bytes(&mp4));
+        // WebM EBML
+        assert!(is_video_bytes(&[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0]));
+        // Ogg
+        assert!(is_video_bytes(b"OggS012345678"));
+        // AVI
+        assert!(is_video_bytes(b"RIFF1234AVI "));
+        // PNG / HTML / tiny inputs are not video
+        assert!(!is_video_bytes(b"\x89PNG\r\n\x1a\n0000"));
+        assert!(!is_video_bytes(b"<!doctype html......"));
+        assert!(!is_video_bytes(b"short"));
     }
 
     #[test]

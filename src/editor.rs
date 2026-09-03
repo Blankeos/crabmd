@@ -10,9 +10,9 @@ use gpui::{
     actions, canvas, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb,
     AnyElement,
     App, AppContext as _, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle,
-    DragMoveEvent, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
+    DragMoveEvent, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement as _, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
     SharedUri, StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
 };
 use gpui_component::{
@@ -3982,6 +3982,33 @@ impl Workspace {
         }
 
         let insert_like = self.mode.is_insert() || self.is_notion();
+        // Focused video block: `space` toggles play/pause instead of
+        // inserting a space (YouTube-style). Skipped when an overlay owns
+        // the keyboard, the slash menu is open, or the clip isn't ready —
+        // `video_key_at` already requires a decoded clip.
+        if key == "space"
+            && !mods.platform
+            && !mods.control
+            && !mods.alt
+            && self.command.is_none()
+            && self.search.is_none()
+            && self.cmd_palette.is_none()
+            && !self.link_open
+            && !self.view_source
+            && !self.settings_open
+            && !self.slash_is_open()
+            && !self.overlay_input_focused(window, cx)
+            && self.pending_replace.is_none()
+            && self.pending_find.is_none()
+            && self.pending_bracket.is_none()
+            && !self.pending_g
+        {
+            if let Some(vkey) = self.video_key_at(self.caret) {
+                window.prevent_default();
+                self.toggle_video(&vkey, cx);
+                return true;
+            }
+        }
         let can_nav = (self.is_modal_nav() || insert_like)
             && self.command.is_none()
             && self.search.is_none()
@@ -4060,8 +4087,6 @@ impl Workspace {
         v_flex()
             .w(px(340.))
             .max_w(relative(0.9))
-            .max_h(max_h)
-            .min_h(px(0.))
             .rounded(px(8.))
             .border_1()
             .border_color(p.border)
@@ -4072,7 +4097,10 @@ impl Workspace {
                 v_flex()
                     .id("slash-list")
                     .w_full()
-                    .flex_1()
+                    // Clamp the scroll container itself (not the outer panel)
+                    // so the viewport height is well-defined: thumb size and
+                    // position are computed from this box vs its content.
+                    .max_h(max_h)
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.slash_scroll)
@@ -4081,6 +4109,9 @@ impl Workspace {
                         let active = i == selected;
                         div()
                             .id(("slash-item", i))
+                            // Never compress rows to fit: they must overflow
+                            // so the scrollbar thumb reflects real content.
+                            .flex_shrink_0()
                             .px_3()
                             .py_1()
                             .cursor_pointer()
@@ -5172,7 +5203,7 @@ impl Workspace {
                 })
                 .into_any_element(),
             BlockExtra::Image { alt, src } => {
-                self.render_image_hit(alt, src, block.display.start, cx)
+                self.render_image_hit(alt, src, block.display.start, caret_here, cx)
             }
             BlockExtra::Heading(level) => {
                 let mut el = v_flex()
@@ -5202,7 +5233,7 @@ impl Workspace {
                         if let Some(src) =
                             images::parse_video_src(raw).or_else(|| images::parse_html_src(raw))
                         {
-                            return self.render_video_hit("", &src, block.display.start, cx);
+                            return self.render_video_hit("", &src, block.display.start, caret_here, cx);
                         }
                     }
                     if let Some((src, alt)) = images::parse_img_src(raw) {
@@ -5213,7 +5244,7 @@ impl Workspace {
                         if matches!(&block.extra, BlockExtra::Html)
                             || (t.starts_with('<') && t.contains("<img"))
                         {
-                            return self.render_image_hit(&alt, &src, block.display.start, cx);
+                            return self.render_image_hit(&alt, &src, block.display.start, caret_here, cx);
                         }
                     }
                     if matches!(&block.extra, BlockExtra::Html) {
@@ -5236,16 +5267,20 @@ impl Workspace {
         alt: &str,
         src: &str,
         display_start: usize,
+        caret_here: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if images::is_video_src(src) {
-            return self.render_video_hit(alt, src, display_start, cx);
+            return self.render_video_hit(alt, src, display_start, caret_here, cx);
         }
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         let remote = !path.exists() && images::is_remote_src(src);
         let missing = !path.exists() && !remote;
         let selected = self.media_sel == Some(display_start);
+        // Caret inside this block (keyboard walk) highlights the frame too —
+        // same primary border as the Edit-selected state.
+        let focused = selected || caret_here;
         let alt_owned = alt.to_string();
         let src_owned = src.to_string();
         v_flex()
@@ -5253,7 +5288,7 @@ impl Workspace {
             .min_w_0()
             .gap_1()
             .cursor_pointer()
-            .when(selected, |el| {
+            .when(focused, |el| {
                 el.border_1()
                     .border_color(pal.primary)
                     .rounded(px(8.))
@@ -5420,11 +5455,13 @@ impl Workspace {
         alt: &str,
         src: &str,
         display_start: usize,
+        caret_here: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         let selected = self.media_sel == Some(display_start);
+        let focused = selected || caret_here;
         let remote = !path.exists() && images::is_remote_src(src);
         let name = Path::new(src)
             .file_name()
@@ -5463,7 +5500,7 @@ impl Workspace {
                         .overflow_hidden()
                         .rounded(px(8.))
                         .border_1()
-                        .border_color(if selected { pal.primary } else { pal.border })
+                        .border_color(if focused { pal.primary } else { pal.border })
                         .bg(pal.background_panel)
                         .child(
                             div()
@@ -5546,32 +5583,7 @@ impl Workspace {
                 cx.spawn(async move |_, cx| {
                     let result = cx
                         .background_spawn(async move {
-                            let tmp = crate::video::remote_cache_path(&url);
-                            if !tmp.exists() || tmp.metadata().map(|m| m.len()).unwrap_or(0) == 0
-                            {
-                                if let Some(dir) = tmp.parent() {
-                                    let _ = std::fs::create_dir_all(dir);
-                                }
-                                let out = std::process::Command::new("curl")
-                                    .args([
-                                        "--fail",
-                                        "--location",
-                                        "--max-time",
-                                        "90",
-                                        &url,
-                                        "-o",
-                                        &tmp.to_string_lossy(),
-                                    ])
-                                    .output()
-                                    .map_err(|e| format!("download failed ({e}); is curl installed?"))?;
-                                if !out.status.success() {
-                                    return Err(format!(
-                                        "download failed ({}): {}",
-                                        out.status,
-                                        String::from_utf8_lossy(&out.stderr).trim()
-                                    ));
-                                }
-                            }
+                            let tmp = crate::video::download_remote(&url)?;
                             crate::video::decode_file(&tmp)
                         })
                         .await;
@@ -5666,7 +5678,7 @@ impl Workspace {
                         ),
                 )
                 .into_any_element();
-            return self.render_video_card(inner, display_start, selected, cx);
+            return self.render_video_card(inner, display_start, focused, cx);
         }
 
         // Ready — the inline player.
@@ -5697,28 +5709,112 @@ impl Workspace {
             let truncated = clip.truncated;
             let pal2 = pal.clone();
             // Bounds tracker: the canvas paints nothing but records the
-            // scrub bar's window bounds each frame, so click-to-seek can
-            // map the (window-space) mouse position to a frame.
+            // scrub bar's window bounds each frame, so click + drag can map
+            // the (window-space) mouse position to a frame.
             let bar_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
             let bar_bounds_paint = bar_bounds.clone();
+            let bar_bounds_drag = bar_bounds.clone();
+            let bar_bounds_outside = bar_bounds.clone();
             let view = cx.entity();
+            let view_drag = view.clone();
+            let view_outside = view.clone();
             let key_seek = key.clone();
+            let key_drag = key.clone();
+            let key_outside = key.clone();
             let n_seek = n;
+            let n_drag = n;
             let scrub = div()
                 .id(("video-scrub", display_start))
                 .w_full()
-                .h(px(20.))
+                .h(px(22.))
                 .flex()
                 .items_center()
                 .cursor_pointer()
+                // Stop here so seeking never moves the caret / opens the
+                // slash menu on the video block.
                 .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, cx| {
-                    if let Some(b) = *bar_bounds.borrow() {
-                        let w = b.size.width.as_f32().max(1.0);
-                        let f = ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w)
-                            .clamp(0.0, 1.0);
-                        let frame = (f * (n_seek - 1) as f32).round() as usize;
+                    cx.stop_propagation();
+                    let bb = bar_bounds.clone();
+                    let f = {
+                        let b = bb.borrow();
+                        b.as_ref().map(|b| {
+                            let w = b.size.width.as_f32().max(1.0);
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0)
+                        })
+                    };
+                    if let Some(f) = f {
+                        let frame = (f * (n_seek.saturating_sub(1)) as f32).round() as usize;
                         view.update(cx, |this, cx| {
                             this.video.scrub(&key_seek, frame);
+                            cx.notify();
+                        });
+                    }
+                })
+                .on_mouse_move(move |ev: &MouseMoveEvent, _, cx| {
+                    // Slow drags inside the bar: only while held. Fast
+                    // flings that leave the bar are handled by
+                    // `on_drag_move` below (keeps working outside the
+                    // element / window while the button stays down).
+                    if !ev.dragging() {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let bb = bar_bounds_drag.clone();
+                    let f = {
+                        let b = bb.borrow();
+                        b.as_ref().map(|b| {
+                            let w = b.size.width.as_f32().max(1.0);
+                            ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w).clamp(0.0, 1.0)
+                        })
+                    };
+                    if let Some(f) = f {
+                        let frame = (f * (n_drag.saturating_sub(1)) as f32).round() as usize;
+                        view_drag.update(cx, |this, cx| {
+                            this.video.scrub(&key_drag, frame);
+                            cx.notify();
+                        });
+                    }
+                })
+                // Platform drag: keeps scrubbing when the pointer races off
+                // the bar (or out of the window / over another app) while
+                // held. `on_drag_move` fires for every move until mouse-up,
+                // regardless of hit-testing — the fraction clamps so fast
+                // flings still land on the first/last frame.
+                .on_drag(
+                    DragVideoScrub {
+                        key: key.clone(),
+                        total: n,
+                    },
+                    |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| drag.clone())
+                    },
+                )
+                .on_drag_move(move |ev: &DragMoveEvent<DragVideoScrub>, _, cx| {
+                    let (dkey, ntotal) = {
+                        let d = ev.drag(cx);
+                        (d.key.clone(), d.total)
+                    };
+                    if dkey != key_outside {
+                        return;
+                    }
+                    let x = ev.event.position.x.as_f32();
+                    let f = bar_bounds_outside
+                        .borrow()
+                        .as_ref()
+                        .map(|b| {
+                            let w = b.size.width.as_f32().max(1.0);
+                            ((x - b.origin.x.as_f32()) / w).clamp(0.0, 1.0)
+                        })
+                        .or_else(|| {
+                            let b = ev.bounds;
+                            let w = b.size.width.as_f32().max(1.0);
+                            Some(((x - b.origin.x.as_f32()) / w).clamp(0.0, 1.0))
+                        });
+                    if let Some(f) = f {
+                        let frame = (f * (ntotal.saturating_sub(1)) as f32).round() as usize;
+                        view_outside.update(cx, |this, cx| {
+                            this.video.scrub(&dkey, frame);
                             cx.notify();
                         });
                     }
@@ -5740,6 +5836,20 @@ impl Workspace {
                                 .rounded_full()
                                 .bg(pal2.primary),
                         )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(-4.))
+                                .bottom(px(-4.))
+                                .left(relative(frac))
+                                .ml(px(-7.))
+                                .w(px(14.))
+                                .h(px(14.))
+                                .rounded_full()
+                                .bg(gpui::white())
+                                .border_2()
+                                .border_color(pal2.primary),
+                        )
                         .child(canvas(
                             move |bounds, _, _| {
                                 *bar_bounds_paint.borrow_mut() = Some(bounds);
@@ -5747,17 +5857,38 @@ impl Workspace {
                             |_, _, _, _| {},
                         )),
                 );
+            let play_icon = if playing { "pause" } else { "play" };
+            let frame_key = key.clone();
+            let frame_view = cx.entity();
             let inner = v_flex()
                 .w_full()
                 .min_w_0()
                 .child(
                     div()
+                        .id(("video-frame", display_start))
                         .w_full()
                         .h(px(box_h))
                         .flex()
                         .items_center()
                         .justify_center()
                         .bg(gpui::black())
+                        .cursor_pointer()
+                        // Clicking the picture toggles play/pause (footer
+                        // stays for Open/Edit). Stop here so the card
+                        // doesn't also move the caret / open the toolbar —
+                        // we set the caret ourselves so `space` keeps
+                        // working afterwards.
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            frame_view.update(cx, |this, cx| {
+                                this.caret = display_start;
+                                this.sel = None;
+                                this.mouse_dragging = false;
+                                this.follow_caret = false;
+                                this.focus.focus(window, cx);
+                                this.toggle_video(&frame_key, cx);
+                            });
+                        })
                         .child(img(image).w(px(iw)).h(px(ih))),
                 )
                 .child(
@@ -5767,38 +5898,19 @@ impl Workspace {
                         .py_2()
                         .gap_2()
                         .items_center()
+                        // Swallow clicks on the transport so they never reach
+                        // the card (which would move the caret / pop the slash
+                        // menu). No tooltip on the icon button either.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             Button::new(("video-play", display_start))
+                                .ghost()
                                 .xsmall()
-                                .label(if playing { "Pause" } else { "Play" })
+                                .icon(icon_el(play_icon, pal.text_muted))
                                 .on_click({
                                     let key = key.clone();
                                     cx.listener(move |this, _, _, cx| {
                                         this.toggle_video(&key, cx);
-                                    })
-                                }),
-                        )
-                        .child(
-                            Button::new(("video-back", display_start))
-                                .ghost()
-                                .xsmall()
-                                .label("-1s")
-                                .on_click({
-                                    let key = key.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.step_video(&key, -30, cx);
-                                    })
-                                }),
-                        )
-                        .child(
-                            Button::new(("video-fwd", display_start))
-                                .ghost()
-                                .xsmall()
-                                .label("+1s")
-                                .on_click({
-                                    let key = key.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.step_video(&key, 30, cx);
                                     })
                                 }),
                         )
@@ -5817,6 +5929,7 @@ impl Workspace {
                         .pb_3()
                         .gap_2()
                         .items_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             v_flex().flex_1().min_w_0()
                                 .child(
@@ -5869,7 +5982,7 @@ impl Workspace {
                         ),
                 )
                 .into_any_element();
-            return self.render_video_card(inner, display_start, selected, cx);
+            return self.render_video_card(inner, display_start, focused, cx);
         }
 
         // Still decoding (or downloading a remote) — placeholder tile.
@@ -5907,19 +6020,21 @@ impl Workspace {
                     ),
             )
             .into_any_element();
-        self.render_video_card(inner, display_start, selected, cx)
+        self.render_video_card(inner, display_start, focused, cx)
     }
 
     /// Video card shell: bordered panel + click-to-select + the Alt/Path
-    /// toolbar when selected. Shared by missing/error/loading/player.
+    /// toolbar when Edit-selected. `focused` (Edit-selected OR caret inside
+    /// the block) drives the primary border; the toolbar stays Edit-only.
     fn render_video_card(
         &self,
         inner: AnyElement,
         display_start: usize,
-        selected: bool,
+        focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pal = &self.palette;
+        let selected = self.media_sel == Some(display_start);
         v_flex()
             .w_full()
             .min_w_0()
@@ -5947,7 +6062,7 @@ impl Workspace {
                     .overflow_hidden()
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(if selected { pal.primary } else { pal.border })
+                    .border_color(if focused { pal.primary } else { pal.border })
                     .bg(pal.background_panel)
                     .child(inner),
             )
@@ -5955,6 +6070,83 @@ impl Workspace {
                 el.child(self.render_media_toolbar(false, display_start, cx))
             })
             .into_any_element()
+    }
+
+    /// Probe an ambiguous remote URL (bare link or extensionless `![](…)`)
+    /// as video: download → magic sniff → decode. Returns the store key.
+    /// Non-video URLs are marked `NotVideo` (and the temp file removed) so
+    /// callers fall back to image/link UI; genuine video errors surface via
+    /// `finish(Err)` like the known-video path. Runs once per URL.
+    fn probe_remote_video(&mut self, url: &str, cx: &mut Context<Self>) -> String {
+        let key = crate::video::VideoStore::remote_key(url);
+        if self.video.begin(key.clone()) {
+            let url = url.to_string();
+            let key2 = key.clone();
+            let view = cx.entity();
+            cx.spawn(async move |_, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        let tmp = crate::video::download_remote(&url)?;
+                        let bytes =
+                            std::fs::read(&tmp).map_err(|e| format!("read cache: {e}"))?;
+                        if !crate::video::is_video_bytes(&bytes) {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(crate::video::NOT_VIDEO.to_string());
+                        }
+                        crate::video::decode_file(&tmp)
+                    })
+                    .await;
+                let _ = cx.update(|cx| {
+                    view.update(cx, |this, cx| {
+                        match result {
+                            Err(e) if e == crate::video::NOT_VIDEO => {
+                                this.video.mark_not_video(key2);
+                            }
+                            other => {
+                                this.video.finish(key2, other);
+                            }
+                        }
+                        cx.notify();
+                    })
+                });
+            })
+            .detach();
+        }
+        key
+    }
+
+    /// Resolve the inline-player key for the video block at display offset
+    /// `d`, when that block actually renders as a video. Mirrors the
+    /// `render_video_hit` source resolution (markdown image vs `<video>`
+    /// HTML). Returns `None` for missing/error/loading clips so callers
+    /// (space-to-toggle) only hijack keys when there's a ready clip.
+    fn video_key_at(&self, d: usize) -> Option<String> {
+        let p = self.proj();
+        let b = p.block_at_display(d)?;
+        if let BlockExtra::Image { src, .. } = &b.extra {
+            if !images::is_video_src(src) {
+                return None;
+            }
+            let path = images::resolve_beside(&self.path, src);
+            let key = if !path.exists() && images::is_remote_src(src) {
+                crate::video::VideoStore::remote_key(src)
+            } else {
+                crate::video::VideoStore::key_for(&path)
+            };
+            return self.video.get(&key).is_some().then_some(key);
+        }
+        let raw = self.source.get(b.source.clone())?;
+        if images::parse_video_src(raw).is_none() && !is_bare_video(raw) {
+            return None;
+        }
+        let src = images::parse_video_src(raw).or_else(|| images::parse_html_src(raw))?;
+        let path = images::resolve_beside(&self.path, &src);
+        let key = if !path.exists() && images::is_remote_src(&src) {
+            crate::video::VideoStore::remote_key(&src)
+        } else {
+            crate::video::VideoStore::key_for(&path)
+        };
+        self.video.get(&key).is_some().then_some(key)
     }
 
     /// Play/pause toggle for an inline clip. Starting playback spawns a
@@ -5984,14 +6176,6 @@ impl Workspace {
             })
             .detach();
         }
-    }
-
-    /// Step ±frames (the -1s/+1s buttons ≈ ±30 frames at 30fps).
-    fn step_video(&mut self, key: &str, delta: isize, cx: &mut Context<Self>) {
-        let (_, frame) = self.video.play_state(key);
-        let next = (frame as isize + delta).clamp(0, usize::MAX as isize) as usize;
-        self.video.scrub(key, next);
-        cx.notify();
     }
 
     /// Generic HTML blocks (`<iframe>`, `<details>`, raw `<div>`…): a small
@@ -8589,6 +8773,23 @@ struct DragBlock {
     bg: gpui::Hsla,
     fg: gpui::Hsla,
     border: gpui::Hsla,
+}
+
+/// Invisible drag payload for the video scrub bar. Starting a GPUI drag
+/// (`on_drag`) routes all subsequent `on_drag_move` events to the scrub
+/// bar — even when the pointer races off the bar, out of the window, or
+/// over another app mid-gesture — for as long as the button stays down.
+/// Same pattern as `gpui-component`'s `Slider` (`DragSlider`).
+#[derive(Clone)]
+struct DragVideoScrub {
+    key: String,
+    total: usize,
+}
+
+impl Render for DragVideoScrub {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
 }
 
 impl Render for DragBlock {
