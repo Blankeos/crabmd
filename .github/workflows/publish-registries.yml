@@ -62,7 +62,7 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # Shared gate: do not publish crates.io or npm until cargo-dist release builds finish.
+  # Shared gate: do not publish npm until cargo-dist release builds finish.
   wait-for-binaries:
     needs: prepare
     runs-on: ubuntu-latest
@@ -105,47 +105,6 @@ jobs:
 
           echo "Timed out waiting for GitHub release binaries"
           exit 1
-
-  publish-crate:
-    needs:
-      - prepare
-      - wait-for-binaries
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.tag }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Verify package
-        run: cargo publish -p crabmd --dry-run --locked
-      - name: Check crates.io
-        id: registry
-        shell: bash
-        run: |
-          set -euo pipefail
-          status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-            --header 'Accept: application/json' \
-            --user-agent 'crabmd-release-workflow (https://github.com/Blankeos/crabmd)' \
-            "https://crates.io/api/v1/crates/crabmd/${{ needs.prepare.outputs.version }}")"
-
-          case "$status" in
-            200) echo "published=true" >> "$GITHUB_OUTPUT" ;;
-            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "Unexpected crates.io response: HTTP $status"; exit 1 ;;
-          esac
-      - name: Authenticate with crates.io
-        if: steps.registry.outputs.published != 'true'
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish to crates.io
-        if: steps.registry.outputs.published != 'true'
-        run: cargo publish --package crabmd --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
   publish-npm:
     needs:

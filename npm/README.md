@@ -10,7 +10,7 @@ brew install blankeos/tap/crabmd
 npm install -g crabmd
 bun install -g crabmd
 curl --proto "=https" --tlsv1.2 -LsSf https://github.com/Blankeos/crabmd/releases/latest/download/crabmd-installer.sh | sh
-cargo install crabmd --locked
+cargo install --git https://github.com/Blankeos/crabmd --locked
 ```
 
 ```sh

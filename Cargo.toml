@@ -2,6 +2,7 @@
 name = "crabmd"
 version = "0.0.1"
 edition = "2021"
+publish = false
 license = "MIT"
 description = "A fast native GPUI markdown writer"
 authors = ["Carlo Taleon <blankeos>"]
