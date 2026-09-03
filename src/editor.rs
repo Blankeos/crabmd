@@ -5273,6 +5273,23 @@ impl Workspace {
         if images::is_video_src(src) {
             return self.render_video_hit(alt, src, display_start, caret_here, cx);
         }
+        // Ambiguous remote `![](https://…)` with no video extension (GitHub
+        // asset URLs): probe download → magic sniff → decode. `probe` runs
+        // once per URL; `NotVideo` falls through to image UI below, anything
+        // else (ready / loading / video error) renders the video card so the
+        // clip plays inline instead of showing as a static image.
+        if images::is_remote_src(src) {
+            let pkey = crate::video::VideoStore::remote_key(src);
+            if !self.video.is_not_video(&pkey) {
+                self.probe_remote_video(src, cx);
+                if self.video.get(&pkey).is_some()
+                    || self.video.error(&pkey).is_some()
+                    || !self.video.is_not_video(&pkey)
+                {
+                    return self.render_video_hit(alt, src, display_start, caret_here, cx);
+                }
+            }
+        }
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         let remote = !path.exists() && images::is_remote_src(src);
@@ -5458,7 +5475,7 @@ impl Workspace {
         caret_here: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let pal = &self.palette;
+        let pal = self.palette.clone();
         let path = images::resolve_beside(&self.path, src);
         let selected = self.media_sel == Some(display_start);
         let focused = selected || caret_here;
@@ -5574,42 +5591,14 @@ impl Workspace {
             crate::video::VideoStore::key_for(&path)
         };
 
-        // Kick off decode at most once per clip.
+        // Kick off decode at most once per clip. Progressive: the first
+        // ~12 frames publish ASAP so the clip plays while the rest decodes.
         if self.video.begin(key.clone()) {
             let view = cx.entity();
             if remote {
-                let url = src.to_string();
-                let key = key.clone();
-                cx.spawn(async move |_, cx| {
-                    let result = cx
-                        .background_spawn(async move {
-                            let tmp = crate::video::download_remote(&url)?;
-                            crate::video::decode_file(&tmp)
-                        })
-                        .await;
-                    let _ = cx.update(|cx| {
-                        view.update(cx, |this, cx| {
-                            this.video.finish(key, result);
-                            cx.notify();
-                        })
-                    });
-                })
-                .detach();
+                self.start_remote_stream(&src, &key, false, view, cx);
             } else {
-                let file = path.clone();
-                let key = key.clone();
-                cx.spawn(async move |_, cx| {
-                    let result = cx
-                        .background_spawn(async move { crate::video::decode_file(&file) })
-                        .await;
-                    let _ = cx.update(|cx| {
-                        view.update(cx, |this, cx| {
-                            this.video.finish(key, result);
-                            cx.notify();
-                        })
-                    });
-                })
-                .detach();
+                Self::stream_decode_into(path.clone(), key.clone(), view, cx);
             }
         }
 
@@ -5696,17 +5685,32 @@ impl Workspace {
                 (box_h * cw / ch, box_h)
             };
             let cur_us = stamps.get(frame).copied().unwrap_or(0);
-            let frac = if n <= 1 {
+            // Stable timeline: pinned to the container totals known before
+            // the first frame decodes, so the playhead / duration don't
+            // jump as each 12-frame chunk lands. `buffered_frac` is the
+            // YouTube-style grey track behind it.
+            let total_n = clip.timeline_frames();
+            let total_us = clip.timeline_duration_us();
+            let buffered_frac = clip.buffered_frac();
+            let frac = if total_n <= 1 {
                 1.0
             } else {
-                frame as f32 / (n - 1) as f32
+                frame as f32 / (total_n - 1) as f32
             };
             let time = format!(
                 "{} / {}",
                 crate::video::fmt_time(cur_us),
-                crate::video::fmt_time(clip.duration_us)
+                crate::video::fmt_time(total_us)
             );
             let truncated = clip.truncated;
+            let preview = clip.preview;
+            // Live buffered bytes while the full clip streams (preview
+            // playback keeps the badge up until the full decode swaps in).
+            let buffered = if remote {
+                self.video.progress_of(&key)
+            } else {
+                None
+            };
             let pal2 = pal.clone();
             // Bounds tracker: the canvas paints nothing but records the
             // scrub bar's window bounds each frame, so click + drag can map
@@ -5936,7 +5940,21 @@ impl Workspace {
                                     div()
                                         .text_xs()
                                         .text_color(pal.text_muted)
-                                        .child(if truncated {
+                                        .child(if preview {
+                                            match buffered {
+                                                Some((r, Some(t))) if t > 0 => format!(
+                                                    "{name} · preview playing · buffering {}%",
+                                                    (r.min(t) * 100 / t).min(100)
+                                                ),
+                                                Some((r, _)) if r > 0 => format!(
+                                                    "{name} · preview playing · buffering {}",
+                                                    crate::video::fmt_bytes(r)
+                                                ),
+                                                _ => format!(
+                                                    "{name} · preview playing · buffering full clip…"
+                                                ),
+                                            }
+                                        } else if truncated {
                                             format!(
                                                 "{name} · preview of first {n} frames · Open for full"
                                             )
@@ -5986,12 +6004,34 @@ impl Workspace {
         }
 
         // Still decoding (or downloading a remote) — placeholder tile.
+        // Remote shows a live buffering bar (browser-style) instead of a
+        // stuck spinner: bytes come from the `.part` poller.
+        let progress = if remote {
+            self.video.progress_of(&key)
+        } else {
+            None
+        };
         let fetching_remote =
             remote && !crate::video::remote_cache_path(src).exists();
-        let label = if fetching_remote {
-            "Fetching remote video…"
-        } else {
-            "Decoding video…"
+        // Download done but no frames yet → the pure-Rust software decode
+        // is grinding, not the network. Say so (previously this showed a
+        // "Buffering 1.4MB" label that looked complete but wasn't playable).
+        let label = match progress {
+            Some((r, Some(t))) if t > 0 && fetching_remote => format!(
+                "Buffering {}% · {} / {}",
+                (r.min(t) * 100 / t).min(100),
+                crate::video::fmt_bytes(r),
+                crate::video::fmt_bytes(t)
+            ),
+            Some((r, _)) if r > 0 && fetching_remote => {
+                format!("Buffering {} received… · {name}", crate::video::fmt_bytes(r))
+            }
+            _ if fetching_remote => "Fetching remote video…".to_string(),
+            _ => "Decoding video…".to_string(),
+        };
+        let bar_frac = match progress {
+            Some((r, Some(t))) if t > 0 => (r as f32 / t as f32).clamp(0.0, 1.0),
+            _ => -1.0,
         };
         let inner = v_flex()
             .w_full()
@@ -6007,17 +6047,33 @@ impl Workspace {
                     .child(icon_el_px("play", gpui::white().opacity(0.4), px(40.))),
             )
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
                     .p_3()
+                    .pb_2()
                     .gap_2()
-                    .items_center()
                     .child(
                         div()
                             .text_xs()
                             .text_color(pal.text_muted)
                             .child(format!("{label} · {name}")),
-                    ),
+                    )
+                    .when(bar_frac >= 0.0, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .h(px(3.))
+                                .rounded_full()
+                                .bg(pal.border)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(pal.primary)
+                                        .w(relative(bar_frac)),
+                                ),
+                        )
+                    }),
             )
             .into_any_element();
         self.render_video_card(inner, display_start, focused, cx)
@@ -6072,6 +6128,206 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Progressive decode into the store: a decode thread ships
+    /// `DECODE_BATCH`-sized batches over a channel while a `cx.spawn`
+    /// forwarder publishes each batch + notifies, so the first ~12 frames
+    /// paint/play while the (slow pure-Rust software) decode of the rest
+    /// still runs. `on_done` reports the terminal state for error cards.
+    fn stream_decode_into(
+        path: PathBuf,
+        key: String,
+        view: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::time::Duration;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::video::DecodeBatch>(8);
+        std::thread::spawn(move || {
+            let _ = crate::video::decode_file_batches(&path, tx);
+        });
+        cx.spawn(async move |_, cx| {
+            let mut published = 0usize;
+            loop {
+                match rx.try_recv() {
+                    Ok(batch) => {
+                        let finished = batch.finished;
+                        let _ = cx.update(|cx| {
+                            view.update(cx, |this, cx| {
+                                if this.video.append_batch(&key, batch) {
+                                    published += 1;
+                                    if finished {
+                                        this.video.normalize_timestamps(&key);
+                                    }
+                                    cx.notify();
+                                }
+                            })
+                        });
+                        if finished {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        cx.background_executor().timer(Duration::from_millis(80)).await;
+                    }
+                }
+            }
+            // Zero frames decoded → surface the error card (the decode
+            // thread dropped `tx` without sending). Otherwise the partial
+            // clip stays playable.
+            let _ = cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    if published == 0 && this.video.get(&key).is_none() {
+                        this.video.finish(
+                            key.clone(),
+                            Err("no frames decoded".to_string()),
+                        );
+                        cx.notify();
+                    } else {
+                        // Wake the card one last time (preview flag cleared).
+                        cx.notify();
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Browser-style streaming for a remote clip. Assumes `begin()` already
+    /// claimed the slot (so this runs once per URL): a single download
+    /// streams to a `.part` target while a poller reports live bytes into
+    /// `VideoStore` progress (buffering bar), then the file sniffs +
+    /// decodes *progressively* — first frames publish ASAP and the clip
+    /// plays while the rest decodes. (No separate Range preview: for small
+    /// clips the preview IS the file, so it doubled downloads; for
+    /// moov-at-end files it always failed and its latency sat on the
+    /// critical path.)
+    /// `is_probe` marks non-video URLs `NotVideo` (extensionless `![](…)`
+    /// falls back to image UI); the known-video path surfaces decode errors
+    /// via `finish(Err)` like local files.
+    fn start_remote_stream(
+        &mut self,
+        url: &str,
+        key: &str,
+        is_probe: bool,
+        view: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) {
+        use std::time::Duration;
+        self.video.set_progress(key.to_string(), 0, None);
+        // Progress poller: reads the growing `.part` file + HEAD total and
+        // notifies so the buffering bar animates. Runs until the full clip
+        // lands (preview Ready doesn't stop it — the badge stays up).
+        {
+            let view = view.clone();
+            let url = url.to_string();
+            let key = key.to_string();
+            cx.spawn(async move |_, cx| {
+                // HEAD first so the bar has a total ASAP.
+                let url_head = url.clone();
+                let total = cx
+                    .background_spawn(async move { crate::video::fetch_remote_total(&url_head) })
+                    .await;
+                let _ = cx.update(|cx| {
+                    view.update(cx, |this, cx| {
+                        let received = this.video.progress_of(&key).map(|(r, _)| r).unwrap_or(0);
+                        this.video.set_progress(key.clone(), received, total);
+                        cx.notify();
+                    })
+                });
+                for _ in 0..600 {
+                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    let done = cx.update(|cx| {
+                        view.update(cx, |this, cx| {
+                                let partial = crate::video::remote_part_path(&url);
+                                let received = partial.metadata().map(|m| m.len()).unwrap_or(0);
+                                let total = this
+                                    .video
+                                    .progress_of(&key)
+                                    .and_then(|(_, t)| t)
+                                    .or(total);
+                                // The final cache file appearing means curl
+                                // renamed `.part` — report it as complete.
+                                let final_len = crate::video::remote_cache_path(&url)
+                                    .metadata()
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                let received = received.max(if final_len > 0 {
+                                    // Full file landed; the finish lands next.
+                                    this.video.set_progress(
+                                        key.clone(),
+                                        total.unwrap_or(final_len).max(final_len),
+                                        total,
+                                    );
+                                    cx.notify();
+                                    return true;
+                                } else {
+                                    received
+                                });
+                                this.video.set_progress(key.clone(), received, total);
+                                cx.notify();
+                                // Keep polling through the preview; stop once
+                                // the full clip (or an error) resolves and no
+                                // download is in flight.
+                                let resolved = this.video.get(&key).is_some()
+                                    && !this.video.is_preview(&key)
+                                    || this.video.error(&key).is_some()
+                                    || this.video.is_not_video(&key);
+                                resolved && final_len > 0
+                            })
+                        });
+                    if done {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        // Single download → sniff → progressive decode. The decode
+        // publishes its first batch (~12 frames) ASAP; the error tail
+        // only fires when nothing decoded at all.
+        {
+            let url = url.to_string();
+            let key = key.to_string();
+            cx.spawn(async move |_, cx| {
+                let downloaded = cx
+                    .background_spawn(async move {
+                        let mut noop = |_, _| {};
+                        let tmp = crate::video::download_remote_streaming(&url, &mut noop)?;
+                        let bytes =
+                            std::fs::read(&tmp).map_err(|e| format!("read cache: {e}"))?;
+                        if !crate::video::is_video_bytes(&bytes) {
+                            let _ = std::fs::remove_file(&tmp);
+                            return Err(crate::video::NOT_VIDEO.to_string());
+                        }
+                        Ok(tmp)
+                    })
+                    .await;
+                match downloaded {
+                    Err(e) => {
+                        let _ = cx.update(|cx| {
+                            view.update(cx, |this, cx| {
+                                if e == crate::video::NOT_VIDEO && is_probe {
+                                    this.video.mark_not_video(key.clone());
+                                } else {
+                                    this.video.finish(key.clone(), Err(e));
+                                }
+                                cx.notify();
+                            })
+                        });
+                    }
+                    Ok(tmp) => {
+                        let _ = cx.update(|cx| {
+                            view.update(cx, |this, cx| {
+                                Self::stream_decode_into(tmp, key.clone(), view.clone(), cx);
+                            })
+                        });
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
     /// Probe an ambiguous remote URL (bare link or extensionless `![](…)`)
     /// as video: download → magic sniff → decode. Returns the store key.
     /// Non-video URLs are marked `NotVideo` (and the temp file removed) so
@@ -6080,37 +6336,7 @@ impl Workspace {
     fn probe_remote_video(&mut self, url: &str, cx: &mut Context<Self>) -> String {
         let key = crate::video::VideoStore::remote_key(url);
         if self.video.begin(key.clone()) {
-            let url = url.to_string();
-            let key2 = key.clone();
-            let view = cx.entity();
-            cx.spawn(async move |_, cx| {
-                let result = cx
-                    .background_spawn(async move {
-                        let tmp = crate::video::download_remote(&url)?;
-                        let bytes =
-                            std::fs::read(&tmp).map_err(|e| format!("read cache: {e}"))?;
-                        if !crate::video::is_video_bytes(&bytes) {
-                            let _ = std::fs::remove_file(&tmp);
-                            return Err(crate::video::NOT_VIDEO.to_string());
-                        }
-                        crate::video::decode_file(&tmp)
-                    })
-                    .await;
-                let _ = cx.update(|cx| {
-                    view.update(cx, |this, cx| {
-                        match result {
-                            Err(e) if e == crate::video::NOT_VIDEO => {
-                                this.video.mark_not_video(key2);
-                            }
-                            other => {
-                                this.video.finish(key2, other);
-                            }
-                        }
-                        cx.notify();
-                    })
-                });
-            })
-            .detach();
+            self.start_remote_stream(url, &key, true, cx.entity(), cx);
         }
         key
     }
@@ -6124,7 +6350,15 @@ impl Workspace {
         let p = self.proj();
         let b = p.block_at_display(d)?;
         if let BlockExtra::Image { src, .. } = &b.extra {
+            // Extensionless remote `![](https://…)` plays inline once the
+            // probe decodes it — mirror `render_image_hit`'s fallback.
             if !images::is_video_src(src) {
+                if images::is_remote_src(src) {
+                    let key = crate::video::VideoStore::remote_key(src);
+                    if self.video.get(&key).is_some() {
+                        return Some(key);
+                    }
+                }
                 return None;
             }
             let path = images::resolve_beside(&self.path, src);
