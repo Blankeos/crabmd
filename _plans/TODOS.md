@@ -28,5 +28,7 @@
 - [x] Font size numeric-only; per-field inline reset icon when customized, minor global reset
 - [x] Palette list mouse-wheel scroll + mac-like fading scrollbars (doc, palette, settings)
 - [x] Vim/Helix block caret inverts the covered character instead of hiding it
-- [x] Fix `cmd-k t` chord (capture-level starter), block-caret inversion under formatting (re-flatten), thumb-only scrollbars, palette keyboard scroll-follow, settings scroll reach/edge, font-family reset icon (12px), smaller Choose button
+- [x] `cmd-k t` chord via manual capture-level state machine (native GPUI `cmd-k t` sequence binding did not fire reliably); no `cmd-shift-p`/`esc back` hint in palette header
+- [x] Brand icons for editor cards via iconmate (simple-icons helix/vim/notion), slimmer settings nav rows, no bold on selected palette row, no `>` in palette input, no `esc back` hint, app bundle name CrabMD, per-field font resets (family/size independent)
+- [x] `cmd-k t` works in Vim/Helix Normal too (keymap dispatch runs before capture, so `on_find_till`/`on_find_till_back` consume a pending chord first); follow-up also accepts held cmd/ctrl (`cmd-k cmd-t`); preview always wraps while "Wrap lines" only affects source view; theme picker hints show dark/light per theme
 

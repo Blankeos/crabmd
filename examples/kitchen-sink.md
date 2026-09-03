@@ -43,11 +43,6 @@ fn main() {
 ```
 
 
-
-
-
-k
-
 ## Tablek
 
 | Feature | GFM |

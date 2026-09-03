@@ -370,7 +370,7 @@ pub fn theme_commands() -> Vec<PaletteItem> {
         .into_iter()
         .map(|name| PaletteItem {
             label: name,
-            hint: "theme",
+            hint: theme::appearance_hint(name),
             action: PaletteAction::SetTheme(name),
         })
         .collect()

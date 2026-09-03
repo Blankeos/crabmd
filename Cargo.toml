@@ -51,6 +51,6 @@ cocoa = "0.25"
 objc = "0.2"
 
 [package.metadata.bundle]
-name = "crabmd"
+name = "CrabMD"
 identifier = "ai.blankeos.crabmd"
 icon = ["assets/app-icon.png"]

@@ -136,6 +136,26 @@ pub fn list_theme_names() -> Vec<&'static str> {
     THEME_FILES.iter().map(|(name, _)| *name).collect()
 }
 
+/// "dark"/"light" hint for the theme picker, read from the theme file's
+/// top-level `appearance` (both TUI and desktop schemas carry it).
+/// Falls back to the `-light` suffix convention.
+pub fn appearance_hint(name: &str) -> &'static str {
+    if let Some((_, json)) = THEME_FILES.iter().find(|(n, _)| *n == name) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+            match v.get("appearance").and_then(|a| a.as_str()) {
+                Some("light") => return "light",
+                Some("dark") => return "dark",
+                _ => {}
+            }
+        }
+    }
+    if name.ends_with("-light") {
+        "light"
+    } else {
+        "dark"
+    }
+}
+
 pub fn load_named(name: &str) -> anyhow::Result<Palette> {
     let name = name.trim();
     let json = THEME_FILES
@@ -408,5 +428,25 @@ mod tests {
     fn light_variant_uses_light_side() {
         let p = load_named("github-light").unwrap();
         assert_eq!(p.appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn appearance_hints_match_loaded_palettes() {
+        assert_eq!(appearance_hint("github-light"), "light");
+        assert_eq!(appearance_hint("dracula"), "dark");
+        assert_eq!(appearance_hint("grokday"), "light");
+        assert_eq!(appearance_hint("groknight"), "dark");
+        for name in list_theme_names() {
+            let hint = appearance_hint(name);
+            assert!(
+                hint == "dark" || hint == "light",
+                "bad hint for {name}: {hint}"
+            );
+            let expected = match load_named(name).unwrap().appearance {
+                Appearance::Dark => "dark",
+                Appearance::Light => "light",
+            };
+            assert_eq!(hint, expected, "hint mismatch for {name}");
+        }
     }
 }

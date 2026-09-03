@@ -82,7 +82,8 @@ pub struct Config {
     pub editor: EditorKind,
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// When true, `j`/`k` count wrapped visual lines. Default on.
+    /// When true, `j`/`k` count wrapped visual lines in source view.
+    /// Preview always wraps; this only affects source view. Default on.
     #[serde(default = "default_wrap")]
     pub wrap_motions: bool,
     /// When true, markdown is not constrained to `COLUMN_PX`. Default off.

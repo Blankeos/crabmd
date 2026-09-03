@@ -286,7 +286,7 @@ Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
 Keys (Helix / Vim normal — one buffer):
   cmd/ctrl-s    save (explicit write; no autosave)
   cmd-shift-p   command palette (theme, editor, full width, source)
-  cmd-k t       theme picker (zed-style chord)
+  cmd-k t       theme picker (zed-style chord; cmd may stay held for t)
   cmd-,         settings
   cmd-f         find
   :w / :write   write from the command-line; :wq writes and quits

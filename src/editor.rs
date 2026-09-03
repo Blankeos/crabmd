@@ -97,7 +97,6 @@ actions!(
         BlockBackspace,
         ToggleSettings,
         OpenPalette,
-        KeyChord,
         OpenCommand,
         OpenSearch,
         SearchBack,
@@ -226,8 +225,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-s", ToggleStrike, Some("Workspace")),
         KeyBinding::new("cmd-shift-p", OpenPalette, Some("Workspace")),
         KeyBinding::new("ctrl-shift-p", OpenPalette, Some("Workspace")),
-        KeyBinding::new("cmd-k", KeyChord, Some("Workspace")),
-        KeyBinding::new("ctrl-k", KeyChord, Some("Workspace")),
         KeyBinding::new("cmd-shift-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("ctrl-shift-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
@@ -313,6 +310,13 @@ enum FontSlot {
     Ui,
     Markdown,
     Buffer,
+}
+
+/// Which field of a font slot a per-field reset button owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FontField {
+    Family,
+    Size,
 }
 
 struct FontInputs {
@@ -501,8 +505,8 @@ pub struct Workspace {
     media_sel: Option<usize>,
     media_alt: Entity<InputState>,
     media_src: Entity<InputState>,
-    /// Zed-style `cmd-k` chord: set by KeyChord, consumed by the next key
-    /// (`t` opens the Themes picker, esc cancels).
+    /// Zed-style `cmd-k` chord: armed by `cmd-k` at capture level, consumed
+    /// by the next key (`t` opens the Themes picker, esc cancels).
     pending_chord: bool,
 }
 
@@ -660,7 +664,8 @@ impl Workspace {
     }
 
     fn wrap_cols(&self) -> Option<usize> {
-        if !self.config.wrap_motions {
+        // Preview always soft-wraps; the toggle only affects source view.
+        if self.view_source && !self.config.wrap_motions {
             return None;
         }
         // Prefer the live column width from the surface when painted so the
@@ -2557,9 +2562,28 @@ impl Workspace {
         self.on_find(FindKind::Backward, window, cx);
     }
     fn on_find_till(&mut self, _: &FindTill, window: &mut Window, cx: &mut Context<Self>) {
+        // `t` doubles as the `cmd-k t` chord follow-up. Keymap dispatch runs
+        // before capture handlers, so in Normal mode this action fires first
+        // (which is why the chord only worked in Notion) — consume the chord
+        // here and stop propagation so capture doesn't see it twice.
+        if self.pending_chord {
+            self.pending_chord = false;
+            window.prevent_default();
+            cx.stop_propagation();
+            self.open_themes_picker(window, cx);
+            return;
+        }
         self.on_find(FindKind::Till, window, cx);
     }
     fn on_find_till_back(&mut self, _: &FindTillBack, window: &mut Window, cx: &mut Context<Self>) {
+        // Same chord race as `t` (covers `cmd-k shift-t`).
+        if self.pending_chord {
+            self.pending_chord = false;
+            window.prevent_default();
+            cx.stop_propagation();
+            self.open_themes_picker(window, cx);
+            return;
+        }
         self.on_find(FindKind::TillBack, window, cx);
     }
     fn commit_find(&mut self, ch: char, window: &mut Window, cx: &mut Context<Self>) {
@@ -2703,35 +2727,57 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reset one font slot (family + size) back to its default.
-    fn reset_font_slot(&mut self, slot: FontSlot, window: &mut Window, cx: &mut Context<Self>) {
+    /// Reset one font field (family or size) back to its default.
+    fn reset_font_field(
+        &mut self,
+        slot: FontSlot,
+        field: FontField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let def = match slot {
             FontSlot::Ui => config::default_ui_font(),
             FontSlot::Markdown => config::default_markdown_font(),
             FontSlot::Buffer => config::default_buffer_font(),
         };
-        let (family, size) = match slot {
-            FontSlot::Ui => {
-                self.config.ui_font = def.clone();
-                (&self.fonts.ui_family, &self.fonts.ui_size)
+        match (slot, field) {
+            (FontSlot::Ui, FontField::Family) => {
+                self.config.ui_font.family = def.family.clone();
+                self.fonts.ui_family.update(cx, |s, cx| {
+                    s.set_value(def.family, window, cx);
+                });
             }
-            FontSlot::Markdown => {
-                self.config.markdown_font = def.clone();
-                (&self.fonts.markdown_family, &self.fonts.markdown_size)
+            (FontSlot::Ui, FontField::Size) => {
+                self.config.ui_font.size = def.size;
+                self.fonts.ui_size.update(cx, |s, cx| {
+                    s.set_value(def.size.to_string(), window, cx);
+                });
             }
-            FontSlot::Buffer => {
-                self.config.buffer_font = def.clone();
-                (&self.fonts.buffer_family, &self.fonts.buffer_size)
+            (FontSlot::Markdown, FontField::Family) => {
+                self.config.markdown_font.family = def.family.clone();
+                self.fonts.markdown_family.update(cx, |s, cx| {
+                    s.set_value(def.family, window, cx);
+                });
             }
-        };
-        let fam = def.family.clone();
-        family.update(cx, |s, cx| {
-            s.set_value(fam, window, cx);
-        });
-        let sz = def.size.to_string();
-        size.update(cx, |s, cx| {
-            s.set_value(sz, window, cx);
-        });
+            (FontSlot::Markdown, FontField::Size) => {
+                self.config.markdown_font.size = def.size;
+                self.fonts.markdown_size.update(cx, |s, cx| {
+                    s.set_value(def.size.to_string(), window, cx);
+                });
+            }
+            (FontSlot::Buffer, FontField::Family) => {
+                self.config.buffer_font.family = def.family.clone();
+                self.fonts.buffer_family.update(cx, |s, cx| {
+                    s.set_value(def.family, window, cx);
+                });
+            }
+            (FontSlot::Buffer, FontField::Size) => {
+                self.config.buffer_font.size = def.size;
+                self.fonts.buffer_size.update(cx, |s, cx| {
+                    s.set_value(def.size.to_string(), window, cx);
+                });
+            }
+        }
         self.persist_config(cx);
         cx.notify();
     }
@@ -2780,28 +2826,12 @@ impl Workspace {
     fn on_open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_palette(window, cx);
     }
-    /// `cmd-k` chord starter (zed-style): the next key decides — `t` opens
-    /// the Themes picker straight away, esc cancels, anything else behaves
-    /// normally. `cmd-shift-p` remains the full command palette.
-    fn on_key_chord(&mut self, _: &KeyChord, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cmd_palette.is_some()
-            || self.command.is_some()
-            || self.search.is_some()
-            || self.link_open
-            || self.view_source
-            || self.settings_open
-        {
-            cx.propagate();
-            return;
-        }
-        if self.overlay_input_focused(window, cx) {
-            cx.propagate();
-            return;
-        }
-        window.prevent_default();
-        self.pending_chord = true;
-        self.status = "cmd-k … (t themes)".into();
-        cx.notify();
+    /// Zed-style `cmd-k t` chord (handled at capture level, before keymap
+    /// dispatch): `cmd-k` arms it, `t` opens the Themes picker straight
+    /// away, esc cancels, anything else behaves normally. `cmd-shift-p`
+    /// remains the full command palette.
+    fn open_themes_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Themes, window, cx);
     }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
@@ -3247,9 +3277,13 @@ impl Workspace {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
 
-        // Zed-style `cmd-k` chord starter at capture level (not just the
-        // action binding): `cmd-k` then `t` opens Themes. Capture runs
-        // before key-context dispatch, so the chord works in every mode.
+        // Zed-style `cmd-k` chord starter at capture level (GPUI keymap
+        // dispatch proved unreliable for this chord, so it is handled
+        // manually here): `cmd-k` then `t` opens Themes. Note capture runs
+        // *after* keymap dispatch, so the `t` follow-up races the Normal-mode
+        // `t` (till) binding — `on_find_till`/`on_find_till_back` consume a
+        // pending chord first (see below); this capture path covers
+        // Notion/insert where `t` has no binding.
         if (key == "k" || key == "K")
             && (mods.platform || mods.control)
             && !mods.shift
@@ -3270,8 +3304,10 @@ impl Workspace {
             return true;
         }
 
-        // Zed-style `cmd-k` chord: `t` opens Themes, esc cancels (handled
-        // by LeaveInsert), anything else falls through to normal handling.
+        // Chord follow-up: `t` opens Themes (plain or with cmd/ctrl still
+        // held, so `cmd-k t` and `cmd-k cmd-t` both work), esc cancels
+        // (handled by LeaveInsert), anything else falls through to normal
+        // handling.
         if self.pending_chord {
             self.pending_chord = false;
             let clean = self.command.is_none()
@@ -3280,15 +3316,9 @@ impl Workspace {
                 && !self.link_open
                 && !self.view_source
                 && !self.settings_open;
-            if clean
-                && key == "t"
-                && !mods.control
-                && !mods.platform
-                && !mods.alt
-                && !mods.shift
-            {
+            if clean && key.eq_ignore_ascii_case("t") && !mods.alt {
                 window.prevent_default();
-                self.open_palette(PaletteMode::Themes, window, cx);
+                self.open_themes_picker(window, cx);
                 return true;
             }
             self.status = if self.dirty { "unsaved" } else { "ready" }.into();
@@ -3809,7 +3839,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::NORMAL)
                             .text_color(p.markdown_text)
                             .child(file_name),
                     )
@@ -3833,7 +3863,7 @@ impl Workspace {
                 .id(("settings-nav", which as usize))
                 .w_full()
                 .px_3()
-                .py_2()
+                .py_1()
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(active, |el| el.bg(p.background_element))
@@ -3938,21 +3968,21 @@ impl Workspace {
                         v_flex()
                             .gap_2()
                             .child(card(
-                                "zap",
+                                "helix",
                                 "Helix",
                                 "x select line · d delete · v select · u undo · U redo",
                                 EditorKind::Helix,
                                 cx,
                             ))
                             .child(card(
-                                "command",
+                                "vim",
                                 "Vim",
                                 "x delete char · dd line · v/V visual · u undo · ctrl-r redo",
                                 EditorKind::Vim,
                                 cx,
                             ))
                             .child(card(
-                                "type",
+                                "notion",
                                 "Notion",
                                 "Rendered blocks; edit visible text. j/k move between blocks.",
                                 EditorKind::Notion,
@@ -3973,7 +4003,7 @@ impl Workspace {
                         div()
                             .text_xs()
                             .text_color(p.text_muted)
-                            .child("When on, j/k count wrapped visual lines and the surface wraps. Off: logical lines."),
+                            .child("Preview always wraps. This only affects the Markdown source view: on follows wrapped visual lines with j/k, off uses logical lines."),
                     )
                     .child(
                         Switch::new("full-width")
@@ -4047,7 +4077,8 @@ impl Workspace {
                            size: &Entity<InputState>,
                            hint: &'static str,
                            slot: FontSlot,
-                           customized: bool,
+                           fam_custom: bool,
+                           size_custom: bool,
                            p: &crate::theme::Palette,
                            cx: &mut Context<Self>| {
                     v_flex()
@@ -4076,11 +4107,12 @@ impl Workspace {
                                         // owns the input's right corner.
                                         .child(Input::new(family).cleanable(false))
                                         // Per-field reset on the family input
-                                        // too (same slot reset, tiny icon).
-                                        .when(customized, |el| {
+                                        // (shows only when family differs).
+                                        .when(fam_custom, |el| {
                                             el.child(reset_btn(
                                                 ("font-reset-fam", slot as usize),
                                                 slot,
+                                                FontField::Family,
                                                 p,
                                                 cx,
                                             ))
@@ -4092,11 +4124,13 @@ impl Workspace {
                                         .relative()
                                         .child(Input::new(size).cleanable(false))
                                         // Per-field reset: tiny circular arrow
-                                        // inside the size input when customized.
-                                        .when(customized, |el| {
+                                        // inside the size input (shows only
+                                        // when the size differs).
+                                        .when(size_custom, |el| {
                                             el.child(reset_btn(
                                                 ("font-reset", slot as usize),
                                                 slot,
+                                                FontField::Size,
                                                 p,
                                                 cx,
                                             ))
@@ -4105,12 +4139,9 @@ impl Workspace {
                         )
                 };
                 let p = &self.palette;
-                let ui_custom =
-                    self.config.ui_font != config::default_ui_font();
-                let md_custom =
-                    self.config.markdown_font != config::default_markdown_font();
-                let buf_custom =
-                    self.config.buffer_font != config::default_buffer_font();
+                let ui_def = config::default_ui_font();
+                let md_def = config::default_markdown_font();
+                let buf_def = config::default_buffer_font();
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -4133,7 +4164,8 @@ impl Workspace {
                         &self.fonts.ui_size,
                         "Titlebar, footer, settings",
                         FontSlot::Ui,
-                        ui_custom,
+                        self.config.ui_font.family != ui_def.family,
+                        self.config.ui_font.size != ui_def.size,
                         p,
                         cx,
                     ))
@@ -4143,7 +4175,8 @@ impl Workspace {
                         &self.fonts.markdown_size,
                         "Paragraphs, headings, lists, quotes",
                         FontSlot::Markdown,
-                        md_custom,
+                        self.config.markdown_font.family != md_def.family,
+                        self.config.markdown_font.size != md_def.size,
                         p,
                         cx,
                     ))
@@ -4153,7 +4186,8 @@ impl Workspace {
                         &self.fonts.buffer_size,
                         "Fenced code blocks",
                         FontSlot::Buffer,
-                        buf_custom,
+                        self.config.buffer_font.family != buf_def.family,
+                        self.config.buffer_font.size != buf_def.size,
                         p,
                         cx,
                     ))
@@ -4280,10 +4314,6 @@ impl Workspace {
             PaletteMode::Themes => "Themes",
             PaletteMode::Editors => "Editor",
         };
-        let hint = match mode {
-            PaletteMode::Root => "cmd-shift-p",
-            PaletteMode::Themes | PaletteMode::Editors => "esc back",
-        };
 
         div()
             .id("palette-overlay")
@@ -4334,8 +4364,7 @@ impl Workspace {
                                     .text_color(p.text_muted)
                                     .child(title),
                             )
-                            .child(div().flex_1())
-                            .child(div().text_xs().text_color(p.text_muted).child(hint)),
+                            .child(div().flex_1()),
                     )
                     .child(
                         h_flex()
@@ -4346,13 +4375,6 @@ impl Workspace {
                             .gap_2()
                             .border_b_1()
                             .border_color(p.border)
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(p.primary)
-                                    .child(">"),
-                            )
                             .child(div().flex_1().text_sm().child(
                                 if query_empty {
                                     div()
@@ -4432,11 +4454,7 @@ impl Workspace {
                                                         div()
                                                             .flex_1()
                                                             .text_sm()
-                                                            .font_weight(if active {
-                                                                FontWeight::SEMIBOLD
-                                                            } else {
-                                                                FontWeight::NORMAL
-                                                            })
+                                                            .font_weight(FontWeight::NORMAL)
                                                             .text_color(if active {
                                                                 p.primary
                                                             } else {
@@ -4568,7 +4586,8 @@ impl Workspace {
     fn render_block(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let wrap = self.config.wrap_motions;
+        // Preview always wraps; "Wrap lines" only affects source view.
+        let wrap = true;
         let block = p.blocks[ix].clone();
         let text = p
             .display
@@ -5012,7 +5031,8 @@ impl Workspace {
     ) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let wrap = self.config.wrap_motions;
+        // Preview always wraps; "Wrap lines" only affects source view.
+        let wrap = true;
         v_flex()
             .w_full()
             .min_w_0()
@@ -5081,7 +5101,8 @@ impl Workspace {
     fn render_table_block(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let wrap = self.config.wrap_motions;
+        // Preview always wraps; "Wrap lines" only affects source view.
+        let wrap = true;
         let caret = self.caret;
         let table_sel = self.table_sel;
         let dragging = self.mouse_dragging;
@@ -5867,6 +5888,8 @@ impl Workspace {
             self.config.buffer_font.family.clone(),
         ));
         let font_px = Some(self.buffer_font_px());
+        // Source view honors the "Wrap lines" toggle (preview always wraps).
+        let src_wrap = self.config.wrap_motions;
         let body = surface::edit_text(
             view,
             focus,
@@ -5876,7 +5899,7 @@ impl Workspace {
             hs,
             None,
             false,
-            true,
+            src_wrap,
             false,
             &pal,
             Some(""),
@@ -6217,7 +6240,8 @@ impl Workspace {
     ) -> AnyElement {
         let p = self.proj();
         let pal = self.palette.clone();
-        let wrap = self.config.wrap_motions;
+        // Preview always wraps; "Wrap lines" only affects source view.
+        let wrap = true;
         let block = p.blocks[block_ix].clone();
         let BlockExtra::List { items, ordered } = &block.extra else {
             return div().into_any_element();
@@ -6772,11 +6796,12 @@ fn icon_el_px(name: &str, color: gpui::Hsla, size: gpui::Pixels) -> Icon {
         .h(size)
 }
 
-/// Tiny slot-reset button overlaying an input's right corner (fonts).
-/// `id` must be unique per input; clicking resets the whole font slot.
+/// Tiny per-field reset button overlaying an input's right corner (fonts).
+/// `id` must be unique per input; clicking resets just that field.
 fn reset_btn(
     id: (&'static str, usize),
     slot: FontSlot,
+    field: FontField,
     p: &crate::theme::Palette,
     cx: &mut gpui::Context<Workspace>,
 ) -> gpui::AnyElement {
@@ -6794,7 +6819,7 @@ fn reset_btn(
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.reset_font_slot(slot, window, cx);
+                this.reset_font_field(slot, field, window, cx);
             }),
         )
         .into_any_element()
@@ -7177,7 +7202,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_block_backspace))
             .on_action(cx.listener(Self::on_toggle_settings))
             .on_action(cx.listener(Self::on_open_palette))
-            .on_action(cx.listener(Self::on_key_chord))
             .on_action(cx.listener(Self::on_open_command))
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_search_back))
