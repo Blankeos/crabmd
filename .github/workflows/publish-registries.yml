@@ -29,7 +29,6 @@ jobs:
         with:
           ref: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
           fetch-depth: 0
-          persist-credentials: false
       - name: Verify release tag and package versions
         id: release
         env:
@@ -45,10 +44,7 @@ jobs:
             exit 1
           fi
 
-          # checkout uses persist-credentials: false, so this fetch is
-          # anonymous by default and fails with "could not read Username"
-          # — re-auth it with the job's GITHUB_TOKEN.
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${GH_TOKEN}" fetch --no-tags origin main
+          git fetch --no-tags origin main
           release_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
 
           if ! git merge-base --is-ancestor "$release_commit" origin/main; then
