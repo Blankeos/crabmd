@@ -1058,7 +1058,8 @@ impl Doc {
         let loc = self.loc(caret);
         let node = self.nodes.get_mut(loc.node)?;
         if let NodeKind::Html { raw } = &mut node.kind {
-            *raw = replace_video_src(raw, &src)?;
+            *raw = replace_video_src(raw, &src)
+                .or_else(|| replace_first_attr(raw, &["src", "href"], &src))?;
             return Some(self.caret_after(loc.node, None, None, 0));
         }
         None
@@ -3420,7 +3421,8 @@ mod tests {
 
 /// Splice a new `src` attribute value into an HTML `<video>` tag.
 /// Returns None when no `src=` attribute is found.
-fn replace_video_src(raw: &str, src: &str) -> Option<String> {    let lower = raw.to_ascii_lowercase();
+fn replace_video_src(raw: &str, src: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
     let tag = lower.find("<video")?;
     let rest_start = tag;
     let rest_lower = &lower[rest_start..];
@@ -3446,6 +3448,54 @@ fn replace_video_src(raw: &str, src: &str) -> Option<String> {    let lower = ra
         out.replace_range(base..base + end_rel, src);
         Some(out)
     }
+}
+
+/// Replace the first `src=` (or `href=`) attribute anywhere in `raw` so
+/// generic HTML blocks (`<iframe>`, `<embed>`, `<source>`…) can have their
+/// URL edited from the handle toolbar.
+fn replace_first_attr(raw: &str, names: &[&str], src: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let mut best_span: Option<(usize, usize, usize)> = None;
+    for name in names {
+        let mut search = lower.as_str();
+        let mut offset = 0usize;
+        while let Some(ix) = search.find(*name) {
+            let abs = offset + ix;
+            let before = raw[..abs].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                search = &search[ix + name.len()..];
+                offset = abs + name.len();
+                continue;
+            }
+            let after = raw[abs + name.len()..].trim_start();
+            let Some(eq) = after.strip_prefix('=') else {
+                search = &search[ix + name.len()..];
+                offset = abs + name.len();
+                continue;
+            };
+            let after = eq.trim_start();
+            let base = abs + (raw[abs..].len() - after.len());
+            let quote = after.as_bytes().first()?;
+            let (start, end) = if *quote == b'"' || *quote == b'\'' {
+                let q = *quote as char;
+                let end_rel = after[1..].find(q)?;
+                (base + 1, base + 1 + end_rel)
+            } else {
+                let end_rel = after
+                    .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                    .unwrap_or(after.len());
+                (base, base + end_rel)
+            };
+            if best_span.is_none_or(|(pos, _, _)| abs < pos) {
+                best_span = Some((abs, start, end));
+            }
+            break;
+        }
+    }
+    let (_, start, end) = best_span?;
+    let mut out = raw.to_string();
+    out.replace_range(start..end, src);
+    Some(out)
 }
 
 #[cfg(test)]

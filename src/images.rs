@@ -193,6 +193,72 @@ pub fn resolve_beside(md_path: &Path, src: &str) -> PathBuf {
     }
 }
 
+/// `1536` → `1.5 KB` for video/image meta lines.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{} {}", bytes, UNITS[u])
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Best-effort tag name of a raw HTML block (`<video …>` → `video`).
+pub fn html_tag(raw: &str) -> Option<String> {
+    let t = raw.trim_start();
+    let t = t.strip_prefix('<')?;
+    let t = t.trim_start_matches('/');
+    let end = t
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(t.len());
+    let tag = t[..end].to_ascii_lowercase();
+    (!tag.is_empty()).then(|| tag)
+}
+
+/// Generic `src`/`href` of any HTML block (video, iframe, embed, source…).
+pub fn parse_html_src(raw: &str) -> Option<String> {
+    parse_video_src(raw).or_else(|| {
+        parse_img_src(raw)
+            .map(|(s, _)| s)
+            .or_else(|| tag_attr_pub(raw, "src").or_else(|| tag_attr_pub(raw, "href")))
+    })
+}
+
+/// `attr="v"` inside any tag in `raw` (public sibling of `tag_attr`).
+pub fn tag_attr_pub(raw: &str, name: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    let mut offset = 0usize;
+    loop {
+        let ix = search.find(name)?;
+        let abs = offset + ix;
+        let before = raw[..abs].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            search = &search[ix + name.len()..];
+            offset = abs + name.len();
+            continue;
+        }
+        let after = raw[abs + name.len()..].trim_start();
+        let after = after.strip_prefix('=')?.trim_start();
+        let quote = after.as_bytes().first()?;
+        if *quote == b'"' || *quote == b'\'' {
+            let end = after[1..].find(*quote as char)?;
+            return Some(after[1..1 + end].to_string());
+        }
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        let v = after[..end].trim();
+        return (!v.is_empty()).then(|| v.to_string());
+    }
+}
+
 #[allow(dead_code)]
 pub fn ext_from_mime_or_name(hint: &str) -> &'static str {
     let h = hint.to_ascii_lowercase();

@@ -10,7 +10,7 @@ use gpui::{
     DragMoveEvent, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseUpEvent, ParentElement as _, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
+    SharedUri, StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -31,6 +31,7 @@ use crate::document::{
     alert_icon_name, extract_links, parse_ranges, take_bare_url, BlockKind, PaintRange,
 };
 use crate::images;
+use crate::mermaid::{self, MermaidStore};
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
     after_caret_same_line, apply_motion, block_caret_range, extend_visual_line, find_char,
@@ -547,6 +548,9 @@ pub struct Workspace {
     /// Theme before the palette opened. Hover/arrows preview without
     /// persisting; esc / dismiss restores this, enter / click commits.
     palette_theme_backup: Option<String>,
+    /// Live Mermaid diagrams, keyed by block source. Themed at render time,
+    /// so a theme switch clears the cache.
+    mermaid: MermaidStore,
 }
 
 impl Workspace {
@@ -639,6 +643,7 @@ impl Workspace {
             media_src,
             pending_chord: false,
             palette_theme_backup: None,
+            mermaid: MermaidStore::default(),
         };
 
         if let Some((line, col)) = initial {
@@ -3202,6 +3207,7 @@ impl Workspace {
             Ok(palette) => {
                 apply_palette(&palette, cx);
                 self.palette = palette;
+                self.mermaid.clear();
                 self.config.theme = name.to_string();
                 window.refresh();
             }
@@ -3294,6 +3300,7 @@ impl Workspace {
             Ok(palette) => {
                 apply_palette(&palette, cx);
                 self.palette = palette;
+                self.mermaid.clear();
                 self.config.theme = name.to_string();
                 let label = name.to_string();
                 self.theme_input.update(cx, |s, cx| {
@@ -3359,7 +3366,11 @@ impl Workspace {
                 BlockExtra::Html => self
                     .source
                     .get(b.source.clone())
-                    .and_then(images::parse_video_src)
+                    .and_then(|raw| {
+                        images::parse_video_src(raw)
+                            .or_else(|| images::parse_html_src(raw))
+                            .or_else(|| images::parse_img_src(raw).map(|(s, _)| s))
+                    })
                     .map(|src| (String::new(), src)),
                 _ => None,
             })
@@ -5022,42 +5033,7 @@ impl Workspace {
                     .text_size(self.buffer_font_px())
                     .text_color(pal.markdown_code_block)
                     .child(self.render_lang_chip(lang, caret, cx))
-                    .when(mermaid, |el| {
-                        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
-                        el.child(
-                            h_flex()
-                                .w_full()
-                                .p_3()
-                                .gap_2()
-                                .items_center()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(pal.border)
-                                .bg(pal.background_panel)
-                                .child(icon_el("diagram", pal.primary))
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(pal.markdown_text)
-                                                .child("Mermaid diagram"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(pal.text_muted)
-                                                .child(format!(
-                                                    "{lines} line{} — live preview coming; edit the source below",
-                                                    if lines == 1 { "" } else { "s" }
-                                                )),
-                                        ),
-                                ),
-                        )
-                    })
+                    .when(mermaid, |el| el.child(self.render_mermaid(&text, cx)))
                     .child(body)
                     .into_any_element()
             }
@@ -5114,16 +5090,33 @@ impl Workspace {
             BlockExtra::Text | BlockExtra::Html => {
                 // HTML media blocks render with the same attachment UI as
                 // markdown images: `<video src=…>` as a video card,
-                // `<img src=…>` (e.g. `<p><img width="100%" …></p>`) as an
-                // image when the file resolves locally, else a remote card.
-                if let BlockExtra::Html = &block.extra {
-                    if let Some(raw) = self.source.get(block.source.clone()) {
-                        if let Some(src) = images::parse_video_src(raw) {
+                // `<img src=…>` as an image, anything else as an HTML card
+                // whose handle click primes the src editor.
+                // NOTE: pulldown-cmark only emits `HtmlBlock` for block-level
+                // tags — a lone `<video>` line often arrives as a Paragraph
+                // with inline HTML, which used to show as raw text. So scan
+                // the raw source for media tags regardless of the extra.
+                if let Some(raw) = self.source.get(block.source.clone()) {
+                    if images::parse_video_src(raw).is_some() || is_bare_video(raw) {
+                        if let Some(src) =
+                            images::parse_video_src(raw).or_else(|| images::parse_html_src(raw))
+                        {
                             return self.render_video_hit("", &src, block.display.start, cx);
                         }
-                        if let Some((src, alt)) = images::parse_img_src(raw) {
+                    }
+                    if let Some((src, alt)) = images::parse_img_src(raw) {
+                        // Only hijack Text blocks when the whole block is just
+                        // the image tag (else inline `<img>` inside prose keeps
+                        // its text rendering).
+                        let t = raw.trim();
+                        if matches!(&block.extra, BlockExtra::Html)
+                            || (t.starts_with('<') && t.contains("<img"))
+                        {
                             return self.render_image_hit(&alt, &src, block.display.start, cx);
                         }
+                    }
+                    if matches!(&block.extra, BlockExtra::Html) {
+                        return self.render_html_block(raw, block.display.start, cx);
                     }
                 }
                 let mut el = v_flex().relative().w_full().min_w_0().child(body);
@@ -5160,11 +5153,10 @@ impl Workspace {
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         let remote = !path.exists() && images::is_remote_src(src);
+        let missing = !path.exists() && !remote;
         let selected = self.media_sel == Some(display_start);
-        let name = Path::new(src)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(src);
+        let alt_owned = alt.to_string();
+        let src_owned = src.to_string();
         v_flex()
             .w_full()
             .min_w_0()
@@ -5200,64 +5192,135 @@ impl Workspace {
                 )
             })
             .when(remote, |el| {
+                // Remote `http(s)` photos load through GPUI's asset pipeline
+                // (`SharedUri` → http_client download + cache). `min_h` keeps
+                // a visible slot while the fetch is in flight; the caption
+                // keeps the URL visible even if the host blocks the fetch.
+                let uri: SharedUri = src.to_string().into();
+                el.child(
+                    img(uri)
+                        .max_w_full()
+                        .max_h(px(480.))
+                        .min_h(px(120.))
+                        .rounded(px(6.)),
+                )
+            })
+            .when(missing, |el| {
                 el.child(
                     h_flex()
                         .w_full()
-                        .p_4()
-                        .gap_3()
+                        .p_3()
+                        .gap_2()
                         .items_center()
-                        .rounded(px(8.))
+                        .rounded(px(6.))
                         .border_1()
-                        .border_color(if selected { pal.primary } else { pal.border })
-                        .bg(pal.background_element.opacity(0.5))
-                        .child(icon_el(
-                            "image",
-                            if selected { pal.primary } else { pal.text_muted },
-                        ))
+                        .border_color(pal.warning)
+                        .bg(pal.background_panel)
+                        .child(icon_el("image", pal.warning))
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
+                            v_flex().flex_1().min_w_0()
                                 .child(
-                                    div()
-                                        .text_sm()
+                                    div().text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(pal.markdown_text)
-                                        .child(name.to_string()),
+                                        .child("Missing image"),
                                 )
                                 .child(
-                                    div()
-                                        .text_xs()
+                                    div().text_xs()
                                         .text_color(pal.text_muted)
-                                        .child(format!("remote image — {src}")),
+                                        .child(format!("{src} — not found beside this file")),
                                 ),
                         ),
                 )
             })
-            .when(!path.exists() && !remote, |el| {
-                el.child(
-                    div()
-                        .text_color(pal.text_muted)
-                        .child(format!("missing image: {src}")),
-                )
-            })
-            .when(!alt.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(pal.text_muted)
-                        .child(alt.to_string()),
-                )
-            })
+            // Knob bar: always-visible alt/url readout + Edit + Open, so a
+            // photo's URL/alt are one click away without guessing select.
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(pal.text_muted)
+                            .child(if alt.is_empty() {
+                                src.to_string()
+                            } else {
+                                format!("{alt} · {src}")
+                            }),
+                    )
+                    .when(remote, |el| {
+                        el.child(
+                            Button::new(("img-open", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label("Open")
+                                .on_click({
+                                    let url = src_owned.clone();
+                                    cx.listener(move |_, _, _, cx| {
+                                        cx.open_url(&url);
+                                    })
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::new(("img-edit", display_start))
+                            .ghost()
+                            .xsmall()
+                            .label(if selected { "Editing…" } else { "Edit" })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_media_knob(
+                                    display_start,
+                                    alt_owned.clone(),
+                                    src_owned.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
             .when(selected, |el| {
                 el.child(self.render_media_toolbar(true, display_start, cx))
             })
             .into_any_element()
     }
 
-    /// GitHub-style video (`![alt](clip.mp4)` or `<video src=…>`): a
-    /// placeholder box with the same click-to-edit toolbar as images.
+    /// Prime the Alt + Path toolbar for an image without going through
+    /// click-hit-testing (used by the always-visible Edit knob).
+    fn select_media_knob(
+        &mut self,
+        display_start: usize,
+        alt: String,
+        src: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.media_sel = Some(display_start);
+        self.caret = display_start;
+        self.sel = None;
+        self.mouse_dragging = false;
+        self.clamp_caret();
+        self.follow_caret = false;
+        self.media_alt.update(cx, |st, cx| {
+            st.set_value(alt, window, cx);
+        });
+        self.media_src.update(cx, |st, cx| {
+            st.set_value(src, window, cx);
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// GitHub-style video (`![alt](clip.mp4)` or `<video src=…>`).
+    /// Deliberately NOT `gpui-video-player`: that crate needs a system
+    /// GStreamer install, spawns a thread + playbin pipeline per video, and
+    /// assumes tight NV12 layouts — too static/inflexible inside a scrolling
+    /// doc and hostile to a self-contained bundle. Instead the card shows
+    /// file meta and `Play` opens the system player (or browser for remote),
+    /// with the same click-to-edit toolbar as images.
     fn render_video_hit(
         &self,
         alt: &str,
@@ -5269,21 +5332,32 @@ impl Workspace {
         let path = images::resolve_beside(&self.path, src);
         let selected = self.media_sel == Some(display_start);
         let remote = !path.exists() && images::is_remote_src(src);
+        let playable = path.exists() || remote;
         let name = Path::new(src)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(src);
+        let meta = if path.exists() {
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            format!("{} · {}", name, crate::images::human_size(bytes))
+        } else {
+            name.to_string()
+        };
         let caption = if alt.is_empty() {
-            if path.exists() || remote {
-                name.to_string()
+            if playable {
+                meta.clone()
             } else {
                 format!("missing video: {src}")
             }
-        } else if path.exists() || remote {
-            format!("{name} · {alt}")
+        } else if playable {
+            format!("{meta} · {alt}")
         } else {
             format!("missing video: {src}")
         };
+        let src_owned = src.to_string();
+        let path_owned = path.clone();
+        let alt_owned = alt.to_string();
+        let missing = !playable;
         v_flex()
             .w_full()
             .min_w_0()
@@ -5328,20 +5402,149 @@ impl Workspace {
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(pal.markdown_text)
-                                    .child("Video"),
+                                    .child(if missing {
+                                        "Missing video"
+                                    } else if remote {
+                                        "Video · remote"
+                                    } else {
+                                        "Video"
+                                    }),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(pal.text_muted)
-                                    .child(caption),
+                                    .child(if missing {
+                                        format!("{src} — not found beside this file; edit the path below")
+                                    } else {
+                                        caption
+                                    }),
                             ),
+                    )
+                    .when(playable, |el| {
+                        el.child(
+                            Button::new(("video-play", display_start))
+                                .xsmall()
+                                .label("Play")
+                                .on_click({
+                                    let src = src_owned.clone();
+                                    let path = path_owned.clone();
+                                    cx.listener(move |_, _, _, cx| {
+                                        open_video_src(&src, &path, cx);
+                                    })
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::new(("video-edit", display_start))
+                            .ghost()
+                            .xsmall()
+                            .label(if selected { "Editing…" } else { "Edit" })
+                            .on_click({
+                                let src = src_owned.clone();
+                                let alt = alt_owned.clone();
+                                cx.listener(move |this, _, window, cx| {
+                                    this.select_media_knob(
+                                        display_start,
+                                        alt.clone(),
+                                        src.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                            }),
                     ),
             )
             .when(selected, |el| {
                 el.child(self.render_media_toolbar(false, display_start, cx))
             })
             .into_any_element()
+    }
+
+    /// Generic HTML blocks (`<iframe>`, `<details>`, raw `<div>`…): a small
+    /// card with the tag name, a one-line source preview, and a draggable
+    /// handle. Clicking the handle selects the block and loads its `src`
+    /// (when it has one) into the path toolbar so it can be edited in place.
+    fn render_html_block(&self, raw: &str, display_start: usize, cx: &mut Context<Self>) -> AnyElement {
+        let pal = &self.palette;
+        let selected = self.media_sel == Some(display_start);
+        let tag = images::html_tag(raw).unwrap_or_else(|| "html".to_string());
+        let src = images::parse_html_src(raw).unwrap_or_default();
+        let preview = raw.lines().next().unwrap_or("").trim().chars().take(88).collect::<String>();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, {
+                let view = cx.entity();
+                let src = src.clone();
+                move |ev: &MouseDownEvent, window, cx| {
+                    view.update(cx, |this, cx| {
+                        // Handle click: select + prime the src editor.
+                        this.select_html(display_start, src.clone(), window, cx);
+                        let _ = ev;
+                    });
+                }
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_3()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(if selected { pal.primary } else { pal.border })
+                    .bg(pal.background_panel)
+                    .child(icon_el("code", if selected { pal.primary } else { pal.text_muted }))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(pal.markdown_text)
+                                    .child(format!("<{tag}> HTML")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(pal.text_muted)
+                                    .child(if preview.is_empty() { "empty block — click to edit".to_string() } else { preview }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.text_muted)
+                            .child("⠿"),
+                    ),
+            )
+            .when(selected, |el| {
+                el.child(self.render_media_toolbar(false, display_start, cx))
+            })
+            .into_any_element()
+    }
+
+    /// Select an HTML block from its handle and prime the toolbar inputs.
+    fn select_html(&mut self, display_start: usize, src: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.media_sel = Some(display_start);
+        self.caret = display_start;
+        self.sel = None;
+        self.mouse_dragging = false;
+        self.clamp_caret();
+        self.follow_caret = false;
+        self.media_alt.update(cx, |st, cx| {
+            st.set_value(String::new(), window, cx);
+        });
+        self.media_src.update(cx, |st, cx| {
+            st.set_value(src, window, cx);
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     /// Alt + path toolbar under a selected image/video. Clicks inside stop
@@ -5405,6 +5608,95 @@ impl Workspace {
                                 this.apply_media_edit(window, cx);
                             })),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// Live Mermaid preview above the editable source: ready diagram as an
+    /// image, error card with the message, or a "Rendering…" placeholder
+    /// while the off-thread render runs. Mirrors `zorite`'s `MermaidStore`.
+    fn render_mermaid(&mut self, source: &str, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.palette.clone();
+        let key: SharedString = source.to_string().into();
+        if let Some((image, w, h)) = self.mermaid.get(&key) {
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .p_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(pal.border)
+                .bg(pal.background_panel)
+                .child(
+                    img(image)
+                        .w(px(w.clamp(40.0, 1200.0)))
+                        .h(px(h.clamp(20.0, 900.0))),
+                )
+                .into_any_element();
+        }
+        if let Some(err) = self.mermaid.error(&key) {
+            let first = err.lines().next().unwrap_or("render failed").to_string();
+            return h_flex()
+                .w_full()
+                .p_3()
+                .gap_2()
+                .items_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(pal.error)
+                .bg(pal.background_panel)
+                .child(icon_el("diagram", pal.error))
+                .child(
+                    v_flex().flex_1().min_w_0()
+                        .child(
+                            div().text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(pal.markdown_text)
+                                .child("Mermaid — could not render"),
+                        )
+                        .child(
+                            div().text_xs()
+                                .text_color(pal.text_muted)
+                                .child(format!("{first} — edit the source below")),
+                        ),
+                )
+                .into_any_element();
+        }
+        // Kick off the off-thread render at most once per source text.
+        if self.mermaid.begin(key.clone()) {
+            let src = source.to_string();
+            let theme = mermaid::theme_for(&pal);
+            let view = cx.entity();
+            cx.spawn(async move |_weak, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        let svg = gpui::SvgRenderer::new(std::sync::Arc::new(
+                            crate::assets::Assets,
+                        ));
+                        mermaid::render_to_image(&src, theme, &svg, mermaid::RASTER_SCALE)
+                    })
+                    .await;
+                let _ = cx.update(|cx| {
+                    view.update(cx, |this, cx| {
+                        this.mermaid.finish(key, result);
+                        cx.notify();
+                    })
+                });
+            })
+            .detach();
+        }
+        h_flex()
+            .w_full()
+            .p_3()
+            .gap_2()
+            .items_center()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.background_panel)
+            .child(icon_el("diagram", pal.text_muted))
+            .child(
+                div().text_xs().text_color(pal.text_muted).child("Rendering diagram…"),
             )
             .into_any_element()
     }
@@ -7827,6 +8119,34 @@ pub fn window_title(path: &Path, dirty: bool) -> String {
     } else {
         format!("{name} — crabmd")
     }
+}
+
+/// True when `raw` is a bare `<video …>` line (any attributes): pulldown
+/// often files these as Paragraph inline-HTML rather than an HtmlBlock.
+fn is_bare_video(raw: &str) -> bool {
+    raw.trim_start().to_ascii_lowercase().starts_with("<video")
+}
+
+/// Open a video `src` in the system player: remote URLs via the OS opener,
+/// local files via `open`/`xdg-open`/explorer so no GStreamer bundle is
+/// needed. Failures land in `status` instead of silently doing nothing.
+fn open_video_src(src: &str, path: &std::path::Path, cx: &mut App) {
+    if crate::images::is_remote_src(src) {
+        cx.open_url(src);
+        return;
+    }
+    if !path.exists() {
+        return;
+    }
+    let s = path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&s).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &s])
+        .spawn();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let _ = std::process::Command::new("xdg-open").arg(&s).spawn();
 }
 
 pub fn apply_palette(palette: &Palette, cx: &mut App) {

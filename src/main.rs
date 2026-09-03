@@ -5,6 +5,7 @@ mod display;
 mod document;
 mod editor;
 mod images;
+mod mermaid;
 mod mode;
 mod motion;
 mod notion;
@@ -135,6 +136,13 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initi
         .run(move |cx| {
             gpui_component::init(cx);
             bind_keys(cx);
+            // Remote `http(s)` images (`img(SharedUri)`) download through
+            // this client — without it GPUI uses a null client and every
+            // remote photo silently never loads (same setup as GPUI's own
+            // image example).
+            if let Ok(client) = reqwest_client::ReqwestClient::user_agent("crabmd") {
+                cx.set_http_client(std::sync::Arc::new(client));
+            }
             crate::assets::apply_dock_icon();
             crate::editor::apply_palette(&palette, cx);
 

@@ -38,4 +38,8 @@
 - [x] Mermaid: ` ```mermaid ` blocks get a preview card (icon + line count, "live preview coming") above the still-editable source
 - [x] HTML: `<img src>` blocks (incl. `<p><img width=…>`) render local files as images; remote http(s) images get a remote card instead of "missing"; remote videos no longer say "missing"
 - [x] Crosslinks: `other.md` / `./sub.md#anchor` / `#anchor` cmd-click or chip-click navigates in place (dirty guard, missing-file status); kitchen sink expanded (lists, tasks, alerts, table, code, mermaid, media, html img, crosslinks) + sink-partner.md backlink target
-
+- [x] Mermaid live preview: pure-Rust `mermaid-rs-renderer` (Zed's crate, no JS) → SVG → GPUI `SvgRenderer` → `RenderImage`, off-thread + cached by source, themed from live palette (cleared on theme switch), error card falls back to source below
+- [x] Media: remote `http(s)` photos load via GPUI `SharedUri` asset pipeline (not a placeholder card); video is a lightweight card (no GStreamer dep — `gpui-video-player` needs system GStreamer + per-video thread/playbin, too static for a scrolling doc/bundle) with size meta + `Play` opening the system player/browser; generic HTML blocks get a `<tag>` card whose ⠿ handle click selects + primes the src toolbar (`src`/`href` rewrite via tree op)
+- [x] Media fixes: `ReqwestClient` wired as GPUI http client (without it the default null client fails every remote fetch — root cause of photos never rendering); bare `<video>` lines filed as Paragraph inline-HTML now detected via `is_bare_video` instead of showing raw tags; images get an always-visible knob bar (alt·url + Open + Edit priming the Alt/Path toolbar), videos get Missing/remote states with Edit knob; kitchen sink remote photo uses the tenor isagi URL
+- [ ] add tabs so when I click between different markdowns, I see it. Or if I open different markdown files with the cli.
+  - [ ] give me cmd+w to close tabs and cmd-shift-t to reopen closed tabs
