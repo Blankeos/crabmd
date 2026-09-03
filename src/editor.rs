@@ -129,9 +129,31 @@ actions!(
         CopySelection,
         PasteClipboard,
         SelectAll,
+        IndentShift,
+        DedentShift,
+        AutoIndent,
+        ChangeOp,
+        MatchObject,
         QuitApp,
     ]
 );
+
+/// `>` / `<` / `=` operator kind for `indent_key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndentOpKind {
+    Indent,
+    Dedent,
+    Auto,
+}
+
+/// Text-object operator for `pending_obj`: Vim `v`/`d`/`c` + `i`/`a`, or
+/// Helix `m` + `i`/`a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjOp {
+    Select,
+    Delete,
+    Change,
+}
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -235,6 +257,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-v", PasteClipboard, Some("Workspace")),
         KeyBinding::new("cmd-a", SelectAll, Some("Workspace")),
         KeyBinding::new("ctrl-a", SelectAll, Some("Workspace")),
+        KeyBinding::new("%", SelectAll, Some("Helix && Normal")),
+        KeyBinding::new(">", IndentShift, Some("Normal")),
+        KeyBinding::new("<", DedentShift, Some("Normal")),
+        KeyBinding::new("=", AutoIndent, Some("Normal")),
+        KeyBinding::new("c", ChangeOp, Some("Normal")),
+        KeyBinding::new("m", MatchObject, Some("Helix && Normal")),
         KeyBinding::new("backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Workspace")),
         KeyBinding::new("alt-backspace", DeleteWordBack, Some("Workspace")),
@@ -472,6 +500,14 @@ pub struct Workspace {
     pending_find: Option<(FindKind, usize)>,
     last_find: Option<(FindKind, char)>,
     pending_bracket: Option<i8>,
+    /// `>` / `<` / `=` operator waiting for a repeat (`>>`) or a motion
+    /// (`>j`, `>G`, `gg=G`). Cleared by `clear_pending` / esc.
+    pending_op: Option<IndentOpKind>,
+    /// Text-object flow (`viw`, `di"`, `ci{`, Helix `miw`): the operator plus
+    /// whether `i` (inner) or `a` (around) was chosen. Cleared on esc.
+    pending_obj: Option<(ObjOp, Option<bool>)>,
+    /// `c` waiting for a repeat (`cc`) or `i`/`a` (change object).
+    pending_change: bool,
     config: Config,
     undo: UndoStack,
     insert_origin: Option<Snapshot>,
@@ -508,6 +544,9 @@ pub struct Workspace {
     /// Zed-style `cmd-k` chord: armed by `cmd-k` at capture level, consumed
     /// by the next key (`t` opens the Themes picker, esc cancels).
     pending_chord: bool,
+    /// Theme before the palette opened. Hover/arrows preview without
+    /// persisting; esc / dismiss restores this, enter / click commits.
+    palette_theme_backup: Option<String>,
 }
 
 impl Workspace {
@@ -570,6 +609,9 @@ impl Workspace {
             pending_find: None,
             last_find: None,
             pending_bracket: None,
+            pending_op: None,
+            pending_obj: None,
+            pending_change: false,
             config,
             undo: UndoStack::default(),
             insert_origin: None,
@@ -596,6 +638,7 @@ impl Workspace {
             media_alt,
             media_src,
             pending_chord: false,
+            palette_theme_backup: None,
         };
 
         if let Some((line, col)) = initial {
@@ -996,6 +1039,9 @@ impl Workspace {
         self.pending_replace = None;
         self.pending_find = None;
         self.pending_bracket = None;
+        self.pending_op = None;
+        self.pending_obj = None;
+        self.pending_change = false;
     }
 
     fn on_press_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1062,7 +1108,7 @@ impl Workspace {
             let p = self.proj();
             if let Some((range, url)) = p.link_at(d) {
                 if cmd {
-                    self.open_link_url(url, cx);
+                    self.open_link_url(url, window, cx);
                     return;
                 } else if click_count == 1 {
                     // Clicking on a link selects the link and opens the link bubble
@@ -1552,6 +1598,9 @@ impl Workspace {
             self.land(next, window, cx);
         }
         self.pending_d = false;
+        // Linewise `>`/`<`/`=` only combines with j/k/G/gg (handled in
+        // their actions); any other motion abandons the armed operator.
+        self.pending_op = None;
     }
 
     /// Prefer real TextLayout wraps over the char-column estimate so up/down
@@ -1684,7 +1733,7 @@ impl Workspace {
             return;
         }
         if self.cmd_palette.is_some() {
-            self.close_palette(window, cx);
+            self.cancel_palette(window, cx);
             return;
         }
         if self.view_source {
@@ -1695,6 +1744,9 @@ impl Workspace {
         if self.pending_replace.is_some()
             || self.pending_find.is_some()
             || self.pending_bracket.is_some()
+            || self.pending_op.is_some()
+            || self.pending_obj.is_some()
+            || self.pending_change
         {
             self.clear_pending();
             cx.notify();
@@ -1720,6 +1772,11 @@ impl Workspace {
     }
 
     fn on_insert_caret(&mut self, _: &InsertAtCaret, window: &mut Window, cx: &mut Context<Self>) {
+        // `i` after `d`/`c` (or in Vim visual) starts a text object (`diw`).
+        if self.arm_obj_inner(true, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1734,6 +1791,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `a` after `d`/`c` (or in Vim visual) = around (`daw`).
+        if self.arm_obj_inner(false, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1822,6 +1884,11 @@ impl Workspace {
             self.on_slash_next(&SlashNext, window, cx);
             return;
         }
+        if self.pending_op.is_some() && self.is_modal_nav() {
+            window.prevent_default();
+            self.consume_pending_op_for_lines(1, false, false, window, cx);
+            return;
+        }
         if self.mode == Mode::VisualLine {
             window.prevent_default();
             let sel = self
@@ -1841,6 +1908,11 @@ impl Workspace {
             self.on_slash_prev(&SlashPrev, window, cx);
             return;
         }
+        if self.pending_op.is_some() && self.is_modal_nav() {
+            window.prevent_default();
+            self.consume_pending_op_for_lines(-1, false, false, window, cx);
+            return;
+        }
         if self.mode == Mode::VisualLine {
             window.prevent_default();
             let sel = self
@@ -1856,6 +1928,13 @@ impl Workspace {
         self.apply_buffer_motion(Motion::Up, window, cx);
     }
     fn on_word_forward(&mut self, _: &WordForward, window: &mut Window, cx: &mut Context<Self>) {
+        // `w` completes a text object (`viw`, `diw`, `miw`).
+        if self.pending_obj.is_some_and(|(_, inner)| inner.is_some()) && self.is_modal_nav() {
+            window.prevent_default();
+            cx.stop_propagation();
+            self.commit_text_object('w', window, cx);
+            return;
+        }
         self.apply_buffer_motion(Motion::WordForward, window, cx);
     }
     fn on_word_back(&mut self, _: &WordBack, window: &mut Window, cx: &mut Context<Self>) {
@@ -1876,6 +1955,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `W` completes a WORD object (`viW`, `daW`).
+        if self.pending_obj.is_some_and(|(_, inner)| inner.is_some()) && self.is_modal_nav() {
+            window.prevent_default();
+            cx.stop_propagation();
+            self.commit_text_object('W', window, cx);
+            return;
+        }
         self.apply_buffer_motion(Motion::WordForwardWs, window, cx);
     }
     fn on_word_back_ws(&mut self, _: &WordBackWs, window: &mut Window, cx: &mut Context<Self>) {
@@ -1899,9 +1985,19 @@ impl Workspace {
         self.apply_buffer_motion(Motion::LineEnd, window, cx);
     }
     fn on_first_doc(&mut self, _: &FirstDoc, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_op.is_some() && self.is_modal_nav() {
+            window.prevent_default();
+            self.consume_pending_op_for_lines(-1, false, true, window, cx);
+            return;
+        }
         self.go_doc_edge(false, window, cx);
     }
     fn on_last_doc(&mut self, _: &LastDoc, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_op.is_some() && self.is_modal_nav() {
+            window.prevent_default();
+            self.consume_pending_op_for_lines(1, true, false, window, cx);
+            return;
+        }
         self.go_doc_edge(true, window, cx);
     }
     fn on_pending_g(&mut self, _: &PendingG, window: &mut Window, cx: &mut Context<Self>) {
@@ -1912,6 +2008,10 @@ impl Workspace {
         window.prevent_default();
         self.pending_d = false;
         if self.pending_g {
+            if self.pending_op.is_some() {
+                self.consume_pending_op_for_lines(-1, false, true, window, cx);
+                return;
+            }
             self.go_doc_edge(false, window, cx);
         } else {
             self.pending_g = true;
@@ -2429,24 +2529,81 @@ impl Workspace {
         cx.notify();
     }
     fn submit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((field, backward)) = self.search.take() else {
-            return;
-        };
-        self.focus.focus(window, cx);
-        let q = if field.is_empty() {
+        // Enter cycles forward (shift+enter is handled at capture level and
+        // calls `cycle_search(false)` directly). Keep the bar open so repeated
+        // enter keeps cycling; esc closes.
+        self.cycle_search(true, window, cx);
+    }
+    /// Cycle the open search bar without closing it: commit the typed query
+    /// to `last_search`, then jump. Used by enter (forward) / shift+enter
+    /// (backward) and the footer ‹ › buttons.
+    fn cycle_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let backward = self.search.as_ref().map(|s| s.1).unwrap_or(false);
+        let typed = self
+            .search
+            .as_ref()
+            .map(|s| s.0.as_str().to_string())
+            .unwrap_or_default();
+        let q = if typed.is_empty() {
             match &self.last_search {
                 Some((prev, _)) => prev.clone(),
-                None => {
-                    cx.notify();
-                    return;
-                }
+                None => return,
             }
         } else {
-            field.as_str().to_string()
+            typed
         };
-        self.last_search = Some((q.clone(), backward));
-        self.jump_search(!backward, true, window, cx);
+        self.last_search = Some((q, backward));
+        // `jump_search` takes an absolute direction; the bar's `backward`
+        // flag (opened with `?`) flips the first jump only. Cycling with
+        // enter always means forward-from-caret / backward-from-caret.
+        self.jump_search(forward, true, window, cx);
         cx.notify();
+    }
+    /// Live query for highlights + footer count: the open bar's text when
+    /// non-empty, otherwise the last submitted search.
+    fn active_search_query(&self) -> Option<String> {
+        if let Some((buf, _)) = self.search.as_ref() {
+            if !buf.is_empty() {
+                return Some(buf.as_str().to_string());
+            }
+        }
+        self.last_search.as_ref().map(|s| s.0.clone())
+    }
+    /// All non-overlapping matches of the active query in display text.
+    /// Capped so a huge file + 1-char query can't stall the frame.
+    fn search_all_matches(&self) -> Vec<std::ops::Range<usize>> {
+        let Some(q) = self.active_search_query() else {
+            return Vec::new();
+        };
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let display = self.proj().display;
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while from <= display.len() && out.len() < 2000 {
+            let Some(rel) = display[from..].find(&q) else {
+                break;
+            };
+            let start = from + rel;
+            out.push(start..start + q.len());
+            from = start + q.len().max(1);
+        }
+        out
+    }
+    /// `(current_1_based, total)` for the footer counter. Current is the
+    /// match at-or-after the caret (the one enter would land on).
+    fn search_position(&self) -> Option<(usize, usize)> {
+        let matches = self.search_all_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let total = matches.len();
+        let cur = matches
+            .iter()
+            .position(|r| r.start >= self.caret)
+            .unwrap_or(0);
+        Some((cur + 1, total))
     }
     fn jump_search(
         &mut self,
@@ -2850,7 +3007,7 @@ impl Workspace {
     /// picker opens Themes directly).
     fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.cmd_palette.is_some() {
-            self.close_palette(window, cx);
+            self.cancel_palette(window, cx);
             return;
         }
         if self.view_source {
@@ -2867,13 +3024,52 @@ impl Workspace {
         self.search = None;
         self.link_open = false;
         self.settings_open = false;
-        self.cmd_palette = Some(PaletteState::open_in(mode));
+        let mut state = PaletteState::open_in(mode);
+        if mode == PaletteMode::Themes {
+            // Park the cursor on the current theme instead of row 0.
+            if let Some(ix) = theme::index_of(&self.config.theme) {
+                state.index = ix;
+            }
+        }
+        self.cmd_palette = Some(state);
+        self.palette_theme_backup = Some(self.config.theme.clone());
+        self.scroll_palette_to_selected();
         self.focus.focus(window, cx);
         cx.notify();
     }
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cmd_palette = None;
+        self.palette_theme_backup = None;
         self.focus.focus(window, cx);
+        cx.notify();
+    }
+    /// Dismiss without committing: restore the theme live-previewed in the
+    /// Themes list (preview never touches disk, so this just re-applies).
+    fn cancel_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(orig) = self.palette_theme_backup.take() {
+            if self.config.theme != orig {
+                self.preview_theme(&orig, window, cx);
+            }
+        }
+        self.cmd_palette = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+    /// Back out of a submenu to root without committing theme previews.
+    fn palette_back_to_root(&mut self, cx: &mut Context<Self>) {
+        if let Some(orig) = self.palette_theme_backup.clone() {
+            if self.config.theme != orig {
+                // Re-apply only; keep backup so a later esc still knows origin.
+                if let Ok(palette) = theme::load_named(&orig) {
+                    apply_palette(&palette, cx);
+                    self.palette = palette;
+                    self.config.theme = orig;
+                }
+            }
+        }
+        if let Some(state) = self.cmd_palette.as_mut() {
+            state.set_mode(PaletteMode::Root);
+        }
         cx.notify();
     }
     fn submit_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2894,9 +3090,20 @@ impl Workspace {
     ) {
         match action {
             PaletteAction::OpenThemes => {
+                if self.palette_theme_backup.is_none() {
+                    self.palette_theme_backup = Some(self.config.theme.clone());
+                }
                 if let Some(state) = self.cmd_palette.as_mut() {
                     state.set_mode(PaletteMode::Themes);
+                    // Park the cursor on the current theme instead of row 0.
+                    if let Some(ix) = theme::index_of(&self.config.theme) {
+                        let len = state.items(self.view_source).len();
+                        if ix < len {
+                            state.index = ix;
+                        }
+                    }
                 }
+                self.scroll_palette_to_selected();
                 cx.notify();
             }
             PaletteAction::OpenEditors => {
@@ -2925,6 +3132,12 @@ impl Workspace {
                 self.close_palette(window, cx);
             }
             PaletteAction::OpenSettings => {
+                // Discard any uncommitted theme preview before leaving.
+                if let Some(orig) = self.palette_theme_backup.take() {
+                    if self.config.theme != orig {
+                        self.preview_theme(&orig, window, cx);
+                    }
+                }
                 self.cmd_palette = None;
                 self.settings_open = true;
                 self.focus.focus(window, cx);
@@ -2965,9 +3178,9 @@ impl Workspace {
         cx.notify();
     }
     /// Live theme preview while hovering / moving through the Themes list.
-    /// Applies immediately (and persists, like the settings picker).
+    /// Preview-only: applies immediately without persisting. Enter / click
+    /// commits via `set_theme`; esc / dismiss restores the backup.
     fn preview_palette_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.palette.name.clone();
         let action = self
             .cmd_palette
             .as_ref()
@@ -2975,8 +3188,26 @@ impl Workspace {
             .and_then(|s| s.items(self.view_source).get(s.index).copied())
             .map(|item| item.action);
         if let Some(PaletteAction::SetTheme(name)) = action {
-            if !current.eq_ignore_ascii_case(name) {
-                self.set_theme(name, window, cx);
+            if !self.config.theme.eq_ignore_ascii_case(name) {
+                self.preview_theme(name, window, cx);
+            }
+        }
+    }
+    /// Preview/revert path: swap the palette with zero disk I/O, no settings-
+    /// input churn and no forced refresh (`cx.notify` from the caller coalesces
+    /// into the single repaint for this step). `set_theme` below is the only
+    /// committing path.
+    fn preview_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match theme::load_named(name) {
+            Ok(palette) => {
+                apply_palette(&palette, cx);
+                self.palette = palette;
+                self.config.theme = name.to_string();
+                window.refresh();
+            }
+            Err(err) => {
+                self.status = format!("{err}").into();
+                cx.notify();
             }
         }
     }
@@ -3352,7 +3583,7 @@ impl Workspace {
                 && mods.shift
                 && !mods.alt
             {
-                self.close_palette(window, cx);
+                self.cancel_palette(window, cx);
                 return true;
             }
             // Caret-aware single-line editing (opt/cmd-backspace, opt/cmd-arrows).
@@ -3386,12 +3617,9 @@ impl Workspace {
                         .as_ref()
                         .is_some_and(|s| s.mode != PaletteMode::Root);
                     if back {
-                        if let Some(state) = self.cmd_palette.as_mut() {
-                            state.set_mode(PaletteMode::Root);
-                        }
-                        cx.notify();
+                        self.palette_back_to_root(cx);
                     } else {
-                        self.close_palette(window, cx);
+                        self.cancel_palette(window, cx);
                     }
                 }
                 "enter" => self.submit_palette(window, cx),
@@ -3413,14 +3641,15 @@ impl Workspace {
                 }
                 "backspace" => {
                     // Empty query in a submenu goes back to root.
-                    if let Some(state) = self.cmd_palette.as_mut() {
-                        if state.query.is_empty() && state.mode != PaletteMode::Root {
-                            state.set_mode(PaletteMode::Root);
-                        } else {
-                            state.index = 0;
-                        }
+                    let back = self.cmd_palette.as_ref().is_some_and(|state| {
+                        state.query.is_empty() && state.mode != PaletteMode::Root
+                    });
+                    if back {
+                        self.palette_back_to_root(cx);
+                    } else if let Some(state) = self.cmd_palette.as_mut() {
+                        state.index = 0;
+                        cx.notify();
                     }
-                    cx.notify();
                 }
                 "space" => {
                     if let Some(state) = self.cmd_palette.as_mut() {
@@ -3542,6 +3771,25 @@ impl Workspace {
             return true;
         }
 
+        // Text-object completion (`di"`, `ci{`, `va)`, …): delimiter keys
+        // have no Normal bindings, so they arrive here. `i`/`a`/`w`/`W`
+        // are consumed in their actions (which run first); esc cancels via
+        // LeaveInsert → clear_pending.
+        if self.pending_obj.is_some_and(|(_, inner)| inner.is_some()) && self.is_modal_nav() {
+            if !mods.control && !mods.platform && !mods.alt && key.chars().count() == 1 {
+                if let Some(ch) = key.chars().next() {
+                    if matches!(
+                        ch,
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | 'b' | 'B'
+                    ) {
+                        window.prevent_default();
+                        self.commit_text_object(ch, window, cx);
+                        return true;
+                    }
+                }
+            }
+        }
+
         if self.pending_g && self.is_modal_nav() && key == "s" && !mods.control && !mods.platform {
             window.prevent_default();
             self.pending_g = false;
@@ -3603,7 +3851,13 @@ impl Workspace {
             }
             match key {
                 "escape" => self.cancel_search(window, cx),
-                "enter" => self.submit_search(window, cx),
+                "enter" => {
+                    if mods.shift {
+                        self.cycle_search(false, window, cx);
+                    } else {
+                        self.submit_search(window, cx);
+                    }
+                }
                 "backspace" => {
                     if let Some((buf, _)) = self.search.as_mut() {
                         buf.backspace();
@@ -3766,8 +4020,8 @@ impl Workspace {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_link_url(&url, cx);
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_link_url(&url, window, cx);
                         }),
                     )
                     .child(
@@ -3990,36 +4244,72 @@ impl Workspace {
                             )),
                     )
                     .child(
-                        Switch::new("wrap-motions")
-                            .label("Wrap lines")
-                            .checked(wrap)
-                            .on_click(move |checked, window, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.set_wrap_motions(*checked, window, cx);
-                                });
-                            }),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(p.markdown_text)
+                                            .child("Wrap lines"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.text_muted)
+                                            .child("Preview always wraps. This only affects the Markdown source view: on follows wrapped visual lines with j/k, off uses logical lines."),
+                                    ),
+                            )
+                            .child(
+                                Switch::new("wrap-motions")
+                                    .small()
+                                    .checked(wrap)
+                                    .on_click(move |checked, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.set_wrap_motions(*checked, window, cx);
+                                        });
+                                    }),
+                            ),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.text_muted)
-                            .child("Preview always wraps. This only affects the Markdown source view: on follows wrapped visual lines with j/k, off uses logical lines."),
-                    )
-                    .child(
-                        Switch::new("full-width")
-                            .label("Full width")
-                            .checked(full_width)
-                            .on_click(move |checked, _, cx| {
-                                entity2.update(cx, |this, cx| {
-                                    this.set_full_width(*checked, cx);
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(p.text_muted)
-                            .child("When on, markdown fills the window. Off: centered column."),
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(p.markdown_text)
+                                            .child("Full width"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(p.text_muted)
+                                            .child("When on, markdown fills the window. Off: centered column."),
+                                    ),
+                            )
+                            .child(
+                                Switch::new("full-width")
+                                    .small()
+                                    .checked(full_width)
+                                    .on_click(move |checked, _, cx| {
+                                        entity2.update(cx, |this, cx| {
+                                            this.set_full_width(*checked, cx);
+                                        });
+                                    }),
+                            ),
                     )
                     .into_any_element()
             }
@@ -4045,15 +4335,27 @@ impl Workspace {
                         .gap_2()
                         .items_center()
                         .child(
-                            div().flex_1().min_w_0().child(
-                                Input::new(&self.theme_input)
-                                    .cleanable(false)
-                                    .readonly(true),
-                            ),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_8()
+                                .px_2()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(p.border)
+                                .bg(p.background_element.opacity(0.5))
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(p.markdown_text)
+                                        .child(self.config.theme.clone()),
+                                ),
                         )
                         .child(
                             Button::new("theme-browse")
-                                .xsmall()
                                 .label("Choose…")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.settings_open = false;
@@ -4327,7 +4629,7 @@ impl Workspace {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
-                    this.close_palette(window, cx);
+                    this.cancel_palette(window, cx);
                 }),
             )
             .on_scroll_wheel(|_, _, cx| {
@@ -4394,6 +4696,7 @@ impl Workspace {
                             .overflow_y_scroll()
                             .track_scroll(&self.palette_scroll)
                             .py_1()
+                            .px_1()
                             .children(if items.is_empty() {
                                 vec![div()
                                     .px_3()
@@ -4414,6 +4717,7 @@ impl Workspace {
                                             .w_full()
                                             .px_3()
                                             .py_2()
+                                            .rounded(px(8.))
                                             .cursor_pointer()
                                             .when(active, |el| el.bg(p.background_element))
                                             .hover(|el| el.bg(p.background_element.opacity(0.7)))
@@ -4511,6 +4815,41 @@ impl Workspace {
         if let Some(lang) = syntax_lang {
             hs.extend(syntax::highlights(lang, text, &pal));
             hs = surface::flatten(text.len(), hs);
+        }
+        // Dimmed search-occurrence highlights (current match brighter). The
+        // footer counter + ‹ › buttons cycle them; enter/shift+enter too.
+        if let Some(q) = self.active_search_query() {
+            if !q.is_empty() && !text.is_empty() {
+                let mut from = 0usize;
+                while from <= text.len() {
+                    let Some(rel) = text[from..].find(&q) else {
+                        break;
+                    };
+                    let s = from + rel;
+                    let e = (s + q.len()).min(text.len());
+                    if e > s {
+                        let global = display.start + s;
+                        let current =
+                            self.caret >= global && self.caret < global + q.len().max(1);
+                        hs.push((
+                            s..e,
+                            gpui::HighlightStyle {
+                                background_color: Some(if current {
+                                    pal.primary.opacity(0.55)
+                                } else {
+                                    pal.primary.opacity(0.22)
+                                }),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                    from = e.max(from + 1);
+                    if hs.len() > 2100 {
+                        break;
+                    }
+                }
+                hs = surface::flatten(text.len(), hs);
+            }
         }
         let ime = local_caret.is_some() && (self.mode.is_insert() || self.is_notion());
         let block_caret = self.uses_block_caret();
@@ -4670,6 +5009,7 @@ impl Workspace {
             BlockExtra::Code { lang } => {
                 let caret = self.caret;
                 let family = self.config.buffer_font.family.clone();
+                let mermaid = lang.eq_ignore_ascii_case("mermaid");
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -4682,6 +5022,42 @@ impl Workspace {
                     .text_size(self.buffer_font_px())
                     .text_color(pal.markdown_code_block)
                     .child(self.render_lang_chip(lang, caret, cx))
+                    .when(mermaid, |el| {
+                        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+                        el.child(
+                            h_flex()
+                                .w_full()
+                                .p_3()
+                                .gap_2()
+                                .items_center()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(pal.border)
+                                .bg(pal.background_panel)
+                                .child(icon_el("diagram", pal.primary))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(pal.markdown_text)
+                                                .child("Mermaid diagram"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(pal.text_muted)
+                                                .child(format!(
+                                                    "{lines} line{} — live preview coming; edit the source below",
+                                                    if lines == 1 { "" } else { "s" }
+                                                )),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(body)
                     .into_any_element()
             }
@@ -4736,15 +5112,18 @@ impl Workspace {
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Text | BlockExtra::Html => {
-                // HTML `<video src=…>` blocks render as a video placeholder
-                // with the same toolbar as image attachments.
+                // HTML media blocks render with the same attachment UI as
+                // markdown images: `<video src=…>` as a video card,
+                // `<img src=…>` (e.g. `<p><img width="100%" …></p>`) as an
+                // image when the file resolves locally, else a remote card.
                 if let BlockExtra::Html = &block.extra {
-                    if let Some(src) = self
-                        .source
-                        .get(block.source.clone())
-                        .and_then(images::parse_video_src)
-                    {
-                        return self.render_video_hit("", &src, block.display.start, cx);
+                    if let Some(raw) = self.source.get(block.source.clone()) {
+                        if let Some(src) = images::parse_video_src(raw) {
+                            return self.render_video_hit("", &src, block.display.start, cx);
+                        }
+                        if let Some((src, alt)) = images::parse_img_src(raw) {
+                            return self.render_image_hit(&alt, &src, block.display.start, cx);
+                        }
                     }
                 }
                 let mut el = v_flex().relative().w_full().min_w_0().child(body);
@@ -4780,7 +5159,12 @@ impl Workspace {
         }
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
+        let remote = !path.exists() && images::is_remote_src(src);
         let selected = self.media_sel == Some(display_start);
+        let name = Path::new(src)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(src);
         v_flex()
             .w_full()
             .min_w_0()
@@ -4815,7 +5199,43 @@ impl Workspace {
                         .rounded(px(6.)),
                 )
             })
-            .when(!path.exists(), |el| {
+            .when(remote, |el| {
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .p_4()
+                        .gap_3()
+                        .items_center()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(if selected { pal.primary } else { pal.border })
+                        .bg(pal.background_element.opacity(0.5))
+                        .child(icon_el(
+                            "image",
+                            if selected { pal.primary } else { pal.text_muted },
+                        ))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(pal.markdown_text)
+                                        .child(name.to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.text_muted)
+                                        .child(format!("remote image — {src}")),
+                                ),
+                        ),
+                )
+            })
+            .when(!path.exists() && !remote, |el| {
                 el.child(
                     div()
                         .text_color(pal.text_muted)
@@ -4848,17 +5268,18 @@ impl Workspace {
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
         let selected = self.media_sel == Some(display_start);
+        let remote = !path.exists() && images::is_remote_src(src);
         let name = Path::new(src)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(src);
         let caption = if alt.is_empty() {
-            if path.exists() {
+            if path.exists() || remote {
                 name.to_string()
             } else {
                 format!("missing video: {src}")
             }
-        } else if path.exists() {
+        } else if path.exists() || remote {
             format!("{name} · {alt}")
         } else {
             format!("missing video: {src}")
@@ -5441,8 +5862,8 @@ impl Workspace {
                         .ghost()
                         .xsmall()
                         .icon(Icon::default().path(crate::assets::path("arrow-up-right")))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_link_url(&url, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_link_url(&url, window, cx);
                         })),
                 )
             })
@@ -5875,6 +6296,460 @@ impl Workspace {
         self.visual_anchor = Some(0);
         self.mouse_anchor = Some(0);
         self.refresh(window, cx);
+    }
+
+    fn on_indent_shift(&mut self, _: &IndentShift, window: &mut Window, cx: &mut Context<Self>) {
+        self.indent_key(IndentOpKind::Indent, window, cx);
+    }
+    fn on_dedent_shift(&mut self, _: &DedentShift, window: &mut Window, cx: &mut Context<Self>) {
+        self.indent_key(IndentOpKind::Dedent, window, cx);
+    }
+    fn on_auto_indent(&mut self, _: &AutoIndent, window: &mut Window, cx: &mut Context<Self>) {
+        self.indent_key(IndentOpKind::Auto, window, cx);
+    }
+
+    /// `>` / `<` / `=` in Normal/Visual:
+    /// - with a visual selection: apply to the selection (Helix `>` after
+    ///   `x`, Vim visual `>`);
+    /// - repeated (`>>`, `<<`, `==`): current line, honoring counts;
+    /// - otherwise: arm `pending_op` for a motion (`>j`, `>G`, `gg=G`).
+    fn indent_key(&mut self, kind: IndentOpKind, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
+        if self.mode.is_visual() {
+            if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+                self.clear_pending();
+                // Like Vim, shifting exits visual (gv reselects; anchor would
+                // otherwise snap a stale selection back on refresh).
+                self.mode = Mode::Normal;
+                self.visual_anchor = None;
+                self.apply_indent_range(sel, kind, window, cx);
+                return;
+            }
+        }
+        if self.pending_op == Some(kind) {
+            let count = take_count(&mut self.pending_count);
+            self.clear_pending();
+            let mut range = visual_line_range(&self.source, self.caret);
+            for _ in 1..count {
+                range = extend_visual_line(&self.source, range, 1);
+            }
+            self.apply_indent_range(range, kind, window, cx);
+        } else {
+            self.pending_g = false;
+            self.pending_d = false;
+            self.pending_replace = None;
+            self.pending_find = None;
+            self.pending_bracket = None;
+            self.pending_op = Some(kind);
+            cx.notify();
+        }
+    }
+
+    /// Apply an indent operator to a display range. List items go through
+    /// the tree-aware `tab` ops (nesting); anything else gets 2-space
+    /// shifts; `=` aligns each line with its previous non-blank line.
+    fn apply_indent_range(
+        &mut self,
+        range: Range<usize>,
+        kind: IndentOpKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let display_len = self.proj().display.len();
+        let a = range.start.min(range.end).min(display_len);
+        let b = range.start.max(range.end).min(display_len);
+        // Collect logical line starts covered by the range first (offsets
+        // from the pre-edit snapshot; applied bottom-up / top-down below).
+        let display = self.proj().display;
+        let mut starts = Vec::new();
+        let mut line = logical_line_range(&display, a);
+        // Include the line containing `b` (exclusive end may sit at its start).
+        loop {
+            starts.push(line.start);
+            if line.end >= b || line.end >= display.len() {
+                break;
+            }
+            let next = logical_line_range(&display, line.end + 1);
+            if next.start <= line.start {
+                break;
+            }
+            line = next;
+            if starts.len() > 2000 {
+                break;
+            }
+        }
+        if starts.is_empty() {
+            return;
+        }
+        self.push_doc_undo();
+        match kind {
+            IndentOpKind::Indent | IndentOpKind::Dedent => {
+                let outdent = kind == IndentOpKind::Dedent;
+                // Bottom-up so earlier line starts stay valid.
+                for s in starts.iter().rev() {
+                    let at = (*s).min(self.proj().display.len());
+                    if self.doc.tab(at, outdent).is_some() {
+                        continue;
+                    }
+                    if outdent {
+                        let disp = self.proj().display;
+                        let line = logical_line_range(&disp, at);
+                        let text = disp.get(line.clone()).unwrap_or("");
+                        let strip = if text.starts_with("  ") {
+                            2
+                        } else if text.starts_with(' ') || text.starts_with('\t') {
+                            1
+                        } else {
+                            0
+                        };
+                        if strip > 0 {
+                            self.doc.delete_display(at..at + strip);
+                        }
+                    } else {
+                        let sticky = self.sticky.clone();
+                        self.doc.insert_text(at, None, "  ", sticky);
+                    }
+                }
+                self.sync_gfm();
+                // Land on the first non-blank of the first touched line.
+                let first = starts[0].min(self.proj().display.len());
+                let disp = self.proj().display;
+                self.commit_caret(first_non_blank_in(&disp, logical_line_range(&disp, first)), window, cx);
+            }
+            IndentOpKind::Auto => {
+                // Top-down: each line takes the previous non-blank line's
+                // indent (spaces; tabs count as 2).
+                let mut delta: isize = 0;
+                for (i, s) in starts.iter().enumerate() {
+                    let at = ((*s) as isize + delta).max(0) as usize;
+                    let at = at.min(self.proj().display.len());
+                    let disp = self.proj().display;
+                    let line = logical_line_range(&disp, at);
+                    let text = disp.get(line.clone()).unwrap_or("").to_string();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let cur_w = indent_width(&text);
+                    let want = if i == 0 {
+                        // First line: match the previous non-blank line above it.
+                        prev_indent_before(&disp, line.start)
+                    } else {
+                        // Previous line in the (already re-indented) buffer.
+                        prev_indent_before(&disp, line.start)
+                    };
+                    let want = want.unwrap_or(cur_w);
+                    if want == cur_w {
+                        continue;
+                    }
+                    if want > cur_w {
+                        let pad = " ".repeat(want - cur_w);
+                        let sticky = self.sticky.clone();
+                        self.doc.insert_text(at, None, &pad, sticky);
+                        delta += (want - cur_w) as isize;
+                    } else {
+                        // Remove plain leading spaces/tabs only (list-aware
+                        // tab() would fight marker indents; auto-indent is
+                        // aimed at code/text lines).
+                        let mut rm = 0usize;
+                        let mut w = 0usize;
+                        for c in text.chars() {
+                            if w >= cur_w - want {
+                                break;
+                            }
+                            if c == ' ' {
+                                rm += 1;
+                                w += 1;
+                            } else if c == '\t' {
+                                rm += 1;
+                                w += 2;
+                            } else {
+                                break;
+                            }
+                        }
+                        if rm > 0 {
+                            self.doc.delete_display(at..at + rm);
+                            delta -= rm as isize;
+                        }
+                    }
+                }
+                self.sync_gfm();
+                let first = ((starts[0]) as isize + 0).max(0) as usize;
+                let first = first.min(self.proj().display.len());
+                let disp = self.proj().display;
+                self.commit_caret(first_non_blank_in(&disp, logical_line_range(&disp, first)), window, cx);
+            }
+        }
+    }
+
+    /// Consume `pending_op` for linewise motions (`>j` / `>k` / `>G` /
+    /// `gg` with `=` armed). Returns true when the motion was consumed as
+    /// an operator range.
+    fn consume_pending_op_for_lines(
+        &mut self,
+        dir: i8,
+        to_end: bool,
+        to_start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(kind) = self.pending_op.take() else {
+            return false;
+        };
+        let count = take_count(&mut self.pending_count);
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_replace = None;
+        self.pending_find = None;
+        self.pending_bracket = None;
+        let range = if to_end {
+            let first = visual_line_range(&self.source, self.caret);
+            first.start..self.source.len()
+        } else if to_start {
+            0..visual_line_range(&self.source, self.caret).end
+        } else {
+            // Operator + motion covers the motion (`>j` = current + next).
+            let mut r = visual_line_range(&self.source, self.caret);
+            for _ in 0..count {
+                r = extend_visual_line(&self.source, r, dir);
+            }
+            r
+        };
+        self.apply_indent_range(range, kind, window, cx);
+        true
+    }
+
+    fn on_change_op(&mut self, _: &ChangeOp, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
+        // Visual change: delete the selection, enter insert (like Vim `s`).
+        if self.mode.is_visual() {
+            if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
+                self.clear_pending();
+                self.push_doc_undo();
+                let a = sel.start.min(sel.end);
+                let b = sel.end.max(sel.start);
+                self.caret = self.doc.delete_display(a..b);
+                self.sync_gfm();
+                self.sel = None;
+                self.mark_dirty();
+                self.enter_insert(Caret::Offset(self.caret), window, cx);
+                self.sync_title(window);
+                return;
+            }
+        }
+        // `cc`: whole current line, then insert.
+        if self.pending_change {
+            self.clear_pending();
+            self.delete_current_line(window, cx);
+            // `delete_current_line` leaves Normal + a valid caret: drop in.
+            self.enter_insert(Caret::Offset(self.caret), window, cx);
+            self.sync_title(window);
+            return;
+        }
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_op = None;
+        self.pending_replace = None;
+        self.pending_find = None;
+        self.pending_bracket = None;
+        self.pending_obj = None;
+        self.pending_change = true;
+        cx.notify();
+    }
+
+    /// Helix `m`: match mode — `miw` / `maw` / `mi"` / `ma{` … select the
+    /// text object (Select mode, like Helix).
+    fn on_match_object(&mut self, _: &MatchObject, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.editor != EditorKind::Helix || !self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_op = None;
+        self.pending_replace = None;
+        self.pending_find = None;
+        self.pending_bracket = None;
+        self.pending_change = false;
+        self.pending_obj = Some((ObjOp::Select, None));
+        cx.notify();
+    }
+
+    /// Consume `i` / `a` after a text-object operator (`d`, `c`, visual `v`,
+    /// Helix `m`) as inner/around. Returns true when the key was consumed.
+    fn arm_obj_inner(&mut self, inner: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.is_modal_nav() || self.view_source || self.cmd_palette.is_some() {
+            return false;
+        }
+        // Already choosing an object — a second i/a just flips inner/around.
+        if let Some((_, slot)) = self.pending_obj.as_mut() {
+            window.prevent_default();
+            *slot = Some(inner);
+            cx.notify();
+            return true;
+        }
+        let op = if self.pending_d {
+            ObjOp::Delete
+        } else if self.pending_change {
+            ObjOp::Change
+        } else if self.mode == Mode::Visual && self.config.editor == EditorKind::Vim {
+            // Vim `vi…` / `va…`: object-select inside the visual session.
+            ObjOp::Select
+        } else {
+            return false;
+        };
+        window.prevent_default();
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_change = false;
+        self.pending_op = None;
+        self.pending_replace = None;
+        self.pending_find = None;
+        self.pending_bracket = None;
+        self.pending_obj = Some((op, Some(inner)));
+        cx.notify();
+        true
+    }
+
+    /// Resolve + apply a text object (`w`, `"`, `'`, `` ` ``, `(`, `[`, `{`,
+    /// `<` and closers; `b` = parens, `B` = braces).
+    fn commit_text_object(&mut self, obj: char, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((op, inner_opt)) = self.pending_obj.take() else {
+            return;
+        };
+        let inner = inner_opt.unwrap_or(true);
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_change = false;
+        self.pending_op = None;
+        self.pending_replace = None;
+        self.pending_find = None;
+        self.pending_bracket = None;
+        let p = self.proj();
+        let display = p.display.clone();
+        let caret = self.caret.min(display.len());
+        let range: Option<Range<usize>> = match obj {
+            'w' | 'W' => {
+                let big = obj == 'W';
+                let r = if big {
+                    crate::motion::big_word_range_at(&display, caret)
+                } else {
+                    word_range_at(&display, caret)
+                };
+                if r.start >= r.end {
+                    None
+                } else if inner {
+                    Some(r)
+                } else {
+                    // `aw`: word + trailing blanks, else leading blanks.
+                    let mut end = r.end;
+                    while end < display.len()
+                        && (display.as_bytes()[end] == b' ' || display.as_bytes()[end] == b'\t')
+                    {
+                        end += 1;
+                    }
+                    if end == r.end {
+                        let mut start = r.start;
+                        while start > 0
+                            && (display.as_bytes()[start - 1] == b' '
+                                || display.as_bytes()[start - 1] == b'\t')
+                        {
+                            start -= 1;
+                        }
+                        Some(start..r.end)
+                    } else {
+                        Some(r.start..end)
+                    }
+                }
+            }
+            '(' | ')' | 'b' => Self::delim_object(&display, caret, '(', ')', inner),
+            '[' | ']' => Self::delim_object(&display, caret, '[', ']', inner),
+            '{' | '}' | 'B' => Self::delim_object(&display, caret, '{', '}', inner),
+            '<' | '>' => Self::delim_object(&display, caret, '<', '>', inner),
+            '"' | '\'' | '`' => {
+                crate::motion::quote_around(&display, caret, obj).map(|(o, c)| {
+                    if inner {
+                        o + obj.len_utf8()..c
+                    } else {
+                        o..c + obj.len_utf8()
+                    }
+                })
+            }
+            _ => None,
+        };
+        let Some(range) = range.filter(|r| r.start < r.end) else {
+            self.status = "no match".into();
+            cx.notify();
+            return;
+        };
+        match op {
+            ObjOp::Select => {
+                self.mode = if self.config.editor == EditorKind::Helix {
+                    Mode::Select
+                } else {
+                    Mode::Visual
+                };
+                self.visual_anchor = Some(range.start);
+                self.caret = range.end.min(display.len());
+                self.sel = Some(range);
+                self.refresh_raw(window, cx);
+            }
+            ObjOp::Delete => {
+                window.prevent_default();
+                self.push_doc_undo();
+                let caret = self.doc.delete_display(range);
+                self.sync_gfm();
+                self.mode = Mode::Normal;
+                self.sel = None;
+                self.visual_anchor = None;
+                self.commit_caret(caret, window, cx);
+            }
+            ObjOp::Change => {
+                window.prevent_default();
+                self.push_doc_undo();
+                let a = range.start;
+                self.doc.delete_display(range);
+                self.sync_gfm();
+                self.sel = None;
+                self.visual_anchor = None;
+                self.mark_dirty();
+                self.enter_insert(Caret::Offset(a), window, cx);
+                self.sync_title(window);
+            }
+        }
+    }
+
+    fn delim_object(
+        display: &str,
+        caret: usize,
+        open: char,
+        close: char,
+        inner: bool,
+    ) -> Option<Range<usize>> {
+        let (o, c) = crate::motion::pair_around(display, caret, open, close)?;
+        if inner {
+            let s = o + open.len_utf8();
+            (s < c).then(|| s..c)
+        } else {
+            Some(o..c + close.len_utf8())
+        }
     }
 
     fn render_source_view(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -6568,11 +7443,50 @@ impl Workspace {
         self.sync_title(window);
     }
 
-    fn open_link_url(&self, raw: &str, _cx: &mut App) {
+    fn open_link_url(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             eprintln!("crabmd: open_link_url: empty url");
             return;
+        }
+        // Crosslinks: `other.md`, `./other.md`, `sub/dir.md#anchor` open
+        // in-place (same window). Anchors jump to the first matching heading.
+        if let Some((target, anchor)) = Self::split_local_md(trimmed) {
+            if target.is_empty() {
+                // `#anchor` in the same file: jump to the matching heading.
+                if let Some(a) = anchor.as_deref().filter(|a| !a.is_empty()) {
+                    let slug = a.to_ascii_lowercase().replace(['-', '_'], " ");
+                    let p = self.proj();
+                    for b in &p.blocks {
+                        if matches!(b.kind, BlockKind::Heading(_)) {
+                            if let Some(text) = p.display.get(b.display.clone()) {
+                                if text.to_ascii_lowercase().contains(&slug) {
+                                    self.caret = b.display.start;
+                                    self.sel = None;
+                                    self.refresh(window, cx);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            let base = self
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let candidate = if std::path::Path::new(&target).is_absolute() {
+                std::path::PathBuf::from(&target)
+            } else {
+                base.join(&target)
+            };
+            if self.open_local_file(&candidate, anchor.as_deref()) {
+                self.refresh(window, cx);
+                self.sync_title(window);
+                return;
+            }
         }
         let url = if trimmed.starts_with("http://")
             || trimmed.starts_with("https://")
@@ -6583,6 +7497,84 @@ impl Workspace {
             format!("https://{trimmed}")
         };
         open_in_browser(&url);
+    }
+
+    /// Split a link target into `(file, anchor)` when it points at a local
+    /// markdown file. Returns None for URLs / mailto / bare domains.
+    fn split_local_md(raw: &str) -> Option<(String, Option<String>)> {
+        let t = raw.trim();
+        if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("mailto:") {
+            return None;
+        }
+        // Strip `<...>` autolink brackets pulldown sometimes keeps.
+        let t = t.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(t);
+        if t.is_empty() || t.contains(' ') || t.contains('\n') {
+            return None;
+        }
+        let (file, anchor) = match t.split_once('#') {
+            Some((f, a)) => (f, Some(a.to_string())),
+            None => (t, None),
+        };
+        if file.is_empty() {
+            // `#anchor` within the same file — handled as a heading jump by
+            // the caller; not a crosslink open. Report as local with empty
+            // file so callers can distinguish.
+            return Some((String::new(), anchor));
+        }
+        let lower = file.to_ascii_lowercase();
+        if !(lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown")) {
+            return None;
+        }
+        Some((file.to_string(), anchor))
+    }
+
+    /// Swap the buffer for a sibling markdown file (crosslink navigation).
+    /// Returns false when the file can't be read (caller falls back to a
+    /// browser open). Refuses when dirty to avoid losing edits.
+    fn open_local_file(&mut self, candidate: &std::path::Path, anchor: Option<&str>) -> bool {
+        if self.dirty {
+            self.status = "unsaved changes — save first (cmd-s)".into();
+            return true;
+        }
+        let resolved = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+        let Ok(raw) = std::fs::read_to_string(&resolved) else {
+            self.status = format!("missing file: {}", candidate.display()).into();
+            return true;
+        };
+        let doc = crate::tree::Doc::from_gfm(&raw);
+        let normalized = doc.to_gfm();
+        self.path = resolved;
+        self.doc = doc;
+        self.source = normalized.clone();
+        self.clean_source = normalized;
+        self.dirty = false;
+        self.caret = 0;
+        self.sel = None;
+        self.mode = Mode::Normal;
+        self.clear_pending();
+        self.command = None;
+        self.search = None;
+        self.media_sel = None;
+        self.link_open = false;
+        self.undo = UndoStack::default();
+        self.insert_origin = None;
+        if let Some(a) = anchor.filter(|a| !a.is_empty()) {
+            // Jump to the first heading containing the anchor slug.
+            let slug = a.to_ascii_lowercase().replace(['-', '_'], " ");
+            let p = self.proj();
+            for b in &p.blocks {
+                if matches!(b.kind, BlockKind::Heading(_)) {
+                    if let Some(text) = p.display.get(b.display.clone()) {
+                        if text.to_ascii_lowercase().contains(&slug) {
+                            self.caret = b.display.start;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.status = "ready".into();
+        true
     }
 
     /// Check if the word directly before `end_display` is a bare URL (http://, https://, or www.)
@@ -7140,6 +8132,9 @@ impl Render for Workspace {
         let palette_open = self.cmd_palette.is_some();
         let command = self.command.clone();
         let search = self.search.clone();
+        let last_search = self.last_search.clone();
+        let search_pos = self.search_position();
+        let search_view = cx.entity();
         let status = if self.view_source {
             SharedString::from("source view — esc/cmd-shift-p to exit")
         } else {
@@ -7231,6 +8226,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_selection))
             .on_action(cx.listener(Self::on_paste_clipboard))
             .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_indent_shift))
+            .on_action(cx.listener(Self::on_dedent_shift))
+            .on_action(cx.listener(Self::on_auto_indent))
+            .on_action(cx.listener(Self::on_change_op))
+            .on_action(cx.listener(Self::on_match_object))
             .on_action(cx.listener(|this, _: &QuitApp, window, cx| {
                 if this.request_quit(window, cx) {
                     cx.quit();
@@ -7333,7 +8333,9 @@ impl Render for Workspace {
                 h_flex()
                     .w_full()
                     .px_3()
-                    .py_1()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .overflow_hidden()
                     .gap_3()
                     .items_center()
                     .border_t_1()
@@ -7378,10 +8380,25 @@ impl Render for Workspace {
                                 ),
                         )
                     })
-                    .when_some(search, |el, (q, back): (LineField, bool)| {
-                        let prefix = if back { "?" } else { "/" };                        el.child(
+                    .when_some(search.clone(), |el, (q, back): (LineField, bool)| {
+                        let prefix = if back { "?" } else { "/" };
+                        let count = match search_pos {
+                            Some((cur, total)) => format!("{cur}/{total}"),
+                            None => {
+                                let typed = q.as_str();
+                                if typed.is_empty() {
+                                    String::new()
+                                } else {
+                                    "0/0".to_string()
+                                }
+                            }
+                        };
+                        let prev_view = search_view.clone();
+                        let next_view = search_view.clone();
+                        el.child(
                             h_flex()
                                 .flex_1()
+                                .min_w_0()
                                 .items_center()
                                 .gap_1()
                                 .child(
@@ -7396,6 +8413,128 @@ impl Render for Workspace {
                                         .text_sm()
                                         .text_color(p.markdown_text)
                                         .child(q.render()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .child(count),
+                                )
+                                .child(
+                                    div()
+                                        .id("search-prev")
+                                        .px_1()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .hover(|el| el.text_color(p.primary))
+                                        .child("‹")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_, window, cx| {
+                                                prev_view.update(cx, |this, cx| {
+                                                    this.cycle_search(false, window, cx);
+                                                });
+                                            },
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("search-next")
+                                        .px_1()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .hover(|el| el.text_color(p.primary))
+                                        .child("›")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_, window, cx| {
+                                                next_view.update(cx, |this, cx| {
+                                                    this.cycle_search(true, window, cx);
+                                                });
+                                            },
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(search.is_none() && last_search.is_some(), |el| {
+                        let (q, back) = last_search.clone().unwrap_or_default();
+                        let prefix = if back { "?" } else { "/" };
+                        let short = if q.chars().count() > 24 {
+                            format!("{}…", q.chars().take(24).collect::<String>())
+                        } else {
+                            q.clone()
+                        };
+                        let count = match search_pos {
+                            Some((cur, total)) => format!("{cur}/{total}"),
+                            None => "0/0".to_string(),
+                        };
+                        let prev_view = search_view.clone();
+                        let next_view = search_view.clone();
+                        el.child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(p.primary)
+                                        .child(prefix),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .child(short),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .child(count),
+                                )
+                                .child(
+                                    div()
+                                        .id("search-prev-idle")
+                                        .px_1()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .hover(|el| el.text_color(p.primary))
+                                        .child("‹")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_, window, cx| {
+                                                prev_view.update(cx, |this, cx| {
+                                                    this.jump_search(false, true, window, cx);
+                                                });
+                                            },
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("search-next-idle")
+                                        .px_1()
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .hover(|el| el.text_color(p.primary))
+                                        .child("›")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_, window, cx| {
+                                                next_view.update(cx, |this, cx| {
+                                                    this.jump_search(true, true, window, cx);
+                                                });
+                                            },
+                                        ),
                                 ),
                         )
                     })
@@ -7450,8 +8589,42 @@ impl Render for Workspace {
     }
 }
 
-fn open_in_browser(url: &str) {
-    // GPUI's open_url (NSWorkspace) is the primary launcher. Also try the
+/// Leading-indent width of a line (spaces; tabs count as 2).
+fn indent_width(line: &str) -> usize {
+    let mut w = 0usize;
+    for c in line.chars() {
+        if c == ' ' {
+            w += 1;
+        } else if c == '\t' {
+            w += 2;
+        } else {
+            break;
+        }
+    }
+    w
+}
+
+/// Indent width of the nearest non-blank logical line above `line_start`.
+fn prev_indent_before(display: &str, line_start: usize) -> Option<usize> {
+    let mut at = line_start.min(display.len());
+    loop {
+        if at == 0 {
+            return None;
+        }
+        let prev_end = at - 1; // the `\n` ending the previous line (or before)
+        let prev_line = logical_line_range(display, prev_end.min(display.len()));
+        if prev_line.start >= at {
+            return None;
+        }
+        let text = display.get(prev_line.clone()).unwrap_or("");
+        if !text.trim().is_empty() {
+            return Some(indent_width(text));
+        }
+        at = prev_line.start;
+    }
+}
+
+fn open_in_browser(url: &str) {    // GPUI's open_url (NSWorkspace) is the primary launcher. Also try the
     // shell path as a fallback: `open` detaches from the GUI process in a way
     // `Command::spawn` from an app bundle sometimes does not, so wait for the
     // fast `open` exit instead of leaving a zombie child.

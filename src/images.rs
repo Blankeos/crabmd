@@ -57,6 +57,51 @@ pub fn parse_video_src(raw: &str) -> Option<String> {
     }
 }
 
+/// `<img src="pic.png" …>` (anywhere in the raw HTML) -> (src, alt).
+pub fn parse_img_src(raw: &str) -> Option<(String, String)> {
+    let lower = raw.to_ascii_lowercase();
+    let tag = lower.find("<img")?;
+    let rest = &raw[tag..];
+    let end = rest.find('>').unwrap_or(rest.len());
+    let tag_text = &rest[..end];
+    Some((tag_attr(tag_text, "src")?, tag_attr(tag_text, "alt").unwrap_or_default()))
+}
+
+/// `attr="v"` / `attr='v'` / `attr=v` inside a single HTML tag.
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    let mut offset = 0usize;
+    loop {
+        let ix = search.find(name)?;
+        let abs = offset + ix;
+        // Attribute name must not be a suffix of a longer name (`data-src`).
+        let before = tag[..abs].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            search = &search[ix + name.len()..];
+            offset = abs + name.len();
+            continue;
+        }
+        let after = tag[abs + name.len()..].trim_start();
+        let after = after.strip_prefix('=')?.trim_start();
+        let quote = after.as_bytes().first()?;
+        if *quote == b'"' || *quote == b'\'' {
+            let end = after[1..].find(*quote as char)?;
+            return Some(after[1..1 + end].to_string());
+        }
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        let v = after[..end].trim();
+        return (!v.is_empty()).then(|| v.to_string());
+    }
+}
+
+/// Remote `http(s)` media that can never resolve to a local file.
+pub fn is_remote_src(src: &str) -> bool {
+    src.starts_with("http://") || src.starts_with("https://")
+}
+
 pub fn unique_filename(existing: &HashSet<String>, preferred: &str) -> String {
     if !existing.contains(preferred) {
         return preferred.to_string();
@@ -224,5 +269,18 @@ mod tests {
             Some("clip.mp4".to_string())
         );
         assert_eq!(parse_video_src("![a](b.png)"), None);
+    }
+
+    #[test]
+    fn img_tag_src() {
+        assert_eq!(
+            parse_img_src(r#"<p><img width="100%" src="https://x.test/b.png" alt="B"></p>"#),
+            Some(("https://x.test/b.png".to_string(), "B".to_string()))
+        );
+        assert_eq!(
+            parse_img_src("<img src=pic.png>"),
+            Some(("pic.png".to_string(), String::new()))
+        );
+        assert_eq!(parse_img_src("<video src=c.mp4>"), None);
     }
 }

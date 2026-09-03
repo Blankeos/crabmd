@@ -31,4 +31,11 @@
 - [x] `cmd-k t` chord via manual capture-level state machine (native GPUI `cmd-k t` sequence binding did not fire reliably); no `cmd-shift-p`/`esc back` hint in palette header
 - [x] Brand icons for editor cards via iconmate (simple-icons helix/vim/notion), slimmer settings nav rows, no bold on selected palette row, no `>` in palette input, no `esc back` hint, app bundle name CrabMD, per-field font resets (family/size independent)
 - [x] `cmd-k t` works in Vim/Helix Normal too (keymap dispatch runs before capture, so `on_find_till`/`on_find_till_back` consume a pending chord first); follow-up also accepts held cmd/ctrl (`cmd-k cmd-t`); preview always wraps while "Wrap lines" only affects source view; theme picker hints show dark/light per theme
+- [x] Settings switches: label+desc left column (text_sm label), small switch right; theme row is a non-focusable readout (h-8) + medium Choose button matching its height
+- [x] cmd-f: live/total match count, ‹ › buttons in footer (typing + persistent idle pill with `/` indicator), enter cycles forward / shift+enter backward without closing, dimmed occurrence highlights (current brighter), fixed 30px footer so the bar never janks
+- [x] Vim/Helix indent: `>>`/`<<`/`==` (counts), visual `>`/`<`/`=`, operator+motion (`>j`/`>k`/`>G`/`gg=G`), list-aware via tree tab ops with 2-space fallback, `=` aligns to previous non-blank indent; Helix `%` selects all (Vim ggVG already worked)
+- [x] Surrounds/text objects: Vim `viw`/`vaw`/`vi"`/`va{`… + `di`/`da`/`ci`/`ca` families (`w`/`W`/quotes/parens/brackets/braces/angles, `b`/`B` aliases), `cc`/visual-`c` change, Helix `miw`/`maw`/`mi"`/`ma{`… via `m`
+- [x] Mermaid: ` ```mermaid ` blocks get a preview card (icon + line count, "live preview coming") above the still-editable source
+- [x] HTML: `<img src>` blocks (incl. `<p><img width=…>`) render local files as images; remote http(s) images get a remote card instead of "missing"; remote videos no longer say "missing"
+- [x] Crosslinks: `other.md` / `./sub.md#anchor` / `#anchor` cmd-click or chip-click navigates in place (dirty guard, missing-file status); kitchen sink expanded (lists, tasks, alerts, table, code, mermaid, media, html img, crosslinks) + sink-partner.md backlink target
 

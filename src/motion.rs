@@ -262,6 +262,98 @@ pub fn word_range_at(source: &str, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// Byte range of the whitespace-separated WORD under `offset`.
+/// Empty when the caret sits on whitespace / empty text.
+pub fn big_word_range_at(source: &str, offset: usize) -> Range<usize> {
+    let offset = clamp_off(source, offset);
+    if source.is_empty() {
+        return 0..0;
+    }
+    let probe = if offset >= source.len() {
+        match prev_char(source, offset) {
+            Some((n, _)) => offset - n,
+            None => return offset..offset,
+        }
+    } else {
+        offset
+    };
+    let Some((_, c)) = next_char(source, probe) else {
+        return offset..offset;
+    };
+    if c.is_whitespace() {
+        return offset..offset;
+    }
+    let start = skip_while_back(source, probe, |ch| !ch.is_whitespace());
+    let end = skip_while(source, probe, |ch| !ch.is_whitespace());
+    start..end
+}
+
+/// Byte offsets of the enclosing delimiter pair around `offset`:
+/// `(open_start, close_start)` (each the delimiter's own offset).
+/// Backward scan finds the unmatched `open`; forward scan from there finds
+/// its match, counting nesting. `None` when unbalanced.
+pub fn pair_around(
+    source: &str,
+    offset: usize,
+    open: char,
+    close: char,
+) -> Option<(usize, usize)> {
+    if open == close {
+        return quote_around(source, offset, open);
+    }
+    let offset = clamp_off(source, offset);
+    // Backward: nearest unmatched `open` at or before `offset`.
+    let mut depth = 0usize;
+    let mut open_pos: Option<usize> = None;
+    let mut i = offset;
+    while i > 0 {
+        let Some((n, c)) = prev_char(source, i) else {
+            break;
+        };
+        let pos = i - n;
+        if c == close {
+            depth += 1;
+        } else if c == open {
+            if depth == 0 {
+                open_pos = Some(pos);
+                break;
+            }
+            depth -= 1;
+        }
+        i = pos;
+    }
+    let open_pos = open_pos?;
+    // Forward: its match, counting nested opens.
+    let mut depth = 0usize;
+    let mut i = open_pos + open.len_utf8();
+    while i < source.len() {
+        let Some((n, c)) = next_char(source, i) else {
+            break;
+        };
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            if depth == 0 {
+                return Some((open_pos, i));
+            }
+            depth -= 1;
+        }
+        i += n;
+    }
+    None
+}
+
+/// Byte offsets of the enclosing same-char quote (e.g. `"`) around `offset`:
+/// `(open_start, close_start)`. `None` when fewer than two quotes straddle it.
+pub fn quote_around(source: &str, offset: usize, q: char) -> Option<(usize, usize)> {
+    let offset = clamp_off(source, offset);
+    let before = &source[..offset];
+    let open_pos = before.rfind(q)?;
+    let after = &source[offset..];
+    let rel = after.find(q)?;
+    Some((open_pos, offset + rel))
+}
+
 fn skip_while(source: &str, mut offset: usize, pred: impl Fn(char) -> bool) -> usize {
     while let Some((n, c)) = next_char(source, offset) {
         if !pred(c) {
@@ -1355,7 +1447,7 @@ mod tests {
 
 #[cfg(test)]
 mod word_select_tests {
-    use super::word_range_at;
+    use super::{big_word_range_at, pair_around, quote_around, word_range_at};
 
     #[test]
     fn word_range_selects_word_under_caret() {
@@ -1366,5 +1458,30 @@ mod word_select_tests {
         assert_eq!(word_range_at("hello world", 11), 6..11);
         assert_eq!(word_range_at("a", 0), 0..1);
         assert_eq!(word_range_at("  ", 1), 1..1);
+    }
+
+    #[test]
+    fn big_word_ignores_punctuation() {
+        assert_eq!(big_word_range_at("foo-bar baz", 2), 0..7);
+        assert_eq!(big_word_range_at("foo-bar baz", 8), 8..11);
+        assert_eq!(big_word_range_at("foo bar", 3), 3..3);
+    }
+
+    #[test]
+    fn pair_finds_enclosing_with_nesting() {
+        let s = "a (b (c) d) e";
+        assert_eq!(pair_around(s, 9, '(', ')'), Some((2, 10)));
+        // Inside the inner pair.
+        assert_eq!(pair_around(s, 6, '(', ')'), Some((5, 7)));
+        // Outside everything.
+        assert_eq!(pair_around("(a", 0, '(', ')'), None);
+        assert_eq!(pair_around("a )", 3, '(', ')'), None);
+    }
+
+    #[test]
+    fn quotes_straddle_caret() {
+        let s = "say \"hi there\" ok";
+        assert_eq!(quote_around(s, 6, '"'), Some((4, 13)));
+        assert_eq!(quote_around(s, 0, '"'), None);
     }
 }

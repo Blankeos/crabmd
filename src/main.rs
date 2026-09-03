@@ -298,6 +298,11 @@ Keys (Helix / Vim normal — one buffer):
   o/O           open line below / above inside the block
   v             Helix select / Vim visual; Vim V = visual line
   d             delete selection (Helix: also current char); Vim dd = line, D = to EOL
+  c             change: visual deletes + insert; Vim cc, ciw/caw/ci-quote/ci-brace
+  m             Helix match: miw/maw/mi-quote/ma-brace/... select object
+  viw/vaw       visual inner/around word; v/c + i/a + quotes/parens/braces too
+  > < =         indent / dedent / auto-indent: >> << ==, visual >, >j >G gg=G
+  %             Helix select all (Vim: ggVG)
   x             Helix: select line (repeat extends). Vim: delete character
   u / U         undo / redo (Helix); Vim redo is ctrl-r
   escape        normal (collapse visual)

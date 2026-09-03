@@ -13,6 +13,9 @@ test:
 themes:
     cargo r -- --list-themes
 
+gen-themes:
+    bun run scripts/gen-themes.ts
+
 dpreview *args:
     ./target/debug/crabmd -w {{args}}
 

@@ -1,6 +1,7 @@
 //! OpenCode-compatible theme loading (`"$schema": "https://opencode.ai/theme.json"`).
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use gpui::{rgb, Hsla, Rgba};
 use serde::Deserialize;
@@ -132,22 +133,44 @@ struct ThemeFile {
     appearance: Option<String>,
 }
 
+/// Parsed once, cloned on preview. `load_named` previously re-ran
+/// `serde_json::from_str` twice per hover/arrow step (hint + load);
+/// the Themes list calls both per row, per frame — ~140 parses per step.
+static ALL: OnceLock<Vec<Palette>> = OnceLock::new();
+
+/// All themes parsed once (lazily). Preview clones from here — no JSON.
+pub fn all_palettes() -> &'static [Palette] {
+    ALL.get_or_init(|| {
+        THEME_FILES
+            .iter()
+            .filter_map(|(name, json)| load_json(name, json).ok())
+            .collect()
+    })
+}
+
+fn cached(name: &str) -> Option<Palette> {
+    // Linear scan over ~70 entries; pointer-fast vs serde_json parse.
+    all_palettes()
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .cloned()
+}
+
 pub fn list_theme_names() -> Vec<&'static str> {
     THEME_FILES.iter().map(|(name, _)| *name).collect()
 }
 
-/// "dark"/"light" hint for the theme picker, read from the theme file's
-/// top-level `appearance` (both TUI and desktop schemas carry it).
-/// Falls back to the `-light` suffix convention.
+/// "dark"/"light" hint for the theme picker, from the parsed cache —
+/// no JSON work per row per frame.
 pub fn appearance_hint(name: &str) -> &'static str {
-    if let Some((_, json)) = THEME_FILES.iter().find(|(n, _)| *n == name) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-            match v.get("appearance").and_then(|a| a.as_str()) {
-                Some("light") => return "light",
-                Some("dark") => return "dark",
-                _ => {}
-            }
-        }
+    if let Some(p) = all_palettes()
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+    {
+        return match p.appearance {
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        };
     }
     if name.ends_with("-light") {
         "light"
@@ -156,8 +179,19 @@ pub fn appearance_hint(name: &str) -> &'static str {
     }
 }
 
+/// Index of a theme in `THEME_FILES` order (the picker's row order).
+/// Used to park the cursor on the current theme when the dialog opens.
+pub fn index_of(name: &str) -> Option<usize> {
+    THEME_FILES
+        .iter()
+        .position(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
+}
+
 pub fn load_named(name: &str) -> anyhow::Result<Palette> {
     let name = name.trim();
+    if let Some(p) = cached(name) {
+        return Ok(p);
+    }
     let json = THEME_FILES
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -201,36 +235,42 @@ fn load_tui(name: &str, file: &ThemeFile) -> anyhow::Result<Palette> {
         Appearance::Light => "light",
     };
 
-    let resolve = |key: &str, fallback: &str| -> Hsla {
-        color_of(&file, key, side).unwrap_or_else(|| parse_hex(fallback).unwrap())
+    let light = matches!(appearance, Appearance::Light);
+    let resolve = |key: &str, dark_fb: &str, light_fb: &str| -> Hsla {
+        // `transparent` / missing tokens hit the fallback. A dark fallback
+        // on a light theme renders text invisible (lucent-orng-light uses
+        // `transparent` panels), so fallbacks are appearance-aware.
+        let fb = if light { light_fb } else { dark_fb };
+        color_of(&file, key, side).unwrap_or_else(|| parse_hex(fb).unwrap())
     };
+    let hue = |key: &str, fallback: &str| -> Hsla { resolve(key, fallback, fallback) };
 
     Ok(Palette {
         name: name.to_string(),
         appearance,
-        background: resolve("background", "#0a0a0a"),
-        background_panel: resolve("backgroundPanel", "#141414"),
-        background_element: resolve("backgroundElement", "#1e1e1e"),
-        border: resolve("border", "#484848"),
-        text: resolve("text", "#eeeeee"),
-        text_muted: resolve("textMuted", "#808080"),
-        primary: resolve("primary", "#fab283"),
-        secondary: resolve("secondary", "#5c9cf5"),
-        accent: resolve("accent", "#9d7cd8"),
-        error: resolve("error", "#e06c75"),
-        warning: resolve("warning", "#f5a742"),
-        success: resolve("success", "#7fd88f"),
-        info: resolve("info", "#56b6c2"),
-        markdown_text: resolve("markdownText", "#eeeeee"),
-        markdown_heading: resolve("markdownHeading", "#9d7cd8"),
-        markdown_link: resolve("markdownLink", "#fab283"),
-        markdown_code: resolve("markdownCode", "#7fd88f"),
-        markdown_block_quote: resolve("markdownBlockQuote", "#e5c07b"),
-        markdown_emph: resolve("markdownEmph", "#e5c07b"),
-        markdown_strong: resolve("markdownStrong", "#f5a742"),
-        markdown_horizontal_rule: resolve("markdownHorizontalRule", "#808080"),
-        markdown_list_item: resolve("markdownListItem", "#fab283"),
-        markdown_code_block: resolve("markdownCodeBlock", "#eeeeee"),
+        background: resolve("background", "#0a0a0a", "#fafafa"),
+        background_panel: resolve("backgroundPanel", "#141414", "#ffffff"),
+        background_element: resolve("backgroundElement", "#1e1e1e", "#f5f5f5"),
+        border: resolve("border", "#484848", "#d4d4d4"),
+        text: resolve("text", "#eeeeee", "#1a1a1a"),
+        text_muted: resolve("textMuted", "#808080", "#8a8a8a"),
+        primary: hue("primary", "#fab283"),
+        secondary: hue("secondary", "#5c9cf5"),
+        accent: hue("accent", "#9d7cd8"),
+        error: hue("error", "#e06c75"),
+        warning: hue("warning", "#f5a742"),
+        success: hue("success", "#7fd88f"),
+        info: hue("info", "#56b6c2"),
+        markdown_text: resolve("markdownText", "#eeeeee", "#1a1a1a"),
+        markdown_heading: hue("markdownHeading", "#9d7cd8"),
+        markdown_link: hue("markdownLink", "#fab283"),
+        markdown_code: hue("markdownCode", "#7fd88f"),
+        markdown_block_quote: hue("markdownBlockQuote", "#e5c07b"),
+        markdown_emph: hue("markdownEmph", "#e5c07b"),
+        markdown_strong: hue("markdownStrong", "#f5a742"),
+        markdown_horizontal_rule: hue("markdownHorizontalRule", "#808080"),
+        markdown_list_item: hue("markdownListItem", "#fab283"),
+        markdown_code_block: resolve("markdownCodeBlock", "#eeeeee", "#1a1a1a"),
     })
 }
 

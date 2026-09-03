@@ -1,26 +1,27 @@
 # Kitchen sink
 
-A paragraph with **bold**, *italic*, ~~strikethrough~~, `inline code`, and a [link]().
+A paragraph with **bold**, *italic*, ~~strikethrough~~, `inline code`, and a [link](https://github.com). Bare URLs auto-link: https://github.github.com/gfm/.
+
+Crosslinks open in place (cmd-click): [partner doc](./sink-partner.md), [partner section](./sink-partner.md#second-part). Nowhere: [missing](./nope.md).
 
 ## Lists
 
 - bullet
 - still a bullet
+  - nested bullet
+    - deeper bullet
 
 1. one
 2. two
+   1. nested ordered
 
-- [ ] open taskka msdkamskd maskdm aksmdkamsdkamskdm askdmsak mdkasm dkasmdkam skdmaskdmaksdmk asmdkmaskdmasd
-  - [x] done tasskdjasdk
-    - [ ] carlolito
+- [ ] open task
+  - [x] done task
+    - [ ] deep task
 
 ## Quote
 
 > A plain block quote.
-
-GitHub-style note.
-
-a
 
 > [!TIP]
 > Massive!
@@ -42,8 +43,18 @@ fn main() {
 }
 ```
 
+```json
+{ "crab": "md", "wrap": true }
+```
 
-## Tablek
+```mermaid
+graph TD
+    A[edits] --> B[project]
+    B --> C{render}
+    C --> D[blocks]
+```
+
+## Table
 
 | Feature | GFM |
 | --- | --- |
@@ -51,14 +62,28 @@ fn main() {
 | Task lists | yes |
 | Alerts | yes |
 
+## Media
+
+Remote image renders as a card (never downloaded):
+
+![remote photo](https://picsum.photos/seed/crabmd/800/400)
+
+GitHub-style video (`<video src=…>`, extension optional):
+
+<video src="https://github.com/solidjs-community/solid-primitives/assets/38070918/7c4fa01f-7959-4a67-9588-e28448f7f20d"></video>
+
+Local video placeholder (drop an mp4 beside this file):
+
+![demo clip](demo-clip.mp4)
+
+HTML image block (width passthrough renders the file when local):
+
+<p>
+  <img width="100%" src="https://picsum.photos/seed/crabmd-html/1200/300" alt="wide banner">
+</p>
+
 ---
 
-Visit [https://github.github.com/gfm/]().
+# Second heading level one
 
-# asdmaksmdkasd amsdkm
-
-aksdmka msdkma skda
-
-amsdkams
-
-mk
+Some trailing text after the rule.
