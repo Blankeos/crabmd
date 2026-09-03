@@ -1,6 +1,6 @@
 {
   "name": "crabmd",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "A fast native GPUI markdown writer",
   "main": "bin.js",
   "bin": {
