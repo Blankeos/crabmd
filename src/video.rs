@@ -249,15 +249,36 @@ impl VideoStore {
     }
 
     /// Zero-timestamp containers (yscv reports all zeros) break pacing —
-    /// anything under ~1ms/frame is bogus, so synthesize 30fps across the
-    /// whole clip. Called once by the progressive forwarder after the final
-    /// batch lands (mirrors `decode_file`'s fixup for the one-shot path).
+    /// anything under ~1ms/frame is bogus, so synthesize pacing across the
+    /// whole clip. Prefers the container total (even spread over the true
+    /// duration); falls back to 30fps. Called once by the progressive
+    /// forwarder after the final batch lands (mirrors `decode_file`).
     pub fn normalize_timestamps(&mut self, key: &str) {
         if let Some(Slot::Ready(clip, stamps)) = self.slots.get_mut(key) {
             if stamps.last().copied().unwrap_or(0) < stamps.len() as u64 * 1_000 {
-                *stamps = (0..stamps.len()).map(|i| i as u64 * 33_333).collect();
-                clip.duration_us = stamps.last().copied().unwrap_or(0).max(1);
-                clip.fps = 30.0;
+                let n = stamps.len();
+                if n > 0 {
+                    if let (Some(t), Some(d)) = (clip.total_frames, clip.total_duration_us) {
+                        if t == n && d > 0 {
+                            *stamps = (0..n)
+                                .map(|i| {
+                                    if n <= 1 {
+                                        0
+                                    } else {
+                                        i as u64 * d / (n - 1) as u64
+                                    }
+                                })
+                                .collect();
+                            clip.duration_us = d;
+                            clip.fps = n as f32 / (d as f32 / 1_000_000.0);
+                            clip.fps = clip.fps.clamp(1.0, 120.0);
+                            return;
+                        }
+                    }
+                    *stamps = (0..n).map(|i| i as u64 * 33_333).collect();
+                    clip.duration_us = stamps.last().copied().unwrap_or(0).max(1);
+                    clip.fps = 30.0;
+                }
             }
         }
     }
@@ -1042,10 +1063,26 @@ mod tests {
         let mut store = VideoStore::default();
         store.begin("g".to_string());
         let mut saw_preview = false;
+        // Timeline denominator must stay pinned from the first batch —
+        // later chunks extend the buffered run, never the total.
+        let mut first_total: Option<usize> = None;
+        let mut first_dur: Option<u64> = None;
         while let Ok(b) = rx.try_recv() {
             let finished = b.finished;
             assert!(store.append_batch("g", b));
-            assert!(store.get("g").is_some());
+            let (clip, stamps) = store.get("g").expect("grown clip");
+            assert_eq!(clip.frames.len(), stamps.len());
+            if first_total.is_none() {
+                first_total = clip.total_frames;
+                first_dur = clip.total_duration_us;
+            } else {
+                assert_eq!(clip.total_frames, first_total, "total frames must not drift");
+                assert_eq!(clip.total_duration_us, first_dur, "total duration must not drift");
+            }
+            // Buffered fraction grows monotonically toward 1.0.
+            if let Some(bf) = clip.buffered_frac() {
+                assert!((0.0..=1.0).contains(&bf));
+            }
             if !finished {
                 assert!(store.is_preview("g"), "in-flight clip stays preview");
                 saw_preview = true;
@@ -1057,6 +1094,72 @@ mod tests {
         let (clip, stamps) = store.get("g").expect("grown clip");
         assert_eq!(clip.frames.len(), stamps.len());
         assert!(clip.duration_us > 0);
+        // Stable timeline: denominator equals the decoded run on completion.
+        assert_eq!(clip.timeline_frames(), clip.frames.len());
+    }
+
+    #[test]
+    fn container_probe_gives_stable_timeline() {
+        let path = std::path::Path::new("examples/random_small.mp4");
+        if !path.exists() {
+            return;
+        }
+        let reader = yscv_video::Mp4VideoReader::open(path).expect("open sample");
+        let samples = reader.nal_count();
+        assert!(samples > 0);
+        let dur = parse_mp4_duration(path).expect("moov duration");
+        assert!(dur > 0);
+        let (clip, _) = decode_file(path).expect("one-shot decode");
+        // One-shot clips carry the same totals the progressive path uses.
+        assert_eq!(clip.total_frames, Some(samples));
+        assert_eq!(clip.total_duration_us, Some(dur));
+        assert_eq!(clip.timeline_frames(), clip.frames.len());
+        assert_eq!(clip.timeline_duration_us(), dur);
+        // Buffered fraction is complete once decoded.
+        assert!((clip.buffered_frac().unwrap_or(0.0) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn playback_stalls_at_buffer_end_while_preview() {
+        let mut store = VideoStore::default();
+        store.begin("p".to_string());
+        // Fake a 2-batch progressive clip: first batch preview, 12 frames.
+        let mk = |n: usize, finished: bool| DecodeBatch {
+            frames: vec![rgb8_to_image(&vec![1u8; 4 * 2 * 3], 4, 2).unwrap(); n],
+            stamps: (0..n).map(|i| i as u64 * 33_333).collect(),
+            width: 4,
+            height: 2,
+            duration_us: n as u64 * 33_333,
+            fps: 30.0,
+            finished,
+            truncated: false,
+            total_frames: Some(24),
+            total_duration_us: Some(24 * 33_333),
+        };
+        assert!(store.append_batch("p", mk(12, false)));
+        assert!(store.is_preview("p"));
+        // Play to the buffer end: the loop must stall (true), not stop.
+        let (_, gen) = store.toggle("p");
+        for _ in 0..11 {
+            assert!(store.advance_if_active("p", gen));
+        }
+        // Frame 11 is the last buffered; next tick stalls, keeps playing.
+        assert!(store.advance_if_active("p", gen));
+        let (playing, frame) = store.play_state("p");
+        assert!(playing, "stall must not pause");
+        assert_eq!(frame, 11);
+        // Second batch completes the clip → playback runs to the end, then pauses.
+        assert!(store.append_batch("p", mk(12, true)));
+        assert!(!store.is_preview("p"));
+        // From 11, twelve advances reach 23 (last); the next tick pauses.
+        for _ in 0..12 {
+            assert!(store.advance_if_active("p", gen));
+        }
+        let (playing, frame) = store.play_state("p");
+        assert!(playing && frame == 23);
+        assert!(!store.advance_if_active("p", gen));
+        let (playing, _) = store.play_state("p");
+        assert!(!playing, "finished clip pauses at the end");
     }
 
     #[test]

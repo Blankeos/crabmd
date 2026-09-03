@@ -5725,8 +5725,11 @@ impl Workspace {
             let key_seek = key.clone();
             let key_drag = key.clone();
             let key_outside = key.clone();
-            let n_seek = n;
-            let n_drag = n;
+            // Seek fractions are over the stable `total_n` timeline; the
+            // store clamps to the decoded run, so seeking past the buffer
+            // lands at the buffer end (YouTube behavior) instead of past it.
+            let n_seek = total_n;
+            let n_drag = total_n;
             let scrub = div()
                 .id(("video-scrub", display_start))
                 .w_full()
@@ -5787,7 +5790,7 @@ impl Workspace {
                 .on_drag(
                     DragVideoScrub {
                         key: key.clone(),
-                        total: n,
+                        total: total_n,
                     },
                     |drag, _, _, cx| {
                         cx.stop_propagation();
@@ -5830,6 +5833,22 @@ impl Workspace {
                         .h(px(6.))
                         .rounded_full()
                         .bg(pal2.border)
+                        // Buffered (decoded) run — YouTube-style grey track
+                        // behind the playhead. Grows as batches land; the
+                        // playhead (`frac`) stays pinned to the stable total.
+                        .when(buffered_frac.is_some(), |el| {
+                            let b = buffered_frac.unwrap_or(0.0);
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(relative(b))
+                                    .rounded_full()
+                                    .bg(pal2.text_muted),
+                            )
+                        })
                         .child(
                             div()
                                 .absolute()
@@ -6173,7 +6192,9 @@ impl Workspace {
             }
             // Zero frames decoded → surface the error card (the decode
             // thread dropped `tx` without sending). Otherwise the partial
-            // clip stays playable.
+            // clip stays playable — but clear a dangling `preview` flag
+            // (error tail after partial batches) so the timer loop stops
+            // at the buffer end instead of stalling forever.
             let _ = cx.update(|cx| {
                 view.update(cx, |this, cx| {
                     if published == 0 && this.video.get(&key).is_none() {
@@ -6183,6 +6204,7 @@ impl Workspace {
                         );
                         cx.notify();
                     } else {
+                        this.video.finalize_preview(&key);
                         // Wake the card one last time (preview flag cleared).
                         cx.notify();
                     }
