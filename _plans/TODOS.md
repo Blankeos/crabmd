@@ -8,6 +8,12 @@
 - [x] Table rendering needs to be more like a table, it breaks if a cell has multiple lines, then you get a brick-like grid which is bad. The table controls like the footer with controls needs to be floating next to the grid I am focusing. Cell highlights and multiple cell highlighting should also be possible.
 - [x] Keyboard accessibility: The up,down seems to be sometimes inaccurate for the same block but wrapped text. Only sometimes, make it more accurate.
 - [x] Bug: when I `cmd+f` to find. Pressing enter still gets listened by the editor, not the search bar.
-- [ ] Bug: when selecting with click and drag the text selection tools popover that floats on top of selections sometimes interferes with the mouse event so when my click and drag is over that tooltip/popover, the mouse movement does not affect me selecting the text behind it.
-- [ ] Table: make the tools tip/popover two-rowed so it fits below for table ops.
+- [x] Bug: when selecting with click and drag the text selection tools popover that floats on top of selections sometimes interferes with the mouse event so when my click and drag is over that tooltip/popover, the mouse movement does not affect me selecting the text behind it.
+- [x] Big bug: Hierarchical lists lose data. I tried to write a hierarchical list and the hierarchy was lost first of all. And the parent list item disappeared. Please make sure we're serializing correctly.
+- [x] Feature: make sure that when we dirty the editor state by even just 1, then do undo. The "changed" state circle thing disappears too. Also.. Please warn, if the user is trying to quit but there's still changes. With an alert maybe.
+- [x] Table the text selection popover options for text and table ops are not fitting because it's too many and too wide. For now let's make it like a 2-row tip/popover. 1st is the text options, 2nd is the table/grid ops.
+- [x] Table: multiple selections and multiple delete of rows should be possible. Show delete rows, delete cols since it should be contextual.
+- [x] Table: text selection should still be possible. Tip since the bg color of selection is the same for cells and the text selection. Make the border colored for selected cells instead. And 2x2 cells selected means the inside borders are not colored, just the outer ones, kinda like notion.
+- [x] Table: since text selection is possible, cmd-b should still work in tables.
+- [x] Table: shift+enter should be possible
 

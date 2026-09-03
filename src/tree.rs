@@ -743,6 +743,301 @@ impl Doc {
         self.delete_display(prev..d)
     }
 
+    /// Vim `r`: replace `count` display chars at `caret` with `ch`.
+    /// Newlines are skipped (never replaced), mirroring motion semantics.
+    /// Caret stays put.
+    pub fn replace_chars(&mut self, caret: usize, count: usize, ch: char) -> usize {
+        let p = self.project();
+        let d = caret.min(p.display.len());
+        let loc = self.loc(d);
+        let text = inlines_text(self.inlines_at(loc));
+        let mut end = loc.offset;
+        let mut n = 0usize;
+        for c in text[loc.offset.min(text.len())..].chars().take(count.max(1)) {
+            if c == '\n' {
+                end += c.len_utf8();
+                continue;
+            }
+            end += c.len_utf8();
+            n += 1;
+        }
+        if n == 0 {
+            return d;
+        }
+        let repl: String = std::iter::repeat(ch).take(n).collect();
+        let inlines = self.inlines_at_mut(loc);
+        delete_inlines(inlines, loc.offset, end);
+        insert_inlines(inlines, loc.offset, &repl, Marks::default());
+        // Re-resolve: deletion/insertion may have merged runs.
+        let p2 = self.project();
+        let lb = Self::target_display(&p2, &loc);
+        (lb.start + loc.offset).min(p2.display.len())
+    }
+
+    /// Helix replace: every non-newline char in `range` becomes `ch`.
+    pub fn replace_range(&mut self, range: Range<usize>, ch: char) -> usize {
+        let a = range.start.min(range.end);
+        let b = range.end.max(range.start);
+        if a >= b {
+            return self.replace_chars(a, 1, ch);
+        }
+        let p = self.project();
+        let targets = self.mark_targets(&p, a, b);
+        let ranges: Vec<(Loc, usize, usize)> = targets
+            .iter()
+            .filter_map(|t| {
+                let disp = Self::target_display(&p, t);
+                let s = a.max(disp.start);
+                let e = b.min(disp.end);
+                (s < e).then(|| (*t, s - disp.start, e - disp.start))
+            })
+            .collect();
+        drop(p);
+        for (loc, off0, off1) in ranges {
+            let text = inlines_text(self.inlines_at(loc));
+            let end = off1.min(text.len());
+            let mut out = String::new();
+            for c in text[off0.min(text.len())..end].chars() {
+                if c == '\n' {
+                    out.push('\n');
+                } else {
+                    out.push(ch);
+                }
+            }
+            let inlines = self.inlines_at_mut(loc);
+            delete_inlines(inlines, off0, end);
+            insert_inlines(inlines, off0, &out, Marks::default());
+        }
+        a
+    }
+
+    /// Vim `J`: join the unit under `caret` with the next `count` units.
+    pub fn join_lines(&mut self, caret: usize, count: usize) -> usize {
+        let mut caret = caret;
+        for _ in 0..count.max(1) {
+            let p = self.project();
+            let us = units(&p);
+            let Some(pos) = us.iter().position(|u| {
+                let r = unit_display(&p, *u);
+                caret >= r.start && caret <= r.end
+            }) else {
+                break;
+            };
+            if pos + 1 >= us.len() {
+                break;
+            }
+            caret = self.join_unit_with_next(us[pos], us[pos + 1]);
+        }
+        caret
+    }
+
+    /// Visual `J`: join every unit overlapping `range`.
+    pub fn join_range(&mut self, range: Range<usize>) -> usize {
+        let a = range.start.min(range.end);
+        let b = range.end.max(range.start);
+        let p = self.project();
+        let us = units(&p);
+        let mut n = 0usize;
+        for u in &us {
+            let r = unit_display(&p, *u);
+            if r.start < b && r.end > a {
+                n += 1;
+            }
+        }
+        drop(p);
+        let mut caret = a;
+        for _ in 0..n.saturating_sub(1).max(1) {
+            let p = self.project();
+            let us = units(&p);
+            let Some(pos) = us.iter().position(|u| {
+                let r = unit_display(&p, *u);
+                caret >= r.start && caret <= r.end
+            }) else {
+                break;
+            };
+            if pos + 1 >= us.len() {
+                break;
+            }
+            caret = self.join_unit_with_next(us[pos], us[pos + 1]);
+        }
+        caret
+    }
+
+    fn join_unit_with_next(&mut self, cur: Unit, next: Unit) -> usize {
+        // Same list node, both items: fold next item text into current.
+        if cur.block == next.block {
+            if let (Some(i), Some(j)) = (cur.item, next.item) {
+                let (left_len, joint) = {
+                    let NodeKind::List { items, .. } = &self.nodes[cur.block].kind else {
+                        return 0;
+                    };
+                    let left = inlines_text(&items[i.min(items.len() - 1)].inlines);
+                    let right = inlines_text(&items[j.min(items.len() - 1)].inlines);
+                    let space = (!left.is_empty() && !right.is_empty()).then_some(" ");
+                    (
+                        left.len() + space.map(|s: &str| s.len()).unwrap_or(0),
+                        format!("{left}{}{right}", space.unwrap_or_default()),
+                    )
+                };
+                let NodeKind::List { items, .. } = &mut self.nodes[cur.block].kind else {
+                    return 0;
+                };
+                let j = j.min(items.len() - 1);
+                let i = i.min(j);
+                items[i].inlines = vec![Inline {
+                    text: joint,
+                    marks: Marks::default(),
+                }];
+                if j > i {
+                    items.remove(j);
+                }
+                return self.caret_after(cur.block, Some(i), None, left_len);
+            }
+        }
+        // Cross-node: append next unit's text to the end of current, drop next.
+        let p0 = self.project();
+        let join_at = unit_display(&p0, cur).end.min(p0.display.len());
+        drop(p0);
+        let right_text = match next.item {
+            Some(j) => match &self.nodes[next.block].kind {
+                NodeKind::List { items, .. } => items
+                    .get(j)
+                    .map(|it| inlines_text(&it.inlines))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+            None => match &self.nodes[next.block].kind {
+                NodeKind::Paragraph { inlines }
+                | NodeKind::Heading { inlines, .. }
+                | NodeKind::Quote { inlines }
+                | NodeKind::Alert { inlines, .. } => inlines_text(inlines),
+                NodeKind::Code { text, .. } => text.clone(),
+                _ => String::new(),
+            },
+        };
+        let keep_end = self.node_end(cur.block, cur.item);
+        let node = cur.block;
+        let item = cur.item;
+        {
+            let inlines = self.inlines_at_mut(Loc {
+                node,
+                item,
+                cell: None,
+                offset: 0,
+            });
+            let cur_text = inlines_text(inlines);
+            let space = (!cur_text.is_empty() && !right_text.is_empty()).then_some(" ");
+            let joint = format!("{cur_text}{}{right_text}", space.unwrap_or_default());
+            *inlines = vec![Inline {
+                text: joint,
+                marks: Marks::default(),
+            }];
+        }
+        if next.block != cur.block {
+            if let Some(j) = next.item {
+                if let NodeKind::List { items, .. } = &mut self.nodes[next.block].kind {
+                    if j < items.len() {
+                        if items.len() <= 1 {
+                            self.nodes.remove(next.block);
+                        } else {
+                            items.remove(j);
+                        }
+                    }
+                }
+            } else if next.block < self.nodes.len() {
+                // Only drop the node when it contributed nothing mergeable
+                // (paragraph-like kinds are folded into `keep` by merge_nodes;
+                // other kinds like tables/images must stay put).
+                let mergeable = matches!(
+                    self.nodes[next.block].kind,
+                    NodeKind::Paragraph { .. }
+                        | NodeKind::Heading { .. }
+                        | NodeKind::Quote { .. }
+                        | NodeKind::Alert { .. }
+                        | NodeKind::Code { .. }
+                );
+                if mergeable {
+                    self.merge_nodes(cur.block, next.block);
+                }
+            }
+        }
+        let _ = keep_end;
+        let n = self.project().display.len();
+        join_at.min(n)
+    }
+
+    /// Toggle `mark` on exactly the cells of a table rectangle
+    /// (display rows `r0..=r1`, cols `c0..=c1`). Returns true when applied.
+    pub fn toggle_mark_table(
+        &mut self,
+        block: usize,
+        r0: usize,
+        r1: usize,
+        c0: usize,
+        c1: usize,
+        mark: Mark,
+    ) -> bool {
+        let p = self.project();
+        let Some(b) = p.blocks.get(block) else {
+            return false;
+        };
+        let BlockExtra::Table { cells, .. } = &b.extra else {
+            return false;
+        };
+        let (rlo, rhi) = (r0.min(r1), r0.max(r1));
+        let (clo, chi) = (c0.min(c1), c0.max(c1));
+        let targets: Vec<(Loc, Range<usize>)> = cells
+            .iter()
+            .filter(|c| c.row >= rlo && c.row <= rhi && c.col >= clo && c.col <= chi)
+            .map(|c| {
+                (
+                    Loc {
+                        node: block,
+                        item: None,
+                        cell: Some((c.row, c.col)),
+                        offset: 0,
+                    },
+                    c.display.clone(),
+                )
+            })
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let mut total = 0usize;
+        let mut marked = 0usize;
+        for (_, disp) in &targets {
+            for i in disp.start..disp.end {
+                total += 1;
+                if mark.has(p.marks_at(i, Affinity::Inside)) {
+                    marked += 1;
+                }
+            }
+        }
+        let turn_on = !(total > 0 && marked == total);
+        drop(p);
+        for (loc, disp) in targets {
+            let len = disp.end.saturating_sub(disp.start);
+            let inlines = self.inlines_at_mut(loc);
+            apply_mark_range(inlines, 0, len, mark, turn_on);
+        }
+        true
+    }
+
+    /// Insert an image block after the unit under `caret`.
+    pub fn insert_image(&mut self, caret: usize, alt: String, src: String) -> usize {
+        let loc = self.loc(caret);
+        let at = loc.node + 1;
+        self.nodes.insert(
+            at.min(self.nodes.len()),
+            Node {
+                id: next_id(),
+                kind: NodeKind::Image { alt, src },
+            },
+        );
+        self.caret_after(at.min(self.nodes.len().saturating_sub(1)), None, None, 0)
+    }
+
     pub fn enter(&mut self, caret: usize, hard: bool) -> usize {
         let loc = self.loc(caret);
         match &self.nodes[loc.node].kind {
@@ -750,7 +1045,9 @@ impl Doc {
                 return self.insert_text(caret, None, "\n", Marks::default());
             }
             NodeKind::List { .. } => return self.enter_list(loc),
-            NodeKind::Table { .. } => return caret,
+            NodeKind::Table { .. } => {
+                return self.insert_text(caret, None, "\n", Marks::default());
+            }
             NodeKind::Rule | NodeKind::Image { .. } => {
                 self.nodes.insert(
                     loc.node + 1,
@@ -1026,15 +1323,17 @@ impl Doc {
             return None;
         }
         let p = self.project();
-        let us = units(&p);
+        let targets = self.mark_targets(&p, a, b);
+        if targets.is_empty() {
+            return None;
+        }
 
-        // Check whether all actual text content inside the selection has the mark.
         let mut total_chars = 0usize;
         let mut marked_chars = 0usize;
-        for u in &us {
-            let u_disp = unit_display(&p, *u);
-            let overlap_start = a.max(u_disp.start);
-            let overlap_end = b.min(u_disp.end);
+        for t in &targets {
+            let disp = Self::target_display(&p, t);
+            let overlap_start = a.max(disp.start);
+            let overlap_end = b.min(disp.end);
             if overlap_start < overlap_end {
                 for i in overlap_start..overlap_end {
                     total_chars += 1;
@@ -1053,30 +1352,96 @@ impl Doc {
         // Partially-marked contiguous words clear instead of stacking.
         let turn_on = !(all || (any && wordish));
 
+        let ranges: Vec<(Loc, usize, usize)> = targets
+            .iter()
+            .filter_map(|t| {
+                let disp = Self::target_display(&p, t);
+                let overlap_start = a.max(disp.start);
+                let overlap_end = b.min(disp.end);
+                if overlap_start < overlap_end {
+                    Some((
+                        *t,
+                        overlap_start - disp.start,
+                        overlap_end - disp.start,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(p);
+
         let mut affected = 0;
-        for u in us {
-            let u_disp = unit_display(&p, u);
-            let overlap_start = a.max(u_disp.start);
-            let overlap_end = b.min(u_disp.end);
-            if overlap_start < overlap_end {
-                let off0 = overlap_start - u_disp.start;
-                let off1 = overlap_end - u_disp.start;
-                let loc = Loc {
-                    node: u.block,
-                    item: u.item,
-                    cell: None,
-                    offset: off0,
-                };
-                let inlines = self.inlines_at_mut(loc);
-                apply_mark_range(inlines, off0, off1, mark, turn_on);
-                affected += 1;
-            }
+        for (loc, off0, off1) in ranges {
+            let inlines = self.inlines_at_mut(loc);
+            apply_mark_range(inlines, off0, off1, mark, turn_on);
+            affected += 1;
         }
         if affected == 0 {
             None
         } else {
             Some(a..b)
         }
+    }
+
+    fn mark_targets(&self, p: &Projection, a: usize, b: usize) -> Vec<Loc> {
+        let mut out = Vec::new();
+        for (bi, block) in p.blocks.iter().enumerate() {
+            match &block.extra {
+                BlockExtra::Table { cells, .. } => {
+                    for c in cells {
+                        if a < c.display.end && b > c.display.start {
+                            out.push(Loc {
+                                node: bi,
+                                item: None,
+                                cell: Some((c.row, c.col)),
+                                offset: 0,
+                            });
+                        }
+                    }
+                }
+                BlockExtra::List { items, .. } => {
+                    for (i, it) in items.iter().enumerate() {
+                        if a < it.display.end && b > it.display.start {
+                            out.push(Loc {
+                                node: bi,
+                                item: Some(i),
+                                cell: None,
+                                offset: 0,
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    if a < block.display.end && b > block.display.start {
+                        out.push(Loc {
+                            node: bi,
+                            item: None,
+                            cell: None,
+                            offset: 0,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn target_display(p: &Projection, loc: &Loc) -> Range<usize> {
+        let Some(block) = p.blocks.get(loc.node) else {
+            return 0..0;
+        };
+        if let (Some((r, c)), BlockExtra::Table { cells, .. }) = (loc.cell, &block.extra) {
+            if let Some(cell) = cells.iter().find(|x| x.row == r && x.col == c) {
+                return cell.display.clone();
+            }
+        }
+        if let (Some(i), BlockExtra::List { items, .. }) = (loc.item, &block.extra) {
+            if let Some(it) = items.get(i) {
+                return it.display.clone();
+            }
+        }
+        block.display.clone()
     }
 
     pub fn apply_slash(&mut self, caret: usize, template: &str) -> usize {
@@ -1248,6 +1613,85 @@ impl Doc {
         };
         let new_r = if r == 0 { 0 } else { r.saturating_sub(1).min(max_r) };
         Some(self.caret_after(loc.node, None, Some((new_r, c)), 0))
+    }
+
+    /// Delete body rows in `[r0, r1]` (display rows; 0 is the header). Header is
+    /// skipped. Caret lands in the row that replaced the first deleted body row.
+    pub fn delete_table_rows(&mut self, caret: usize, r0: usize, r1: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (_, c) = loc.cell?;
+        let (lo, hi) = (r0.min(r1), r0.max(r1));
+        {
+            let NodeKind::Table { rows, .. } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            let body_lo = lo.saturating_sub(1).min(rows.len());
+            let body_hi = if hi == 0 {
+                // Header-only: same as deleting the first body row.
+                0
+            } else {
+                hi.saturating_sub(1)
+            };
+            if rows.is_empty() {
+                return Some(self.caret_after(loc.node, None, Some((0, c)), 0));
+            }
+            let from = body_lo.min(rows.len().saturating_sub(1));
+            let to = body_hi.min(rows.len().saturating_sub(1));
+            if from <= to {
+                rows.drain(from..=to);
+            }
+        }
+        let max_r = match &self.nodes[loc.node].kind {
+            NodeKind::Table { rows, .. } => rows.len(),
+            _ => 0,
+        };
+        let new_r = if lo == 0 {
+            0
+        } else {
+            lo.saturating_sub(1).min(max_r).max(1).min(max_r)
+        };
+        Some(self.caret_after(loc.node, None, Some((new_r, c)), 0))
+    }
+
+    pub fn delete_table_cols(&mut self, caret: usize, c0: usize, c1: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, _) = loc.cell?;
+        let (lo, hi) = (c0.min(c1), c0.max(c1));
+        {
+            let NodeKind::Table { headers, rows } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            let last = headers.len().saturating_sub(1);
+            let from = lo.min(last);
+            let to = hi.min(last);
+            if from == 0 && to == last {
+                headers.clear();
+                headers.push(vec![]);
+                for row in rows.iter_mut() {
+                    row.clear();
+                    row.push(vec![]);
+                }
+            } else {
+                for i in (from..=to).rev() {
+                    if headers.len() <= 1 {
+                        break;
+                    }
+                    if i < headers.len() {
+                        headers.remove(i);
+                    }
+                    for row in rows.iter_mut() {
+                        if i < row.len() {
+                            row.remove(i);
+                        }
+                    }
+                }
+            }
+        }
+        let max_c = match &self.nodes[loc.node].kind {
+            NodeKind::Table { headers, .. } => headers.len().saturating_sub(1),
+            _ => 0,
+        };
+        Some(self.caret_after(loc.node, None, Some((r, lo.min(max_c))), 0))
     }
 
     pub fn delete_table(&mut self, caret: usize) -> Option<usize> {
@@ -1464,11 +1908,16 @@ impl Doc {
         if ix >= items.len() {
             return false;
         }
+        let end = list_subtree_end(items, ix);
         if outdent {
             if items[ix].indent == 0 {
                 return false;
             }
-            items[ix].indent -= 1;
+            for item in &mut items[ix..end] {
+                if item.indent > 0 {
+                    item.indent -= 1;
+                }
+            }
             true
         } else {
             let max = if ix == 0 {
@@ -1479,7 +1928,9 @@ impl Doc {
             if items[ix].indent >= max {
                 return false;
             }
-            items[ix].indent += 1;
+            for item in &mut items[ix..end] {
+                item.indent += 1;
+            }
             true
         }
     }
@@ -1503,14 +1954,24 @@ impl Doc {
         let p = self.project();
         let us = units(&p);
         let mut modified = false;
+        // Skip descendants already shifted with a selected ancestor.
+        let mut skip: Option<(usize, usize)> = None;
         for u in us {
             let u_disp = unit_display(&p, u);
             let overlap_start = a.max(u_disp.start);
             let overlap_end = b.min(u_disp.end);
             if overlap_start < overlap_end {
                 if let Some(item_ix) = u.item {
+                    if skip.is_some_and(|(block, until)| block == u.block && item_ix < until) {
+                        continue;
+                    }
                     if self.tab_item_at(u.block, item_ix, outdent) {
                         modified = true;
+                        let until = match &self.nodes[u.block].kind {
+                            NodeKind::List { items, .. } => list_subtree_end(items, item_ix),
+                            _ => item_ix + 1,
+                        };
+                        skip = Some((u.block, until));
                     }
                 }
             }
@@ -1956,6 +2417,18 @@ fn nodes_plain_text(nodes: &[Node]) -> String {
         .join("\n")
 }
 
+/// Exclusive end of `ix` plus nested items (indent strictly deeper than `ix`).
+fn list_subtree_end(items: &[ListItem], ix: usize) -> usize {
+    let Some(base) = items.get(ix).map(|it| it.indent) else {
+        return ix;
+    };
+    let mut j = ix + 1;
+    while j < items.len() && items[j].indent > base {
+        j += 1;
+    }
+    j
+}
+
 fn flatten_list_items(nodes: Vec<Node>) -> Vec<ListItem> {
     nodes
         .into_iter()
@@ -2028,7 +2501,7 @@ fn node_from_proj(p: &Projection, b: &ProjBlock, src: &str) -> Node {
             let mut headers = vec![vec![]; (*cols).max(1)];
             let mut body = vec![vec![vec![]; (*cols).max(1)]; (*rows).saturating_sub(1)];
             for c in cells {
-                let ins = inlines_in(p, c.display.clone());
+                let ins = table_inlines_in(p, c.display.clone());
                 if c.header {
                     if c.col < headers.len() {
                         headers[c.col] = ins;
@@ -2061,6 +2534,16 @@ fn node_from_proj(p: &Projection, b: &ProjBlock, src: &str) -> Node {
         id: next_id(),
         kind,
     }
+}
+
+fn table_inlines_in(p: &Projection, range: Range<usize>) -> Vec<Inline> {
+    let mut ins = inlines_in(p, range);
+    for run in &mut ins {
+        if run.text.contains(crate::display::TABLE_CELL_BR) {
+            run.text = run.text.replace(crate::display::TABLE_CELL_BR, "\n");
+        }
+    }
+    ins
 }
 
 fn inlines_in(p: &Projection, range: Range<usize>) -> Vec<Inline> {
@@ -2860,7 +3343,7 @@ mod tests {
             1,
             "row separators stay unique: {table:?}"
         );
-        assert!(table.contains("foo bar"), "{table:?}");
+        assert!(table.contains("foo\u{001e}bar"), "{table:?}");
         assert!(!table.contains("foo\nbar"), "{table:?}");
         // Tree still stores the original newline.
         match &d.nodes[0].kind {
@@ -3005,6 +3488,133 @@ mod feature_tests {
         );
         assert!(gfm.contains("- a"), "{gfm:?}");
         assert!(gfm.contains("- b") && gfm.contains("- c"), "{gfm:?}");
+        let NodeKind::List { items, .. } = &d2.nodes[0].kind else {
+            panic!("{:?}", d2.nodes[0].kind);
+        };
+        assert_eq!(items.len(), 3, "{gfm:?}");
+        assert_eq!(inlines_text(&items[0].inlines), "a");
+        assert_eq!(items[0].indent, 0);
+        assert_eq!(items[1].indent, 1);
+        assert_eq!(items[2].indent, 2);
+    }
+
+    #[test]
+    fn nested_list_from_gfm_keeps_parent() {
+        let src = "- parent\n  - child\n    - grand\n- sibling";
+        let d = Doc::from_gfm(src);
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!("{:?}", d.nodes[0].kind);
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|it| (it.indent, inlines_text(&it.inlines)))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "parent".into()),
+                (1, "child".into()),
+                (2, "grand".into()),
+                (0, "sibling".into()),
+            ]
+        );
+        let gfm = d.to_gfm();
+        assert!(gfm.contains("- parent"), "{gfm:?}");
+        let d2 = Doc::from_gfm(&gfm);
+        let NodeKind::List { items, .. } = &d2.nodes[0].kind else {
+            panic!("{} {:?}", gfm, d2.nodes[0].kind);
+        };
+        assert_eq!(items.len(), 4, "{gfm:?}");
+        assert_eq!(inlines_text(&items[0].inlines), "parent");
+    }
+
+    #[test]
+    fn tab_parent_indents_nested_children() {
+        let mut d = Doc::from_gfm("- parent\n  - child\n    - grand\n- sibling");
+        let p = d.project();
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!()
+        };
+        let parent = items[0].display.start;
+        d.tab(parent, false).expect("indent parent subtree");
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
+        assert_eq!(
+            items.iter().map(|it| it.indent).collect::<Vec<_>>(),
+            vec![1, 2, 3, 0],
+            "children follow the parent; sibling stays"
+        );
+        d.tab(parent, true).expect("outdent parent subtree");
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!()
+        };
+        assert_eq!(
+            items.iter().map(|it| it.indent).collect::<Vec<_>>(),
+            vec![0, 1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn write_nested_tasks_keeps_parents() {
+        use crate::display::Affinity;
+        let mut d = Doc::empty();
+        let mut c = 0;
+        for ch in "- [ ] wow2".chars() {
+            c = d.insert_text(c, None, &ch.to_string(), Marks::default());
+        }
+        c = d.enter(c, false);
+        c = d.tab(c, false).expect("tab");
+        for ch in "wow3".chars() {
+            c = d.insert_text(c, None, &ch.to_string(), Marks::default());
+        }
+        c = d.enter(c, false);
+        c = d.tab(c, false).expect("tab2");
+        for ch in "wow4".chars() {
+            c = d.insert_text(c, None, &ch.to_string(), Marks::default());
+        }
+        let gfm = d.to_gfm();
+        assert!(
+            gfm.contains("wow2") && gfm.contains("wow3") && gfm.contains("wow4"),
+            "parents lost while writing: {gfm:?}"
+        );
+        let d2 = Doc::from_gfm(&gfm);
+        let texts: Vec<String> = d2
+            .nodes
+            .iter()
+            .flat_map(|n| match &n.kind {
+                NodeKind::List { items, .. } => items
+                    .iter()
+                    .map(|it| inlines_text(&it.inlines))
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(texts, vec!["wow2", "wow3", "wow4"], "gfm was {gfm:?}");
+        let _ = Affinity::Inside;
+        let _ = c;
+    }
+
+    #[test]
+    fn nested_tasks_roundtrip() {
+        let src = "- [ ] wow2\n  - [ ] wow3\n    - [ ] wow4";
+        let d = Doc::from_gfm(src);
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!("not a list: {:?}", d.nodes[0].kind);
+        };
+        assert_eq!(items.len(), 3, "{items:?}");
+        let gfm = d.to_gfm();
+        let d2 = Doc::from_gfm(&gfm);
+        let NodeKind::List { items, .. } = &d2.nodes[0].kind else {
+            panic!("reparse lost list: {gfm:?} -> {:?}", d2.nodes[0].kind);
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|it| inlines_text(&it.inlines))
+                .collect::<Vec<_>>(),
+            vec!["wow2".to_string(), "wow3".to_string(), "wow4".to_string()],
+            "gfm was {gfm:?}"
+        );
     }
 
     #[test]
@@ -3255,5 +3865,123 @@ mod feature_tests {
         assert_eq!(rows[0].len(), 3);
         assert_eq!(inlines_text(&headers[0]), "a");
         assert_eq!(inlines_text(&headers[2]), "b");
+    }
+
+    #[test]
+    fn table_toggle_mark_stays_in_cell() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| hello | 2 |\n");
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let cell = cells.iter().find(|c| c.row == 1 && c.col == 0).unwrap();
+        let sel = cell.display.clone();
+        d.toggle_mark(sel.clone(), Mark::Bold).unwrap();
+        let p2 = d.project();
+        assert!(p2.marks_at(sel.start, Affinity::Inside).bold);
+        let BlockExtra::Table { cells, .. } = &p2.blocks[0].extra else {
+            panic!();
+        };
+        let other = cells.iter().find(|c| c.row == 1 && c.col == 1).unwrap();
+        assert!(!p2.marks_at(other.display.start, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn table_shift_enter_stays_in_cell() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let cell = cells.iter().find(|c| c.row == 1 && c.col == 0).unwrap();
+        let caret = cell.display.end;
+        let next = d.enter(caret, true);
+        match &d.nodes[0].kind {
+            NodeKind::Table { rows, .. } => {
+                assert!(inlines_text(&rows[0][0]).contains('\n'), "{rows:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let p2 = d.project();
+        let BlockExtra::Table { cells, rows, .. } = &p2.blocks[0].extra else {
+            panic!();
+        };
+        assert_eq!(*rows, 2);
+        let cell2 = cells.iter().find(|c| c.row == 1 && c.col == 0).unwrap();
+        assert!(
+            next >= cell2.display.start && next <= cell2.display.end,
+            "caret {next} not in {}..{}",
+            cell2.display.start,
+            cell2.display.end
+        );
+        let display = &p2.display;
+        assert!(
+            display.is_char_boundary(next),
+            "caret {next} not a char boundary in {display:?}"
+        );
+        assert!(
+            !display[cell2.display.clone()].contains('\n'),
+            "cell display must not use raw newlines: {:?}",
+            &display[cell2.display.clone()]
+        );
+    }
+
+    #[test]
+    fn table_delete_row_range() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n");
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let cell = cells.iter().find(|c| c.row == 1 && c.col == 0).unwrap();
+        d.delete_table_rows(cell.display.start, 1, 2).unwrap();
+        let NodeKind::Table { rows, .. } = &d.nodes[0].kind else {
+            panic!();
+        };
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn table_toggle_mark_rect_scopes_to_rect() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        assert!(d.toggle_mark_table(0, 0, 1, 1, 1, Mark::Bold));
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        for c in cells {
+            let bold = p.marks_at(c.display.start, Affinity::Inside).bold;
+            if c.col == 1 {
+                assert!(bold, "right column cell must be bold: {c:?}");
+            } else {
+                assert!(!bold, "left column cell must stay plain: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn replace_chars_stays_put() {
+        let mut d = Doc::from_gfm("Tablek");
+        let p = d.project();
+        let at = p.display.len() - 1;
+        let c = d.replace_chars(at, 1, 'X');
+        assert_eq!(d.project().display, "TableX");
+        assert_eq!(c, at);
+    }
+
+    #[test]
+    fn join_lines_merges_list_items() {
+        let mut d = Doc::from_gfm("- a\n- b\n- c");
+        let p = d.project();
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let c = d.join_lines(items[0].display.start, 1);
+        let NodeKind::List { items, .. } = &d.nodes[0].kind else {
+            panic!();
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(inlines_text(&items[0].inlines), "a b");
+        let _ = c;
     }
 }

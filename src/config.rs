@@ -56,15 +56,15 @@ impl FontSpec {
 }
 
 pub fn default_ui_font() -> FontSpec {
-    FontSpec::new(".SystemUIFont", 13)
+    FontSpec::new("IBM Plex Sans", 13)
 }
 
 pub fn default_markdown_font() -> FontSpec {
-    FontSpec::new("JetBrainsMono Nerd Font", 15)
+    FontSpec::new("IBM Plex Sans", 15)
 }
 
 pub fn default_buffer_font() -> FontSpec {
-    FontSpec::new("JetBrainsMono Nerd Font", 14)
+    FontSpec::new("JetBrains Mono", 14)
 }
 
 fn default_wrap() -> bool {
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(cfg.theme, "opencode");
         assert!(cfg.wrap_motions);
         assert!(!cfg.full_width);
-        assert_eq!(cfg.markdown_font.family, "JetBrainsMono Nerd Font");
+        assert_eq!(cfg.markdown_font.family, "IBM Plex Sans");
         assert_eq!(cfg.markdown_font.size, 15);
         assert_eq!(cfg.buffer_font.size, 14);
     }

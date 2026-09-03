@@ -883,6 +883,16 @@ fn emit_plain(
     });
 }
 
+struct OpenListItem {
+    index: usize,
+    d0: usize,
+    src_start: usize,
+    indent: usize,
+    checked: Option<bool>,
+    /// Frozen when a nested list starts so parent text does not swallow children.
+    display_end: Option<usize>,
+}
+
 fn project_inlines(
     src: &str,
     r: &PaintRange,
@@ -893,11 +903,8 @@ fn project_inlines(
     let slice = r.slice(src);
     let parser = Parser::new_ext(slice, gfm_options()).into_offset_iter();
     let mut marks = Marks::default();
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut item_d0 = 0usize;
-    let mut item_src: Option<Range<usize>> = None;
-    let mut item_indent = 0usize;
-    let mut item_checked: Option<bool> = None;
+    let mut items: Vec<Option<ListItem>> = Vec::new();
+    let mut stack: Vec<OpenListItem> = Vec::new();
     let mut saw_list = false;
     let mut skip_alert_label = matches!(r.kind, BlockKind::Alert(_));
     let mut skip_alert_break = false;
@@ -908,6 +915,11 @@ fn project_inlines(
         match event {
             Event::Start(Tag::List(_)) => {
                 saw_list = true;
+                if let Some(open) = stack.last_mut() {
+                    if open.display_end.is_none() {
+                        open.display_end = Some(display.len());
+                    }
+                }
             }
             Event::Start(Tag::Item) => {
                 if after_item {
@@ -920,32 +932,51 @@ fn project_inlines(
                     });
                 }
                 after_item = true;
-                item_d0 = display.len();
-                item_src = Some(abs);
-                item_indent = list_indent(&slice[range.start.min(slice.len())..]);
-                item_checked = None;
+                let index = items.len();
+                items.push(None);
+                stack.push(OpenListItem {
+                    index,
+                    d0: display.len(),
+                    src_start: abs.start,
+                    indent: list_indent_at(src, abs.start),
+                    checked: None,
+                    display_end: None,
+                });
             }
             Event::End(TagEnd::Item) => {
-                if let Some(src_r) = item_src.take() {
-                    let src_range = src_r.start..r.range.start + range.end;
-                    restore_list_item_trailing_spaces(
-                        src,
-                        &src_range,
-                        item_d0,
-                        display,
-                        segments,
-                        item_checked,
-                    );
-                    items.push(ListItem {
-                        display: item_d0..display.len(),
-                        source: src_range,
-                        indent: item_indent,
-                        checked: item_checked,
-                    });
+                if let Some(open) = stack.pop() {
+                    let src_end = r.range.start + range.end;
+                    let first_line_end = src
+                        .get(open.src_start..src_end)
+                        .and_then(|s| s.find('\n'))
+                        .map(|i| open.src_start + i)
+                        .unwrap_or(src_end);
+                    let restore_src = open.src_start..first_line_end;
+                    if open.display_end.is_none() {
+                        restore_list_item_trailing_spaces(
+                            src,
+                            &restore_src,
+                            open.d0,
+                            display,
+                            segments,
+                            open.checked,
+                        );
+                    }
+                    let end = open.display_end.unwrap_or(display.len());
+                    if let Some(slot) = items.get_mut(open.index) {
+                        *slot = Some(ListItem {
+                            display: open.d0..end,
+                            source: open.src_start..src_end,
+                            indent: open.indent,
+                            checked: open.checked,
+                        });
+                    }
                 }
             }
             Event::TaskListMarker(checked) => {
-                item_checked = Some(checked);
+                if let Some(open) = stack.last_mut() {
+                    open.checked = Some(checked);
+                }
             }
             Event::Start(Tag::Strong) => marks.bold = true,
             Event::End(TagEnd::Strong) => marks.bold = false,
@@ -1020,7 +1051,7 @@ fn project_inlines(
     }
 
     if saw_list {
-        Some(items)
+        Some(items.into_iter().flatten().collect())
     } else {
         None
     }
@@ -1038,18 +1069,52 @@ fn is_alert_label(t: &str) -> bool {
     )
 }
 
+fn list_indent_at(src: &str, abs: usize) -> usize {
+    let abs = abs.min(src.len());
+    let line_start = src[..abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    list_indent(&src[line_start..])
+}
+
 fn list_indent(line: &str) -> usize {
     line.chars().take_while(|c| *c == ' ' || *c == '\t').count() / 2
 }
 
+/// Line separator used inside table cells in the display string so real `\n`
+/// can stay the row separator. ASCII `\x1e` (record separator) is 1 byte so
+/// caret math never lands inside a multi-byte char.
+pub(crate) const TABLE_CELL_BR: char = '\u{001e}';
+
 /// Flatten CR/LF inside a table cell so the display projection can keep using
 /// `\n` as a row separator and `\t` as a cell separator.
 pub(crate) fn flatten_table_cell_text(s: &str) -> Cow<'_, str> {
+    flatten_table_cell_display(s)
+}
+
+pub(crate) fn flatten_table_cell_display(s: &str) -> Cow<'_, str> {
     if s.bytes().any(|b| b == b'\n' || b == b'\r') {
-        Cow::Owned(s.replace(['\n', '\r'], " "))
+        Cow::Owned(s.replace('\n', "\u{001e}").replace('\r', "\u{001e}"))
     } else {
         Cow::Borrowed(s)
     }
+}
+
+pub(crate) fn flatten_table_cell_gfm(s: &str) -> Cow<'_, str> {
+    if !s.contains(['\n', '\r', TABLE_CELL_BR]) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.replace('\n', "<br>")
+            .replace('\r', "")
+            .replace(TABLE_CELL_BR, "<br>"),
+    )
+}
+
+pub fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn project_table(
@@ -1110,13 +1175,13 @@ fn project_table(
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
-                // Treat in-cell breaks as spaces so they cannot look like row separators.
-                emit_plain(display, segments, abs, " ", Marks::default());
+                // In-cell breaks must not use `\n` (that's the row separator).
+                emit_plain(display, segments, abs, "\u{001e}", Marks::default());
             }
             Event::Html(t) | Event::InlineHtml(t) => {
                 let lower = t.as_ref().trim().to_ascii_lowercase();
                 if matches!(lower.as_str(), "<br>" | "<br/>" | "<br />") {
-                    emit_plain(display, segments, abs, " ", Marks::default());
+                    emit_plain(display, segments, abs, "\u{001e}", Marks::default());
                 }
             }
             Event::End(TagEnd::TableCell) => {
@@ -1154,7 +1219,7 @@ pub fn serialize_table(headers: &[String], rows: &[Vec<String>]) -> String {
     out.push('|');
     for i in 0..cols {
         out.push(' ');
-        out.push_str(&flatten_table_cell_text(
+        out.push_str(&flatten_table_cell_gfm(
             headers.get(i).map(|s| s.as_str()).unwrap_or(""),
         ));
         out.push_str(" |");
@@ -1169,7 +1234,7 @@ pub fn serialize_table(headers: &[String], rows: &[Vec<String>]) -> String {
         out.push('|');
         for i in 0..cols {
             out.push(' ');
-            out.push_str(&flatten_table_cell_text(
+            out.push_str(&flatten_table_cell_gfm(
                 row.get(i).map(|s| s.as_str()).unwrap_or(""),
             ));
             out.push_str(" |");
@@ -1261,6 +1326,24 @@ mod tests {
     }
 
     #[test]
+    fn nested_list_keeps_parent() {
+        let src = "- parent\n  - child\n    - grand\n- sibling";
+        let p = project(src);
+        let BlockExtra::List { items, .. } = &p.blocks[0].extra else {
+            panic!("not list: {:?}", p.blocks[0].extra);
+        };
+        assert_eq!(items.len(), 4, "items={items:?} display={:?}", p.display);
+        assert_eq!(&p.display[items[0].display.clone()], "parent");
+        assert_eq!(&p.display[items[1].display.clone()], "child");
+        assert_eq!(&p.display[items[2].display.clone()], "grand");
+        assert_eq!(&p.display[items[3].display.clone()], "sibling");
+        assert_eq!(items[0].indent, 0);
+        assert_eq!(items[1].indent, 1);
+        assert_eq!(items[2].indent, 2);
+        assert_eq!(items[3].indent, 0);
+    }
+
+    #[test]
     fn two_blocks_separated() {
         let p = project("# H\n\npara");
         assert_eq!(p.display, "H\npara");
@@ -1286,8 +1369,11 @@ mod tests {
 
     #[test]
     fn table_multiline_cell_flattens_newlines() {
-        assert_eq!(flatten_table_cell_text("foo\nbar"), "foo bar");
-        assert_eq!(flatten_table_cell_text("foo\r\nbar"), "foo  bar");
+        assert_eq!(flatten_table_cell_text("foo\nbar"), "foo\u{001e}bar");
+        assert_eq!(
+            flatten_table_cell_text("foo\r\nbar"),
+            "foo\u{001e}\u{001e}bar"
+        );
         assert_eq!(flatten_table_cell_text("plain"), "plain");
 
         let src = "| a | b |\n| --- | --- |\n| 1 | 2 |";
@@ -1322,7 +1408,7 @@ mod tests {
         assert!(table.contains("bar"), "{table:?}");
 
         let gfm = serialize_table(&["h".into()], &[vec!["a\nb".into()]]);
-        assert_eq!(gfm, "| h |\n| --- |\n| a b |");
+        assert_eq!(gfm, "| h |\n| --- |\n| a<br>b |");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gpui::{
     App, AppContext as _, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DragMoveEvent, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    MouseUpEvent, ParentElement as _, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
 };
 use gpui_component::{
@@ -24,20 +24,19 @@ use gpui_component::{
 
 use crate::config::{self, Config, EditorKind};
 use crate::display::{
-    list_sibling_index, ordered_marker, project, Affinity, BlockExtra, Projection, CODE_LANGS,
-    COLUMN_PX,
+    floor_char_boundary, list_sibling_index, ordered_marker, project, Affinity, BlockExtra,
+    Projection, CODE_LANGS, COLUMN_PX,
 };
 use crate::document::{
-    alert_icon_name, extract_links, parse_ranges, splice, take_bare_url, BlockKind, PaintRange,
+    alert_icon_name, extract_links, parse_ranges, take_bare_url, BlockKind, PaintRange,
 };
 use crate::images;
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
-    after_caret_same_line, apply_motion, block_caret_range, delete_char_at, delete_range,
-    extend_visual_line, find_char, first_non_blank_in, join_next_lines, join_range,
-    last_line_start, line_start_n, logical_line_delete_range, logical_line_range, paragraph_jump,
-    push_count, replace_chars, replace_selection, search_next, search_prev, take_count,
-    visual_line_range, whichwrap, word_range_at, FindKind, Motion,
+    after_caret_same_line, apply_motion, block_caret_range, extend_visual_line, find_char,
+    first_non_blank_in, last_line_start, line_start_n, logical_line_range, paragraph_jump,
+    push_count, search_next, search_prev, take_count, visual_line_range, whichwrap, word_range_at,
+    FindKind, Motion,
 };
 use crate::palette::{PaletteAction, PaletteMode, PaletteState};
 use crate::slash::{self, SlashItem};
@@ -286,6 +285,16 @@ impl TableRect {
         let n = self.normalize();
         n.r0 != n.r1 || n.c0 != n.c1
     }
+
+    fn row_count(self) -> usize {
+        let n = self.normalize();
+        n.r1.saturating_sub(n.r0) + 1
+    }
+
+    fn col_count(self) -> usize {
+        let n = self.normalize();
+        n.c1.saturating_sub(n.c0) + 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,6 +417,8 @@ pub struct Workspace {
     focus: FocusHandle,
     palette: Palette,
     dirty: bool,
+    /// Source as last saved/opened. Undo back to this clears the dirty dot.
+    clean_source: String,
     status: SharedString,
     command: Option<String>,
     search: Option<(String, bool)>,
@@ -467,10 +478,14 @@ impl Workspace {
         let empty_doc = source.trim().is_empty();
         let fonts = FontInputs::new(&config, window, cx);
         let doc = crate::tree::Doc::from_gfm(&source);
+        // Normalize once: `source` after any edit is `doc.to_gfm()`, so the
+        // clean baseline must be in the same form or typing-then-deleting the
+        // same text would never clear the dirty dot.
+        let normalized = doc.to_gfm();
         let mut this = Self {
             path,
             doc,
-            source,
+            source: normalized.clone(),
             caret: 0,
             sel: None,
             mode: Mode::Normal,
@@ -483,6 +498,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             palette,
             dirty: false,
+            clean_source: normalized,
             status: "ready".into(),
             command: None,
             search: None,
@@ -528,6 +544,10 @@ impl Workspace {
             this.mode = Mode::Normal;
             this.refresh_raw(window, cx);
         }
+        let entity = cx.entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            entity.update(cx, |this, cx| this.request_quit(window, cx))
+        });
         this
     }
 
@@ -600,8 +620,7 @@ impl Workspace {
     fn commit_caret(&mut self, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.caret = caret.min(self.proj().display.len());
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -631,13 +650,12 @@ impl Workspace {
     }
 
     fn clamp_caret(&mut self) {
-        let n = self.proj().display.len();
-        if self.caret > n {
-            self.caret = n;
-        }
+        let display = self.proj().display;
+        let n = display.len();
+        self.caret = floor_char_boundary(&display, self.caret.min(n));
         if let Some(sel) = self.sel.as_mut() {
-            sel.start = sel.start.min(n);
-            sel.end = sel.end.min(n);
+            sel.start = floor_char_boundary(&display, sel.start.min(n));
+            sel.end = floor_char_boundary(&display, sel.end.min(n));
             if sel.start == sel.end {
                 self.sel = None;
             }
@@ -650,6 +668,49 @@ impl Workspace {
 
     fn set_caret_src(&mut self, src: usize) {
         self.caret = self.proj().to_display(src);
+    }
+
+    fn mark_dirty(&mut self) {
+        self.refresh_dirty();
+    }
+
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.source != self.clean_source;
+        self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+    }
+
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Unsaved changes",
+            Some("Save before quitting?"),
+            &["Save", "Don't Save", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(answer) = prompt.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| match answer {
+                0 => {
+                    if this.write_to_disk(cx) {
+                        this.sync_title(window);
+                        cx.quit();
+                    }
+                }
+                1 => {
+                    this.dirty = false;
+                    cx.quit();
+                }
+                _ => {}
+            })
+            .ok();
+        })
+        .detach();
+        false
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -709,30 +770,6 @@ impl Workspace {
                 self.sel = Some(a..b);
             }
         }
-    }
-
-    fn apply_source(
-        &mut self,
-        source: String,
-        caret: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let keep_insert = self.mode.is_insert() || self.is_notion();
-        self.doc = crate::tree::Doc::from_gfm(&source);
-        self.source = self.doc.to_gfm();
-        self.caret = caret.min(self.proj().display.len());
-        self.sel = None;
-        self.visual_anchor = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
-        if keep_insert {
-            self.mode = Mode::Insert;
-        } else {
-            self.mode = Mode::Normal;
-        }
-        self.refresh_raw(window, cx);
-        self.sync_title(window);
     }
 
     fn land(&mut self, next: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -855,6 +892,9 @@ impl Workspace {
     fn apply_snapshot(&mut self, snap: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         // Restore the live tree. Re-parsing GFM is lossy (e.g. Tab-indented
         // lists become indented code whose "language" is `- bullet`).
+        // Undo/redo restores the caret recorded in the snapshot (the position
+        // from before the undone edit); dirty state is pure content comparison
+        // so it never moves the caret on its own.
         self.doc = snap.doc;
         self.source = snap.source;
         self.caret = snap.caret.min(self.doc.project().display.len());
@@ -862,11 +902,7 @@ impl Workspace {
         self.insert_origin = None;
         self.clear_pending();
         self.visual_anchor = self.sel.as_ref().map(|s| s.start);
-        self.dirty = true;
-        self.status = "unsaved".into();
-        // Notion stays in insert. Vim/Helix undo/redo always land in Normal —
-        // never bounce back into Insert just because the snapshot was taken
-        // during an insert session.
+        self.refresh_dirty();
         if !self.config.editor.is_modal() {
             self.enter_insert(Caret::Offset(self.caret), window, cx);
         } else {
@@ -917,8 +953,7 @@ impl Workspace {
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
 
         // Check if the token before Enter was a bare URL. If so, auto-link it.
         // `push_doc_undo` above already recorded the state before Enter, and
@@ -1004,7 +1039,7 @@ impl Workspace {
                 Some((ix, cell.row, cell.col, cell.display.clone()))
             })
         };
-        if let Some((ix, row, col, disp)) = table_hit {
+        if let Some((ix, row, col, _disp)) = table_hit {
             if shift {
                 if let Some((aix, ar, ac)) = self.table_anchor {
                     if aix == ix {
@@ -1039,7 +1074,7 @@ impl Workspace {
             });
             if !shift {
                 self.caret = d;
-                self.mouse_anchor = Some(disp.start);
+                self.mouse_anchor = Some(d);
                 self.affinity = Affinity::Inside;
                 if !self.mode.is_insert() && self.config.editor.is_modal() {
                     self.mode = Mode::Normal;
@@ -1108,6 +1143,25 @@ impl Workspace {
         if let Some((aix, ar, ac)) = self.table_anchor {
             if let Some((block, cell)) = p.table_cell_at(d) {
                 if p.blocks.get(aix).is_some_and(|b| b.source == block.source) {
+                    if cell.row == ar && cell.col == ac {
+                        // Same cell: text selection, not a cell rectangle.
+                        self.table_sel = Some(TableRect {
+                            block_ix: aix,
+                            r0: ar,
+                            c0: ac,
+                            r1: ar,
+                            c1: ac,
+                        });
+                        let anchor = self.mouse_anchor.unwrap_or(self.caret);
+                        self.visual_anchor = Some(anchor);
+                        self.caret = d;
+                        self.snap_visual_sel();
+                        self.clamp_caret();
+                        self.follow_caret = false;
+                        self.focus.focus(window, cx);
+                        cx.notify();
+                        return;
+                    }
                     self.table_sel = Some(
                         TableRect {
                             block_ix: aix,
@@ -1201,30 +1255,16 @@ impl Workspace {
         }
     }
 
-    fn commit_edit(
-        &mut self,
-        source: String,
-        caret: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.doc = crate::tree::Doc::from_gfm(&source);
-        self.source = self.doc.to_gfm();
-        self.caret = caret.min(self.proj().display.len());
-        self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
-        self.refresh(window, cx);
-        self.sync_title(window);
-    }
-
     fn slash_query(&self) -> Option<String> {
         let p = self.proj();
         let d = self.caret;
         let block = p.block_at_display(d)?;
         let body = &p.display[block.display.clone()];
-        let local = d.saturating_sub(block.display.start).min(body.len());
-        let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let local = floor_char_boundary(body, d.saturating_sub(block.display.start).min(body.len()));
+        let line_start = body[..local]
+            .rfind(['\n', crate::display::TABLE_CELL_BR])
+            .map(|i| i + 1)
+            .unwrap_or(0);
         crate::document::slash_query(&body[line_start..local]).map(|s| s.to_string())
     }
 
@@ -1259,8 +1299,7 @@ impl Workspace {
         self.caret = self.caret.min(self.proj().display.len());
         self.slash_index = 0;
         self.last_slash_query.clear();
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh_raw(window, cx);
     }
 
@@ -1270,8 +1309,14 @@ impl Workspace {
             let d = self.caret.min(p.display.len());
             p.block_at_display(d).and_then(|block| {
                 let body = p.display.get(block.display.clone())?;
-                let local = d.saturating_sub(block.display.start).min(body.len());
-                let line_start = body[..local].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let local = floor_char_boundary(
+                    body,
+                    d.saturating_sub(block.display.start).min(body.len()),
+                );
+                let line_start = body[..local]
+                    .rfind(['\n', crate::display::TABLE_CELL_BR])
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let rel = body[line_start..local].rfind('/')?;
                 let d0 = block.display.start + line_start + rel;
                 let d1 = block.display.start + local;
@@ -1284,8 +1329,7 @@ impl Workspace {
         }
         self.slash_index = 0;
         self.last_slash_query.clear();
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh_raw(window, cx);
     }
 
@@ -1642,11 +1686,9 @@ impl Workspace {
         }
         window.prevent_default();
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::open_line(&self.source, self.caret, above);
-        self.source = next;
-        self.caret = caret;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        let caret = self.doc.open_line(self.caret, above);
+        self.sync_gfm();
+        self.mark_dirty();
         self.enter_insert(Caret::Offset(caret), window, cx);
     }
 
@@ -1819,25 +1861,41 @@ impl Workspace {
     }
 
     fn delete_selection_or_char(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Tree mutation on display offsets: splicing GFM `source` with display
+        // offsets corrupts lists/tables (markers are hidden in display).
         let range = if let Some(sel) = self.sel.clone() {
             sel
         } else {
-            block_caret_range(&self.source, self.caret)
+            block_caret_range(&self.proj().display, self.caret)
         };
         self.push_doc_undo();
-        let (next, caret) = if range.start == range.end {
-            delete_char_at(&self.source, range.start)
+        let caret = if range.start == range.end {
+            self.doc.delete_char(self.caret)
         } else {
-            delete_range(&self.source, range)
+            self.doc.delete_display(range)
         };
-        self.apply_source(next, caret, window, cx);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn delete_current_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let range = logical_line_delete_range(&self.source, self.caret);
+        let ix = self.unit_ix_at(self.caret);
         self.push_doc_undo();
-        let (next, caret) = delete_range(&self.source, range);
-        self.apply_source(next, caret, window, cx);
+        let caret = self.doc.delete_unit(ix);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
+    }
+
+    /// Unit (block / list item) index containing display offset `d`.
+    fn unit_ix_at(&self, d: usize) -> usize {
+        let p = self.proj();
+        let us = crate::tree::units(&p);
+        us.iter()
+            .position(|u| {
+                let r = crate::tree::unit_display(&p, *u);
+                d >= r.start && d <= r.end
+            })
+            .unwrap_or(0)
     }
 
     fn on_select_line(&mut self, _: &SelectLine, window: &mut Window, cx: &mut Context<Self>) {
@@ -1904,10 +1962,18 @@ impl Workspace {
             return;
         }
         let start = self.caret;
-        let end = logical_line_range(&self.source, start).end;
+        let p = self.proj();
+        let end = crate::tree::units(&p)
+            .iter()
+            .find_map(|u| {
+                let r = crate::tree::unit_display(&p, *u);
+                (start >= r.start && start <= r.end).then_some(r.end)
+            })
+            .unwrap_or(p.display.len());
         self.push_doc_undo();
-        let (next, caret) = delete_range(&self.source, start..end);
-        self.apply_source(next, caret, window, cx);
+        let caret = self.doc.delete_display(start..end);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn on_visual_char(&mut self, _: &VisualChar, window: &mut Window, cx: &mut Context<Self>) {
@@ -2029,8 +2095,7 @@ impl Workspace {
             .insert_text(self.caret, self.sel.clone(), "/", self.sticky);
         self.sync_gfm();
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         let q = self.slash_query().unwrap_or_default();
         if q != self.last_slash_query {
             self.last_slash_query = q;
@@ -2102,8 +2167,9 @@ impl Workspace {
 
         let start_d = apply_motion(&p.display, d, Motion::WordBack, 1, None);
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::delete_display_range(&self.source, start_d..d);
-        self.commit_edit(next, caret, window, cx);
+        let caret = self.doc.delete_display(start_d..d);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn on_delete_line_back(
@@ -2179,8 +2245,9 @@ impl Workspace {
             return;
         }
         self.push_doc_undo();
-        let (next, caret) = wysiwyg::delete_display_range(&self.source, start_d..d);
-        self.commit_edit(next, caret, window, cx);
+        let caret = self.doc.delete_display(start_d..d);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn on_block_backspace(
@@ -2313,12 +2380,15 @@ impl Workspace {
         let count = take_count(&mut self.pending_count);
         self.clear_pending();
         self.push_doc_undo();
-        let (next, caret) = if let Some(sel) = self.sel.clone() {
-            join_range(&self.source, sel)
+        if let Some(sel) = self.sel.clone() {
+            let caret = self.doc.join_range(sel);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
         } else {
-            join_next_lines(&self.source, self.caret, count)
-        };
-        self.apply_source(next, caret, window, cx);
+            let caret = self.doc.join_lines(self.caret, count);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+        }
     }
 
     fn on_replace_char(&mut self, _: &ReplaceChar, window: &mut Window, cx: &mut Context<Self>) {
@@ -2337,12 +2407,13 @@ impl Workspace {
     fn commit_replace(&mut self, ch: char, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.pending_replace.take().unwrap_or(1);
         self.push_doc_undo();
-        let (next, caret) = if let Some(sel) = self.sel.clone() {
-            replace_selection(&self.source, sel, ch)
+        let caret = if let Some(sel) = self.sel.clone() {
+            self.doc.replace_range(sel, ch)
         } else {
-            replace_chars(&self.source, self.caret, count, ch)
+            self.doc.replace_chars(self.caret, count, ch)
         };
-        self.apply_source(next, caret, window, cx);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn on_find(&mut self, kind: FindKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -2480,6 +2551,35 @@ impl Workspace {
         };
         let next = p.to_source(next_d, Affinity::Inside);
         self.land(next, window, cx);
+    }
+
+    fn reset_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ui = config::default_ui_font();
+        let md = config::default_markdown_font();
+        let buf = config::default_buffer_font();
+        self.config.ui_font = ui.clone();
+        self.config.markdown_font = md.clone();
+        self.config.buffer_font = buf.clone();
+        self.fonts.ui_family.update(cx, |s, cx| {
+            s.set_value(ui.family, window, cx);
+        });
+        self.fonts.ui_size.update(cx, |s, cx| {
+            s.set_value(ui.size.to_string(), window, cx);
+        });
+        self.fonts.markdown_family.update(cx, |s, cx| {
+            s.set_value(md.family, window, cx);
+        });
+        self.fonts.markdown_size.update(cx, |s, cx| {
+            s.set_value(md.size.to_string(), window, cx);
+        });
+        self.fonts.buffer_family.update(cx, |s, cx| {
+            s.set_value(buf.family, window, cx);
+        });
+        self.fonts.buffer_size.update(cx, |s, cx| {
+            s.set_value(buf.size.to_string(), window, cx);
+        });
+        self.persist_config(cx);
+        cx.notify();
     }
 
     fn apply_font_family(&mut self, slot: FontSlot, family: String, cx: &mut Context<Self>) {
@@ -2653,6 +2753,7 @@ impl Workspace {
     fn write_to_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let ok = match std::fs::write(&self.path, self.source.as_bytes()) {
             Ok(()) => {
+                self.clean_source = self.source.clone();
                 self.dirty = false;
                 true
             }
@@ -2742,8 +2843,7 @@ impl Workspace {
         self.push_doc_undo();
         self.doc.toggle_task(block_ix, item_ix);
         self.sync_gfm();
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.sync_title(window);
         self.clamp_caret();
         if self.mode.extends_selection() {
@@ -2758,20 +2858,12 @@ impl Workspace {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("image");
-        let line = images::gfm_image(alt, filename);
         self.push_doc_undo();
-        let at = self.caret_src();
-        let insert = if at > 0 && !self.source[..at].ends_with('\n') {
-            format!("\n{line}\n")
-        } else {
-            format!("{line}\n")
-        };
-        self.source = splice(&self.source, at..at, &insert);
-        self.set_caret_src(at + insert.len());
-        self.dirty = true;
-        self.status = "unsaved".into();
-        self.refresh(window, cx);
-        cx.notify();
+        let caret = self
+            .doc
+            .insert_image(self.caret, alt.to_string(), filename.to_string());
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn try_paste_image(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -2813,6 +2905,57 @@ impl Workspace {
             }
         }
     }
+}
+
+/// Shared single-line editing for the hand-rolled inputs (palette query,
+/// command bar, search bar, link draft). All are append-at-end buffers with an
+/// implicit end caret.
+/// - backspace: delete one char (false on empty so callers can fall through,
+///   e.g. palette backs out of submenus)
+/// - opt-backspace: delete the previous word
+/// - cmd-backspace: clear the line
+/// - left/right/home/end: consumed no-ops (nowhere to move); up/down are left
+///   to callers (palette selection).
+/// Returns true when the key was consumed.
+fn line_edit_key(buf: &mut String, key: &str, mods: gpui::Modifiers) -> bool {
+    match key {
+        "backspace" => {
+            if mods.platform && !mods.alt && !mods.control {
+                if buf.is_empty() {
+                    return false;
+                }
+                buf.clear();
+                true
+            } else if mods.alt && !mods.platform && !mods.control {
+                if buf.is_empty() {
+                    return false;
+                }
+                while buf.ends_with(' ') {
+                    buf.pop();
+                }
+                while let Some(c) = buf.chars().next_back() {
+                    if c == ' ' {
+                        break;
+                    }
+                    buf.pop();
+                }
+                true
+            } else if !mods.platform && !mods.control && !mods.alt {
+                if buf.is_empty() {
+                    return false;
+                }
+                buf.pop();
+                true
+            } else {
+                false
+            }
+        }
+        "left" | "right" | "home" | "end" => true,
+        _ => false,
+    }
+}
+
+impl Workspace {
     fn handle_capture_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -2836,6 +2979,14 @@ impl Workspace {
             if (key == "k") && (mods.platform || mods.control) && !mods.alt {
                 self.close_palette(window, cx);
                 return true;
+            }
+            // Shared single-line editing (opt/cmd-backspace, arrows) first.
+            if let Some(state) = self.cmd_palette.as_mut() {
+                if line_edit_key(&mut state.query, key, mods) {
+                    state.index = 0;
+                    cx.notify();
+                    return true;
+                }
             }
             if mods.control || mods.platform || mods.alt {
                 return true;
@@ -2875,8 +3026,9 @@ impl Workspace {
                     cx.notify();
                 }
                 "backspace" => {
+                    // Empty query in a submenu goes back to root.
                     if let Some(state) = self.cmd_palette.as_mut() {
-                        if state.query.pop().is_none() && state.mode != PaletteMode::Root {
+                        if state.query.is_empty() && state.mode != PaletteMode::Root {
                             state.set_mode(PaletteMode::Root);
                         } else {
                             state.index = 0;
@@ -2909,6 +3061,10 @@ impl Workspace {
 
         if self.link_open {
             window.prevent_default();
+            if line_edit_key(&mut self.link_draft, key, mods) {
+                cx.notify();
+                return true;
+            }
             match key {
                 "escape" => {
                     self.link_open = false;
@@ -3007,6 +3163,12 @@ impl Workspace {
 
         if self.command.is_some() {
             window.prevent_default();
+            if let Some(buf) = self.command.as_mut() {
+                if line_edit_key(buf, key, mods) {
+                    cx.notify();
+                    return true;
+                }
+            }
             if mods.control || mods.platform || mods.alt {
                 return true;
             }
@@ -3042,6 +3204,12 @@ impl Workspace {
 
         if self.search.is_some() {
             window.prevent_default();
+            if let Some((buf, _)) = self.search.as_mut() {
+                if line_edit_key(buf, key, mods) {
+                    cx.notify();
+                    return true;
+                }
+            }
             if mods.control || mods.platform || mods.alt {
                 return true;
             }
@@ -3526,6 +3694,14 @@ impl Workspace {
                         "Fenced code blocks",
                         p,
                     ))
+                    .child(
+                        Button::new("fonts-reset")
+                            .ghost()
+                            .label("Reset to defaults")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_fonts(window, cx);
+                            })),
+                    )
                     .into_any_element()
             }
         };
@@ -3711,11 +3887,15 @@ impl Workspace {
                                     .text_color(p.primary)
                                     .child(">"),
                             )
-                            .child(div().flex_1().text_sm().text_color(p.markdown_text).child(
+                            .child(div().flex_1().text_sm().child(
                                 if query.is_empty() {
-                                    "Type a command…▌".to_string()
+                                    div()
+                                        .text_color(p.text_muted.opacity(0.7))
+                                        .child("Type a command…")
                                 } else {
-                                    format!("{query}▌")
+                                    div()
+                                        .text_color(p.markdown_text)
+                                        .child(format!("{query}▌"))
                                 },
                             )),
                     )
@@ -4148,10 +4328,12 @@ impl Workspace {
                         menu =
                             menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    if let Some((next, caret)) =
-                                        wysiwyg::set_code_lang(&this.source, this.caret, &lang)
+                                    this.push_doc_undo();
+                                    if let Some(caret) =
+                                        this.doc.set_code_lang(this.caret, &lang)
                                     {
-                                        this.commit_edit(next, caret, window, cx);
+                                        this.sync_gfm();
+                                        this.commit_caret(caret, window, cx);
                                     }
                                 });
                             }));
@@ -4243,7 +4425,6 @@ impl Workspace {
         let pal = self.palette.clone();
         let wrap = self.config.wrap_motions;
         let caret = self.caret;
-        let sel = self.sel.clone();
         let table_sel = self.table_sel;
         let dragging = self.mouse_dragging;
         let BlockExtra::Table { cells, rows, cols } = &p.blocks[ix].extra else {
@@ -4284,25 +4465,27 @@ impl Workspace {
                         } else {
                             (0..0, r == 0, false)
                         };
-                        let highlighted = real
-                            && table_cell_active(
-                                r,
-                                c,
-                                &disp,
-                                ix,
-                                caret,
-                                sel.as_ref(),
-                                table_sel,
-                            );
+                        let rect = table_sel
+                            .filter(|t| t.block_ix == ix && t.is_multi())
+                            .map(|t| t.normalize());
+                        let in_sel = real && rect.is_some_and(|n| n.contains(r, c));
+                        let edge_t = in_sel && rect.is_some_and(|n| r == n.r0);
+                        let edge_b = in_sel && rect.is_some_and(|n| r == n.r1);
+                        let edge_l = in_sel && rect.is_some_and(|n| c == n.c0);
+                        let edge_r = in_sel && rect.is_some_and(|n| c == n.c1);
                         let text = p
                             .display
                             .get(disp.clone())
                             .unwrap_or("")
                             .replace('\t', "")
+                            // Render in-cell breaks as real newlines. Both are
+                            // 1 byte, so display offsets used for caret/hit
+                            // mapping stay aligned.
+                            .replace(crate::display::TABLE_CELL_BR, "\n")
                             .to_string();
                         // Suppress linear text-sel paint when using rectangular table_sel
                         // (linear ranges include in-between cells in reading order).
-                        let saved_sel = if table_sel.is_some() {
+                        let saved_sel = if table_sel.is_some_and(|t| t.is_multi()) {
                             let s = self.sel.take();
                             let edit = self.render_edit(
                                 disp, &text, header, None, None, wrap, None, false, cx,
@@ -4314,6 +4497,7 @@ impl Workspace {
                         };
                         let edit = saved_sel;
                         let show_tools = tools_at == Some((r, c));
+                        let sel_color = pal.primary;
                         div()
                             .id(("td", r * 100 + c))
                             .relative()
@@ -4331,16 +4515,26 @@ impl Workspace {
                                 el.bg(pal.background_element)
                                     .font_weight(FontWeight::SEMIBOLD)
                             })
-                            .when(highlighted, |el| el.bg(pal.primary.opacity(0.12)))
                             .child(edit)
+                            .when(in_sel, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .when(edge_t, |e| e.border_t_2())
+                                        .when(edge_b, |e| e.border_b_2())
+                                        .when(edge_l, |e| e.border_l_2())
+                                        .when(edge_r, |e| e.border_r_2())
+                                        .border_color(sel_color),
+                                )
+                            })
                             .when(show_tools, |el| {
                                 el.child(
                                     deferred(
                                         div()
                                             .absolute()
-                                            .top(px(-40.))
+                                            .top(px(-52.))
                                             .left(px(-4.))
-                                            .occlude()
                                             .child(self.render_table_tools(cx)),
                                     )
                                     .with_priority(2),
@@ -4361,9 +4555,12 @@ impl Workspace {
     /// Combined selection bubble + grid controls, floating over the table.
     fn render_table_tools(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = &self.palette;
-        let has_text_sel = self.sel.as_ref().is_some_and(|s| s.start != s.end)
-            || self.table_sel.is_some_and(|t| t.is_multi());
-        h_flex()
+        let n = self.table_sel.map(|t| t.normalize());
+        let del_rows = n.map(|t| t.row_count()).unwrap_or(1);
+        let del_cols = n.map(|t| t.col_count()).unwrap_or(1);
+        let del_row_label = if del_rows > 1 { "Del rows" } else { "Del row" };
+        let del_col_label = if del_cols > 1 { "Del cols" } else { "Del col" };
+        v_flex()
             .gap_1()
             .p_1()
             .rounded(px(8.))
@@ -4371,51 +4568,61 @@ impl Workspace {
             .border_color(pal.border)
             .bg(pal.background_panel)
             .shadow_sm()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when(has_text_sel, |el| {
-                el.child(self.mark_btn("B", Mark::Bold, cx))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(self.mark_btn("B", Mark::Bold, cx))
                     .child(self.mark_btn("I", Mark::Italic, cx))
                     .child(self.mark_btn("U", Mark::Underline, cx))
                     .child(self.mark_btn("S", Mark::Strike, cx))
-                    .child(self.mark_btn("<>", Mark::Code, cx))
+                    .child(self.mark_btn("<>", Mark::Code, cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(self.table_btn("row-above", "Row ↑", false, true, cx))
+                    .child(self.table_btn("row-below", "Row ↓", false, false, cx))
+                    .child(self.table_btn("col-left", "Col ←", true, true, cx))
+                    .child(self.table_btn("col-right", "Col →", true, false, cx))
                     .child(
                         div()
-                            .w(px(1.))
-                            .h(px(16.))
-                            .mx_1()
-                            .bg(pal.border),
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("tbl-del-row")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(del_row_label)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.table_delete_row(window, cx);
+                                    })),
+                            ),
                     )
-            })
-            .child(self.table_btn("row-above", "Row ↑", false, true, cx))
-            .child(self.table_btn("row-below", "Row ↓", false, false, cx))
-            .child(self.table_btn("col-left", "Col ←", true, true, cx))
-            .child(self.table_btn("col-right", "Col →", true, false, cx))
-            .child(
-                Button::new("tbl-del-row")
-                    .ghost()
-                    .xsmall()
-                    .label("Del row")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.table_delete_row(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("tbl-del-col")
-                    .ghost()
-                    .xsmall()
-                    .label("Del col")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.table_delete_col(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("tbl-del")
-                    .ghost()
-                    .xsmall()
-                    .label("Delete table")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.delete_current_table(window, cx);
-                    })),
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("tbl-del-col")
+                                    .ghost()
+                                    .xsmall()
+                                    .label(del_col_label)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.table_delete_col(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("tbl-del")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Delete table")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.delete_current_table(window, cx);
+                                    })),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -4433,13 +4640,17 @@ impl Workspace {
         before: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        Button::new(id)
-            .ghost()
-            .xsmall()
-            .label(label)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.table_insert(col, before, window, cx);
-            }))
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(id)
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.table_insert(col, before, window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -4466,7 +4677,12 @@ impl Workspace {
 
     fn table_delete_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.push_doc_undo();
-        let Some(caret) = self.doc.delete_table_row(self.caret) else {
+        let caret = if let Some(rect) = self.table_sel.map(|t| t.normalize()) {
+            self.doc.delete_table_rows(self.caret, rect.r0, rect.r1)
+        } else {
+            self.doc.delete_table_row(self.caret)
+        };
+        let Some(caret) = caret else {
             return;
         };
         self.sync_gfm();
@@ -4476,7 +4692,12 @@ impl Workspace {
 
     fn table_delete_col(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.push_doc_undo();
-        let Some(caret) = self.doc.delete_table_col(self.caret) else {
+        let caret = if let Some(rect) = self.table_sel.map(|t| t.normalize()) {
+            self.doc.delete_table_cols(self.caret, rect.c0, rect.c1)
+        } else {
+            self.doc.delete_table_col(self.caret)
+        };
+        let Some(caret) = caret else {
             return;
         };
         self.sync_gfm();
@@ -4589,7 +4810,6 @@ impl Workspace {
                     .absolute()
                     .top(px(-40.))
                     .left(px(48.))
-                    .occlude()
                     .child(self.render_bubble(cx)),
             )
             .with_priority(2)
@@ -4598,13 +4818,17 @@ impl Workspace {
     }
 
     fn mark_btn(&self, label: &'static str, mark: Mark, cx: &mut Context<Self>) -> AnyElement {
-        Button::new(("mk", label.len()))
-            .ghost()
-            .xsmall()
-            .label(label)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_mark_action(mark, window, cx);
-            }))
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(("mk", label.len()))
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_mark_action(mark, window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -4652,8 +4876,7 @@ impl Workspace {
                 self.undo.push(before);
                 self.sync_gfm();
                 self.sel = Some(range);
-                self.dirty = true;
-                self.status = "unsaved".into();
+                self.mark_dirty();
                 self.refresh(window, cx);
                 self.sync_title(window);
                 return;
@@ -4693,8 +4916,7 @@ impl Workspace {
                 self.undo.push(before);
                 self.sync_gfm();
                 self.sel = Some(range);
-                self.dirty = true;
-                self.status = "unsaved".into();
+                self.mark_dirty();
                 self.refresh(window, cx);
                 self.sync_title(window);
                 return;
@@ -4770,8 +4992,7 @@ impl Workspace {
         self.caret = self.doc.delete_display(a..b);
         self.sync_gfm();
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -4900,8 +5121,7 @@ impl Workspace {
         }
         self.sync_gfm();
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
 
         // If the pasted text was or ended with a bare URL, auto-link it with a two-step undo stack.
         // `push_doc_undo` above already recorded the state before pasting (step 1).
@@ -5443,18 +5663,18 @@ impl Workspace {
 
     fn delete_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.block_menu = None;
-        if let Some((next, caret)) = wysiwyg::delete_block(&self.source, ix) {
-            self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
-        }
+        self.push_doc_undo();
+        let caret = self.doc.delete_unit(ix);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn duplicate_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.block_menu = None;
-        if let Some((next, caret)) = wysiwyg::duplicate_block(&self.source, ix) {
-            self.push_doc_undo();
-            self.commit_edit(next, caret, window, cx);
-        }
+        self.push_doc_undo();
+        let caret = self.doc.duplicate_unit(ix);
+        self.sync_gfm();
+        self.commit_caret(caret, window, cx);
     }
 
     fn drop_block_at(&mut self, from: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -5565,14 +5785,28 @@ impl Workspace {
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
+        // Multi-cell table selection: the linear `sel` spans in-between cells
+        // in reading order, so apply to exactly the rectangle instead.
+        if let Some(rect) = self.table_sel.map(|t| t.normalize()).filter(|t| t.is_multi()) {
+            self.push_doc_undo();
+            if self
+                .doc
+                .toggle_mark_table(rect.block_ix, rect.r0, rect.r1, rect.c0, rect.c1, mark)
+            {
+                self.sync_gfm();
+                self.mark_dirty();
+                self.refresh(window, cx);
+                self.sync_title(window);
+            }
+            return;
+        }
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
             self.push_doc_undo();
             if let Some(range) = self.doc.toggle_mark(sel, mark) {
                 self.sync_gfm();
                 self.caret = range.end.min(self.proj().display.len());
                 self.sel = Some(range);
-                self.dirty = true;
-                self.status = "unsaved".into();
+                self.mark_dirty();
                 self.refresh(window, cx);
                 self.sync_title(window);
             }
@@ -5598,8 +5832,7 @@ impl Workspace {
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -5691,7 +5924,7 @@ impl Workspace {
         self.doc.apply_link(url_start..url_end, &full_url);
         self.sync_gfm();
         self.undo.push(before_link);
-        self.dirty = true;
+        self.mark_dirty();
         self.status = "unsaved".into();
         true
     }
@@ -5711,8 +5944,7 @@ impl Workspace {
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
         self.sel = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -5827,29 +6059,6 @@ fn icon_el(name: &str, color: gpui::Hsla) -> Icon {
         .text_color(color)
         .w(px(16.))
         .h(px(16.))
-}
-
-fn table_cell_active(
-    row: usize,
-    col: usize,
-    disp: &std::ops::Range<usize>,
-    block_ix: usize,
-    caret: usize,
-    sel: Option<&std::ops::Range<usize>>,
-    table_sel: Option<TableRect>,
-) -> bool {
-    if let Some(rect) = table_sel.map(|r| r.normalize()) {
-        if rect.block_ix == block_ix {
-            return rect.contains(row, col);
-        }
-    }
-    if let Some(sel) = sel.filter(|s| s.start != s.end) {
-        let a = sel.start.min(sel.end);
-        let b = sel.start.max(sel.end);
-        disp.start <= b && a <= disp.end
-    } else {
-        caret >= disp.start && caret <= disp.end
-    }
 }
 
 pub fn window_title(path: &Path, dirty: bool) -> String {
@@ -6035,8 +6244,7 @@ impl EntityInputHandler for Workspace {
             self.sync_gfm();
             self.sel = None;
             self.marked = None;
-            self.dirty = true;
-            self.status = "unsaved".into();
+            self.mark_dirty();
             self.refresh(window, cx);
             self.sync_title(window);
             return;
@@ -6054,8 +6262,7 @@ impl EntityInputHandler for Workspace {
         self.sync_gfm();
         self.sel = None;
         self.marked = None;
-        self.dirty = true;
-        self.status = "unsaved".into();
+        self.mark_dirty();
         let q = self.slash_query().unwrap_or_default();
         if q != self.last_slash_query {
             self.last_slash_query = q;
@@ -6258,7 +6465,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_selection))
             .on_action(cx.listener(Self::on_paste_clipboard))
             .on_action(cx.listener(Self::on_select_all))
-            .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
+            .on_action(cx.listener(|this, _: &QuitApp, window, cx| {
+                if this.request_quit(window, cx) {
+                    cx.quit();
+                }
+            }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {
                     cx.stop_propagation();
@@ -6502,4 +6713,51 @@ fn open_in_browser(url: &str) {
 fn _rgb_anchor() -> gpui::Rgba {
     let _ = point(px(0.), px(0.));
     rgb(0x000000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(control: bool, alt: bool, platform: bool) -> gpui::Modifiers {
+        gpui::Modifiers {
+            control,
+            alt,
+            platform,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn line_edit_backspace_variants() {
+        let plain = mods(false, false, false);
+        let mut s = String::from("abc");
+        assert!(line_edit_key(&mut s, "backspace", plain));
+        assert_eq!(s, "ab");
+        // Empty buffer: fall through so callers (palette) can back out.
+        let mut s = String::new();
+        assert!(!line_edit_key(&mut s, "backspace", plain));
+
+        let mut s = String::from("foo bar baz");
+        assert!(line_edit_key(&mut s, "backspace", mods(false, true, false)));
+        assert_eq!(s, "foo bar ");
+        assert!(line_edit_key(&mut s, "backspace", mods(false, true, false)));
+        assert_eq!(s, "foo ");
+
+        let mut s = String::from("hello world");
+        assert!(line_edit_key(&mut s, "backspace", mods(false, false, true)));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn line_edit_arrows_consumed() {
+        let plain = mods(false, false, false);
+        let mut s = String::from("abc");
+        assert!(line_edit_key(&mut s, "left", plain));
+        assert!(line_edit_key(&mut s, "right", mods(false, true, false)));
+        assert!(line_edit_key(&mut s, "home", mods(false, false, true)));
+        assert_eq!(s, "abc");
+        assert!(!line_edit_key(&mut s, "up", plain));
+        assert!(!line_edit_key(&mut s, "x", plain));
+    }
 }
