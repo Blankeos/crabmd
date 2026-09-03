@@ -24,8 +24,8 @@ use gpui_component::{
 
 use crate::config::{self, Config, EditorKind};
 use crate::display::{
-    list_sibling_index, ordered_marker, project, wrap_cols_for, Affinity, BlockExtra, Projection,
-    CODE_LANGS, COLUMN_PX,
+    list_sibling_index, ordered_marker, project, Affinity, BlockExtra, Projection, CODE_LANGS,
+    COLUMN_PX,
 };
 use crate::document::{
     alert_icon_name, extract_links, parse_ranges, splice, take_bare_url, BlockKind, PaintRange,
@@ -39,6 +39,7 @@ use crate::motion::{
     push_count, replace_chars, replace_selection, search_next, search_prev, take_count,
     visual_line_range, whichwrap, word_range_at, FindKind, Motion,
 };
+use crate::palette::{PaletteAction, PaletteMode, PaletteState};
 use crate::slash::{self, SlashItem};
 use crate::surface::{self, Hit};
 use crate::syntax;
@@ -96,6 +97,7 @@ actions!(
         SlashApply,
         BlockBackspace,
         ToggleSettings,
+        OpenPalette,
         OpenCommand,
         OpenSearch,
         SearchBack,
@@ -136,8 +138,11 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-s", Save, Some("Workspace")),
         KeyBinding::new("ctrl-s", Save, Some("Workspace")),
+        KeyBinding::new("cmd-,", ToggleSettings, Some("Workspace")),
+        KeyBinding::new("ctrl-,", ToggleSettings, Some("Workspace")),
         KeyBinding::new("escape", LeaveInsert, Some("Workspace")),
         KeyBinding::new("escape", LeaveInsert, Some("Input")),
+        KeyBinding::new("escape", LeaveInsert, Some("Command")),
         KeyBinding::new("i", InsertAtCaret, Some("Normal")),
         KeyBinding::new("a", InsertAfterCaret, Some("Normal")),
         KeyBinding::new("shift-i", InsertLineStart, Some("Normal")),
@@ -219,8 +224,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("ctrl-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("cmd-shift-s", ToggleStrike, Some("Workspace")),
-        KeyBinding::new("cmd-k", ToggleLink, Some("Workspace")),
-        KeyBinding::new("ctrl-k", ToggleLink, Some("Workspace")),
+        KeyBinding::new("cmd-k", OpenPalette, Some("Workspace")),
+        KeyBinding::new("ctrl-k", OpenPalette, Some("Workspace")),
+        KeyBinding::new("cmd-shift-k", ToggleLink, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
         KeyBinding::new("ctrl-x", CutSelection, Some("Workspace")),
         KeyBinding::new("cmd-c", CopySelection, Some("Workspace")),
@@ -247,6 +254,38 @@ enum SelectGranularity {
     Char,
     Word,
     Line,
+}
+
+/// Excel-style rectangular cell selection inside one table block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableRect {
+    block_ix: usize,
+    r0: usize,
+    c0: usize,
+    r1: usize,
+    c1: usize,
+}
+
+impl TableRect {
+    fn normalize(self) -> Self {
+        Self {
+            block_ix: self.block_ix,
+            r0: self.r0.min(self.r1),
+            c0: self.c0.min(self.c1),
+            r1: self.r0.max(self.r1),
+            c1: self.c0.max(self.c1),
+        }
+    }
+
+    fn contains(self, row: usize, col: usize) -> bool {
+        let n = self.normalize();
+        row >= n.r0 && row <= n.r1 && col >= n.c0 && col <= n.c1
+    }
+
+    fn is_multi(self) -> bool {
+        let n = self.normalize();
+        n.r0 != n.r1 || n.c0 != n.c1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +412,8 @@ pub struct Workspace {
     command: Option<String>,
     search: Option<(String, bool)>,
     last_search: Option<(String, bool)>,
+    cmd_palette: Option<PaletteState>,
+    view_source: bool,
     affinity: Affinity,
     marked: Option<Range<usize>>,
     sticky: crate::display::Marks,
@@ -392,12 +433,19 @@ pub struct Workspace {
     /// Keep the caret in view after the next paint. Clicks leave scroll alone.
     follow_caret: bool,
     surface_h: gpui::Pixels,
+    /// Preferred screen X for vertical caret motion (sticky column). Cleared
+    /// on horizontal moves / clicks.
+    goal_x: Option<Pixels>,
     titlebar_moving: bool,
     mouse_anchor: Option<usize>,
     /// Initial word/line unit from a multi-click, used while dragging.
     mouse_unit: Option<Range<usize>>,
     mouse_dragging: bool,
     mouse_granularity: SelectGranularity,
+    /// Anchor cell when starting a drag inside a table (block_ix, row, col).
+    table_anchor: Option<(usize, usize, usize)>,
+    /// Rectangular cell selection (Excel-style). Independent of linear `sel`.
+    table_sel: Option<TableRect>,
     block_dragging: Option<usize>,
     block_drag_gap: Option<usize>,
     block_menu: Option<usize>,
@@ -439,6 +487,8 @@ impl Workspace {
             command: None,
             search: None,
             last_search: None,
+            cmd_palette: None,
+            view_source: false,
             affinity: Affinity::Inside,
             marked: None,
             sticky: crate::display::Marks::default(),
@@ -457,11 +507,14 @@ impl Workspace {
             scroll_handle: ScrollHandle::new(),
             follow_caret: true,
             surface_h: px(0.),
+            goal_x: None,
             titlebar_moving: false,
             mouse_anchor: None,
             mouse_unit: None,
             mouse_dragging: false,
             mouse_granularity: SelectGranularity::Char,
+            table_anchor: None,
+            table_sel: None,
             block_dragging: None,
             block_drag_gap: None,
             block_menu: None,
@@ -490,8 +543,11 @@ impl Workspace {
     }
 
     fn key_context(&self) -> &'static str {
-        if self.command.is_some() || self.search.is_some() {
-            return "Workspace Command";
+        // Keep "Workspace" out of the context so Workspace-scoped bindings
+        // (notably enter → InsertNewline) do not fire while the find/command
+        // bar owns the keyboard. Capture handlers still see every key.
+        if self.command.is_some() || self.search.is_some() || self.cmd_palette.is_some() {
+            return "Command";
         }
         match (self.config.editor, self.mode) {
             (EditorKind::Notion, _) => "Workspace Notion",
@@ -514,7 +570,23 @@ impl Workspace {
     }
 
     fn wrap_cols(&self) -> Option<usize> {
-        wrap_cols_for(self.config.markdown_font.size, self.config.wrap_motions)
+        if !self.config.wrap_motions {
+            return None;
+        }
+        // Prefer the live column width from the surface when painted so the
+        // char-column fallback matches soft-wrap more closely.
+        let width = self
+            .hits
+            .iter()
+            .find_map(|h| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.layout.bounds()))
+                    .ok()
+                    .map(|b| f32::from(b.size.width))
+            })
+            .filter(|w| *w > 8.0)
+            .unwrap_or(COLUMN_PX - 64.0);
+        let ch = (self.config.markdown_font.size as f32 * 0.55).max(6.0);
+        Some((width / ch).max(8.0) as usize)
     }
 
     fn proj(&self) -> Projection {
@@ -673,6 +745,25 @@ impl Workspace {
         } else {
             self.sel = None;
             self.visual_anchor = None;
+            // Drop rectangular table selection on caret moves (unless still in that cell).
+            if let Some(rect) = self.table_sel {
+                let still = self
+                    .proj()
+                    .table_cell_at(self.caret)
+                    .and_then(|(b, c)| {
+                        let ix = self
+                            .proj()
+                            .blocks
+                            .iter()
+                            .position(|x| x.source == b.source)?;
+                        Some(ix == rect.block_ix && rect.contains(c.row, c.col))
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    self.table_sel = None;
+                    self.table_anchor = None;
+                }
+            }
         }
         self.refresh_raw(window, cx);
     }
@@ -801,6 +892,14 @@ impl Workspace {
     }
 
     fn insert_newline(&mut self, hard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some()
+            || self.command.is_some()
+            || self.settings_open
+            || self.cmd_palette.is_some()
+            || self.view_source
+        {
+            return;
+        }
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             return;
         }
@@ -841,6 +940,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
+        self.goal_x = None;
         if self.link_open {
             self.link_open = false;
             self.link_draft.clear();
@@ -893,6 +996,69 @@ impl Workspace {
         }
         self.mouse_granularity = SelectGranularity::Char;
         self.mouse_unit = None;
+        // Table: start Excel-style cell selection from this cell.
+        let table_hit = {
+            let p = self.proj();
+            p.table_cell_at(d).and_then(|(block, cell)| {
+                let ix = p.blocks.iter().position(|b| b.source == block.source)?;
+                Some((ix, cell.row, cell.col, cell.display.clone()))
+            })
+        };
+        if let Some((ix, row, col, disp)) = table_hit {
+            if shift {
+                if let Some((aix, ar, ac)) = self.table_anchor {
+                    if aix == ix {
+                        self.table_sel = Some(
+                            TableRect {
+                                block_ix: ix,
+                                r0: ar,
+                                c0: ac,
+                                r1: row,
+                                c1: col,
+                            }
+                            .normalize(),
+                        );
+                        self.caret = d;
+                        self.sel = Some(self.table_sel_display_range());
+                        self.mouse_dragging = true;
+                        self.clamp_caret();
+                        self.follow_caret = false;
+                        self.focus.focus(window, cx);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            self.table_anchor = Some((ix, row, col));
+            self.table_sel = Some(TableRect {
+                block_ix: ix,
+                r0: row,
+                c0: col,
+                r1: row,
+                c1: col,
+            });
+            if !shift {
+                self.caret = d;
+                self.mouse_anchor = Some(disp.start);
+                self.affinity = Affinity::Inside;
+                if !self.mode.is_insert() && self.config.editor.is_modal() {
+                    self.mode = Mode::Normal;
+                    self.sel = None;
+                    self.visual_anchor = None;
+                } else {
+                    self.sel = None;
+                }
+                self.mouse_dragging = true;
+                self.clamp_caret();
+                self.follow_caret = false;
+                self.focus.focus(window, cx);
+                cx.notify();
+                return;
+            }
+        } else {
+            self.table_anchor = None;
+            self.table_sel = None;
+        }
         if shift {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -926,6 +1092,9 @@ impl Workspace {
     }
 
     pub fn drag_display(&mut self, d: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if self.link_open {
             self.link_open = false;
             self.link_draft.clear();
@@ -935,6 +1104,44 @@ impl Workspace {
         }
         let p = self.proj();
         let d = d.min(p.display.len());
+        // Excel-style table rectangle while dragging inside the same table.
+        if let Some((aix, ar, ac)) = self.table_anchor {
+            if let Some((block, cell)) = p.table_cell_at(d) {
+                if p.blocks.get(aix).is_some_and(|b| b.source == block.source) {
+                    self.table_sel = Some(
+                        TableRect {
+                            block_ix: aix,
+                            r0: ar,
+                            c0: ac,
+                            r1: cell.row,
+                            c1: cell.col,
+                        }
+                        .normalize(),
+                    );
+                    self.caret = d;
+                    if self.table_sel.is_some_and(|t| t.is_multi()) {
+                        self.sel = Some(self.table_sel_display_range());
+                        if self.config.editor.is_modal() && !self.mode.is_insert() {
+                            self.mode = if self.config.editor == EditorKind::Helix {
+                                Mode::Select
+                            } else {
+                                Mode::Visual
+                            };
+                        }
+                    } else {
+                        self.sel = None;
+                    }
+                    self.clamp_caret();
+                    self.follow_caret = false;
+                    self.focus.focus(window, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+            // Left the table — fall through to linear selection.
+            self.table_sel = None;
+            self.table_anchor = None;
+        }
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             self.mode = if self.config.editor == EditorKind::Helix {
                 Mode::Select
@@ -965,6 +1172,33 @@ impl Workspace {
         self.follow_caret = false;
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Union of display ranges for cells in `table_sel` (for clipboard / bubble).
+    fn table_sel_display_range(&self) -> Range<usize> {
+        let Some(rect) = self.table_sel.map(|r| r.normalize()) else {
+            return self.caret..self.caret;
+        };
+        let p = self.proj();
+        let Some(block) = p.blocks.get(rect.block_ix) else {
+            return self.caret..self.caret;
+        };
+        let BlockExtra::Table { cells, .. } = &block.extra else {
+            return self.caret..self.caret;
+        };
+        let mut start = usize::MAX;
+        let mut end = 0usize;
+        for c in cells {
+            if rect.contains(c.row, c.col) {
+                start = start.min(c.display.start);
+                end = end.max(c.display.end);
+            }
+        }
+        if start == usize::MAX {
+            self.caret..self.caret
+        } else {
+            start..end
+        }
     }
 
     fn commit_edit(
@@ -1106,16 +1340,41 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.command.is_some() || self.search.is_some() || self.link_open {
+        if self.command.is_some()
+            || self.search.is_some()
+            || self.link_open
+            || self.cmd_palette.is_some()
+            || self.view_source
+        {
             return;
         }
         window.prevent_default();
         let count = take_count(&mut self.pending_count);
         self.pending_g = false;
+        let vertical = matches!(motion, Motion::Up | Motion::Down);
+        if !vertical {
+            self.goal_x = None;
+        }
         let p = self.proj();
         let d = self.caret;
         let wrap = self.wrap_cols();
-        let mut next_d = apply_motion(&p.display, d, motion, count, wrap);
+        let mut next_d = if vertical {
+            let mut at = d;
+            for _ in 0..count.max(1) {
+                if let Some(n) = self.layout_move_vertical(at, motion == Motion::Down) {
+                    at = n;
+                } else {
+                    let step = apply_motion(&p.display, at, motion, 1, wrap);
+                    if step == at {
+                        break;
+                    }
+                    at = step;
+                }
+            }
+            at
+        } else {
+            apply_motion(&p.display, d, motion, count, wrap)
+        };
         let insert_like = self.mode.is_insert() || self.is_notion();
         if insert_like && next_d == d {
             if let Some(w) = whichwrap(&p.display, d, motion) {
@@ -1152,6 +1411,49 @@ impl Workspace {
             self.land(next, window, cx);
         }
         self.pending_d = false;
+    }
+
+    /// Prefer real TextLayout wraps over the char-column estimate so up/down
+    /// stay on the painted visual row within a soft-wrapped block.
+    fn layout_move_vertical(&mut self, from: usize, down: bool) -> Option<usize> {
+        let hit = self.hits.iter().find(|h| {
+            from >= h.display_start && from <= h.display_start.saturating_add(h.doc_len)
+        })?;
+        let local = from.saturating_sub(hit.display_start).min(hit.doc_len);
+        let layout = hit.layout.clone();
+        let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layout.position_for_index(local)
+        }))
+        .ok()
+        .flatten()?;
+        let line_h =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.line_height())).ok()?;
+        let bounds =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.bounds())).ok()?;
+        if line_h <= px(0.) {
+            return None;
+        }
+        let goal = self.goal_x.get_or_insert(pos.x);
+        let target_y = if down {
+            pos.y + line_h + (line_h * 0.5)
+        } else {
+            pos.y - (line_h * 0.5)
+        };
+        if target_y < bounds.top() || target_y >= bounds.bottom() {
+            return None;
+        }
+        let target = point(*goal, target_y);
+        let idx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layout.index_for_position(target)
+        }))
+        .ok()?
+        .unwrap_or_else(|e| e)
+        .min(hit.doc_len);
+        let next = hit.display_start + idx;
+        if next == from {
+            return None;
+        }
+        Some(next)
     }
 
     fn go_doc_edge(&mut self, last: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1238,6 +1540,15 @@ impl Workspace {
         }
         if self.search.is_some() {
             self.cancel_search(window, cx);
+            return;
+        }
+        if self.cmd_palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        if self.view_source {
+            self.view_source = false;
+            cx.notify();
             return;
         }
         if self.pending_replace.is_some()
@@ -1697,7 +2008,12 @@ impl Workspace {
     }
 
     fn on_insert_slash(&mut self, _: &InsertSlash, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command.is_some() || self.search.is_some() || self.link_open {
+        if self.command.is_some()
+            || self.search.is_some()
+            || self.link_open
+            || self.cmd_palette.is_some()
+            || self.view_source
+        {
             cx.propagate();
             return;
         }
@@ -1730,6 +2046,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1793,6 +2112,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if self.is_modal_nav() {
             cx.propagate();
             return;
@@ -1867,6 +2189,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if !self.mode.is_insert() && !self.is_notion() {
             cx.propagate();
             return;
@@ -2198,12 +2523,110 @@ impl Workspace {
     ) {
         self.toggle_settings(window, cx);
     }
+    fn on_open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(window, cx);
+    }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.cmd_palette = None;
+        }
         if !self.settings_open {
             self.focus.focus(window, cx);
         }
         cx.notify();
+    }
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmd_palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        if self.view_source {
+            window.prevent_default();
+            self.view_source = false;
+            self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+            self.focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        window.prevent_default();
+        self.clear_pending();
+        self.command = None;
+        self.search = None;
+        self.link_open = false;
+        self.settings_open = false;
+        self.cmd_palette = Some(PaletteState::open());
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cmd_palette = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+    fn submit_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.cmd_palette.as_ref() else {
+            return;
+        };
+        let items = state.items(self.view_source);
+        let Some(item) = items.get(state.index).copied() else {
+            return;
+        };
+        self.run_palette_action(item.action, window, cx);
+    }
+    fn run_palette_action(
+        &mut self,
+        action: PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            PaletteAction::OpenThemes => {
+                if let Some(state) = self.cmd_palette.as_mut() {
+                    state.set_mode(PaletteMode::Themes);
+                }
+                cx.notify();
+            }
+            PaletteAction::OpenEditors => {
+                if let Some(state) = self.cmd_palette.as_mut() {
+                    state.set_mode(PaletteMode::Editors);
+                }
+                cx.notify();
+            }
+            PaletteAction::ToggleFullWidth => {
+                self.config.full_width = !self.config.full_width;
+                self.persist_config(cx);
+                self.status = if self.config.full_width {
+                    "full width".into()
+                } else {
+                    "column width".into()
+                };
+                self.close_palette(window, cx);
+            }
+            PaletteAction::ToggleSource => {
+                self.view_source = !self.view_source;
+                if self.view_source {
+                    self.status = "source view — esc/cmd-k to exit".into();
+                } else {
+                    self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+                }
+                self.close_palette(window, cx);
+            }
+            PaletteAction::OpenSettings => {
+                self.cmd_palette = None;
+                self.settings_open = true;
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            PaletteAction::SetTheme(name) => {
+                self.close_palette(window, cx);
+                self.set_theme(name, window, cx);
+            }
+            PaletteAction::SetEditor(kind) => {
+                self.close_palette(window, cx);
+                self.set_editor(kind, window, cx);
+            }
+        }
     }
     fn set_editor(&mut self, editor: EditorKind, window: &mut Window, cx: &mut Context<Self>) {
         let was_notion = self.is_notion();
@@ -2408,6 +2831,82 @@ impl Workspace {
             return false;
         }
 
+        if self.cmd_palette.is_some() {
+            window.prevent_default();
+            if (key == "k") && (mods.platform || mods.control) && !mods.alt {
+                self.close_palette(window, cx);
+                return true;
+            }
+            if mods.control || mods.platform || mods.alt {
+                return true;
+            }
+            let view_source = self.view_source;
+            let len = self
+                .cmd_palette
+                .as_ref()
+                .map(|s| s.items(view_source).len())
+                .unwrap_or(0);
+            match key {
+                "escape" => {
+                    let back = self
+                        .cmd_palette
+                        .as_ref()
+                        .is_some_and(|s| s.mode != PaletteMode::Root);
+                    if back {
+                        if let Some(state) = self.cmd_palette.as_mut() {
+                            state.set_mode(PaletteMode::Root);
+                        }
+                        cx.notify();
+                    } else {
+                        self.close_palette(window, cx);
+                    }
+                }
+                "enter" => self.submit_palette(window, cx),
+                "up" => {
+                    if let Some(state) = self.cmd_palette.as_mut() {
+                        state.move_by(-1, len);
+                    }
+                    cx.notify();
+                }
+                "down" => {
+                    if let Some(state) = self.cmd_palette.as_mut() {
+                        state.move_by(1, len);
+                    }
+                    cx.notify();
+                }
+                "backspace" => {
+                    if let Some(state) = self.cmd_palette.as_mut() {
+                        if state.query.pop().is_none() && state.mode != PaletteMode::Root {
+                            state.set_mode(PaletteMode::Root);
+                        } else {
+                            state.index = 0;
+                        }
+                    }
+                    cx.notify();
+                }
+                "space" => {
+                    if let Some(state) = self.cmd_palette.as_mut() {
+                        state.query.push(' ');
+                        state.index = 0;
+                    }
+                    cx.notify();
+                }
+                k if k.chars().count() == 1 => {
+                    if let Some(ch) = k.chars().next() {
+                        if !ch.is_control() {
+                            if let Some(state) = self.cmd_palette.as_mut() {
+                                state.query.push(ch);
+                                state.index = 0;
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         if self.link_open {
             window.prevent_default();
             match key {
@@ -2583,7 +3082,9 @@ impl Workspace {
             && (self.mode.is_insert() || self.is_notion())
             && self.command.is_none()
             && self.search.is_none()
+            && self.cmd_palette.is_none()
             && !self.link_open
+            && !self.view_source
         {
             window.prevent_default();
             self.insert_newline(mods.shift, window, cx);
@@ -2594,7 +3095,9 @@ impl Workspace {
         let can_nav = (self.is_modal_nav() || insert_like)
             && self.command.is_none()
             && self.search.is_none()
+            && self.cmd_palette.is_none()
             && !self.link_open
+            && !self.view_source
             && self.pending_replace.is_none()
             && self.pending_find.is_none()
             && self.pending_bracket.is_none();
@@ -3035,6 +3538,7 @@ impl Workspace {
             .items_center()
             .justify_center()
             .bg(p.background.opacity(0.55))
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -3043,6 +3547,9 @@ impl Workspace {
                     cx.notify();
                 }),
             )
+            .on_scroll_wheel(|_, _, cx| {
+                cx.stop_propagation();
+            })
             .child(
                 h_flex()
                     .id("settings-panel")
@@ -3117,6 +3624,184 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn render_palette(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(state) = self.cmd_palette.as_ref() else {
+            return div().into_any_element();
+        };
+        let p = self.palette.clone();
+        let items = state.items(self.view_source);
+        let selected = state.index;
+        let query = state.query.clone();
+        let mode = state.mode;
+        let title = match mode {
+            PaletteMode::Root => "Commands",
+            PaletteMode::Themes => "Themes",
+            PaletteMode::Editors => "Editor",
+        };
+        let hint = match mode {
+            PaletteMode::Root => "cmd-k",
+            PaletteMode::Themes | PaletteMode::Editors => "esc back",
+        };
+
+        div()
+            .id("palette-overlay")
+            .absolute()
+            .size_full()
+            .flex()
+            .justify_center()
+            .pt(px(88.))
+            .bg(p.background.opacity(0.45))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.close_palette(window, cx);
+                }),
+            )
+            .on_scroll_wheel(|_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                v_flex()
+                    .id("palette-panel")
+                    .w(px(520.))
+                    .max_w(relative(0.92))
+                    .max_h(px(420.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.background_panel)
+                    .shadow_lg()
+                    .overflow_hidden()
+                    .font_family(self.config.ui_font.family.clone())
+                    .text_size(self.ui_font_px())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.text_muted)
+                                    .child(title),
+                            )
+                            .child(div().flex_1())
+                            .child(div().text_xs().text_color(p.text_muted).child(hint)),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(p.border)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.primary)
+                                    .child(">"),
+                            )
+                            .child(div().flex_1().text_sm().text_color(p.markdown_text).child(
+                                if query.is_empty() {
+                                    "Type a command…▌".to_string()
+                                } else {
+                                    format!("{query}▌")
+                                },
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .id("palette-list")
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .py_1()
+                            .children(if items.is_empty() {
+                                vec![div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_sm()
+                                    .text_color(p.text_muted)
+                                    .child("No matching commands")
+                                    .into_any_element()]
+                            } else {
+                                items
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, item)| {
+                                        let active = i == selected;
+                                        let action = item.action;
+                                        div()
+                                            .id(("palette-item", i))
+                                            .w_full()
+                                            .px_3()
+                                            .py_2()
+                                            .cursor_pointer()
+                                            .when(active, |el| el.bg(p.background_element))
+                                            .hover(|el| el.bg(p.background_element.opacity(0.7)))
+                                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                                if let Some(state) = this.cmd_palette.as_mut() {
+                                                    if state.index != i {
+                                                        state.index = i;
+                                                        cx.notify();
+                                                    }
+                                                }
+                                            }))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.run_palette_action(action, window, cx);
+                                                }),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .text_sm()
+                                                            .font_weight(if active {
+                                                                FontWeight::SEMIBOLD
+                                                            } else {
+                                                                FontWeight::NORMAL
+                                                            })
+                                                            .text_color(if active {
+                                                                p.primary
+                                                            } else {
+                                                                p.markdown_text
+                                                            })
+                                                            .child(item.label),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(p.text_muted)
+                                                            .child(item.hint),
+                                                    ),
+                                            )
+                                            .into_any_element()
+                                    })
+                                    .collect()
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_edit(
         &mut self,
         display: std::ops::Range<usize>,
@@ -3171,6 +3856,19 @@ impl Workspace {
         };
         let font = Some(gpui::SharedString::from(family));
         let font_px = Some(size);
+        let code_ranges: Vec<_> = runs
+            .iter()
+            .filter(|(_, m)| m.code)
+            .map(|(r, _)| r.clone())
+            .collect();
+        let code_font = if code_ranges.is_empty() {
+            None
+        } else {
+            Some((
+                gpui::SharedString::from(self.config.buffer_font.family.clone()),
+                code_ranges,
+            ))
+        };
         surface::edit_text(
             view.clone(),
             focus,
@@ -3187,6 +3885,7 @@ impl Workspace {
             font,
             font_px,
             heading,
+            code_font,
             {
                 let view = view.clone();
                 move |d, shift, cmd, clicks, window, cx| {
@@ -3543,6 +4242,10 @@ impl Workspace {
         let p = self.proj();
         let pal = self.palette.clone();
         let wrap = self.config.wrap_motions;
+        let caret = self.caret;
+        let sel = self.sel.clone();
+        let table_sel = self.table_sel;
+        let dragging = self.mouse_dragging;
         let BlockExtra::Table { cells, rows, cols } = &p.blocks[ix].extra else {
             return div().into_any_element();
         };
@@ -3554,35 +4257,71 @@ impl Workspace {
                 grid[c.row][c.col] = Some(c.clone());
             }
         }
-        let in_table = p.table_cell_at(self.caret).is_some();
-        v_flex()
+        let in_table = p
+            .block_at_display(caret)
+            .is_some_and(|b| b.source == p.blocks[ix].source)
+            || table_sel.is_some_and(|t| t.block_ix == ix);
+        let tools_at = if in_table && !dragging {
+            p.table_cell_at(caret)
+                .filter(|(b, _)| b.source == p.blocks[ix].source)
+                .map(|(_, c)| (c.row, c.col))
+        } else {
+            None
+        };
+        let grid_el = v_flex()
             .w_full()
             .min_w_0()
             .border_1()
             .border_color(pal.border)
             .rounded(px(8.))
-            .overflow_hidden()
             .children(grid.into_iter().enumerate().map(|(r, row)| {
                 h_flex()
                     .w_full()
+                    .items_stretch()
                     .children(row.into_iter().enumerate().map(|(c, cell)| {
-                        let (disp, header) = if let Some(cell) = cell {
-                            (cell.display, cell.header)
+                        let (disp, header, real) = if let Some(cell) = cell {
+                            (cell.display, cell.header, true)
                         } else {
-                            (0..0, r == 0)
+                            (0..0, r == 0, false)
                         };
+                        let highlighted = real
+                            && table_cell_active(
+                                r,
+                                c,
+                                &disp,
+                                ix,
+                                caret,
+                                sel.as_ref(),
+                                table_sel,
+                            );
                         let text = p
                             .display
                             .get(disp.clone())
                             .unwrap_or("")
                             .replace('\t', "")
                             .to_string();
-                        let edit = self
-                            .render_edit(disp, &text, header, None, None, wrap, None, false, cx);
+                        // Suppress linear text-sel paint when using rectangular table_sel
+                        // (linear ranges include in-between cells in reading order).
+                        let saved_sel = if table_sel.is_some() {
+                            let s = self.sel.take();
+                            let edit = self.render_edit(
+                                disp, &text, header, None, None, wrap, None, false, cx,
+                            );
+                            self.sel = s;
+                            edit
+                        } else {
+                            self.render_edit(disp, &text, header, None, None, wrap, None, false, cx)
+                        };
+                        let edit = saved_sel;
+                        let show_tools = tools_at == Some((r, c));
                         div()
                             .id(("td", r * 100 + c))
+                            .relative()
                             .flex_1()
+                            .flex_basis(relative(1. / cols as f32))
                             .min_w_0()
+                            .h_full()
+                            .min_h(px(28.))
                             .px_2()
                             .py_1()
                             .border_r_1()
@@ -3592,33 +4331,98 @@ impl Workspace {
                                 el.bg(pal.background_element)
                                     .font_weight(FontWeight::SEMIBOLD)
                             })
+                            .when(highlighted, |el| el.bg(pal.primary.opacity(0.12)))
                             .child(edit)
+                            .when(show_tools, |el| {
+                                el.child(
+                                    deferred(
+                                        div()
+                                            .absolute()
+                                            .top(px(-40.))
+                                            .left(px(-4.))
+                                            .occlude()
+                                            .child(self.render_table_tools(cx)),
+                                    )
+                                    .with_priority(2),
+                                )
+                            })
                             .into_any_element()
                     }))
                     .into_any_element()
-            }))
-            .when(in_table, |el| el.child(self.render_table_menu(cx)))
+            }));
+        div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .child(grid_el)
             .into_any_element()
     }
 
-    fn render_table_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Combined selection bubble + grid controls, floating over the table.
+    fn render_table_tools(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pal = &self.palette;
+        let has_text_sel = self.sel.as_ref().is_some_and(|s| s.start != s.end)
+            || self.table_sel.is_some_and(|t| t.is_multi());
         h_flex()
             .gap_1()
             .p_1()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.background_panel)
+            .shadow_sm()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(has_text_sel, |el| {
+                el.child(self.mark_btn("B", Mark::Bold, cx))
+                    .child(self.mark_btn("I", Mark::Italic, cx))
+                    .child(self.mark_btn("U", Mark::Underline, cx))
+                    .child(self.mark_btn("S", Mark::Strike, cx))
+                    .child(self.mark_btn("<>", Mark::Code, cx))
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h(px(16.))
+                            .mx_1()
+                            .bg(pal.border),
+                    )
+            })
             .child(self.table_btn("row-above", "Row ↑", false, true, cx))
             .child(self.table_btn("row-below", "Row ↓", false, false, cx))
             .child(self.table_btn("col-left", "Col ←", true, true, cx))
             .child(self.table_btn("col-right", "Col →", true, false, cx))
             .child(
+                Button::new("tbl-del-row")
+                    .ghost()
+                    .xsmall()
+                    .label("Del row")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.table_delete_row(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("tbl-del-col")
+                    .ghost()
+                    .xsmall()
+                    .label("Del col")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.table_delete_col(window, cx);
+                    })),
+            )
+            .child(
                 Button::new("tbl-del")
                     .ghost()
                     .xsmall()
-                    .label("Delete")
+                    .label("Delete table")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.delete_current_table(window, cx);
                     })),
             )
             .into_any_element()
+    }
+
+    fn render_table_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Kept for callers; tools now live in render_table_tools.
+        self.render_table_tools(cx)
     }
 
     fn table_btn(
@@ -3646,78 +4450,49 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let p = self.proj();
-        let d = self.caret;
-        let Some((block, cell)) = p.table_cell_at(d) else {
-            return;
-        };
-        let BlockExtra::Table { cells, cols, .. } = &block.extra else {
-            return;
-        };
-        let cols = *cols;
-        let (mut headers, mut rows) = {
-            // rebuild from display
-            let mut headers = vec![String::new(); cols.max(1)];
-            let mut body: Vec<Vec<String>> = Vec::new();
-            for c in cells {
-                let text = p
-                    .display
-                    .get(c.display.clone())
-                    .unwrap_or("")
-                    .replace('\t', "")
-                    .to_string();
-                if c.header {
-                    if c.col < headers.len() {
-                        headers[c.col] = text;
-                    }
-                } else {
-                    let br = c.row.saturating_sub(1);
-                    while body.len() <= br {
-                        body.push(vec![String::new(); cols.max(1)]);
-                    }
-                    if c.col < body[br].len() {
-                        body[br][c.col] = text;
-                    }
-                }
-            }
-            (headers, body)
-        };
-        if col {
-            let at = if before { cell.col } else { cell.col + 1 };
-            headers.insert(at.min(headers.len()), String::new());
-            for row in &mut rows {
-                row.insert(at.min(row.len()), String::new());
-            }
-        } else {
-            let body_row = if cell.header {
-                0
-            } else {
-                cell.row.saturating_sub(1)
-            };
-            let at = if before { body_row } else { body_row + 1 };
-            rows.insert(
-                at.min(rows.len()),
-                vec![String::new(); headers.len().max(1)],
-            );
-        }
-        let gfm = crate::display::serialize_table(&headers, &rows);
         self.push_doc_undo();
-        let next = splice(&self.source, block.source.clone(), &gfm);
-        self.commit_edit(next, block.source.start, window, cx);
+        let caret = if col {
+            self.doc.insert_table_col(self.caret, before)
+        } else {
+            self.doc.insert_table_row(self.caret, before)
+        };
+        let Some(caret) = caret else {
+            return;
+        };
+        self.sync_gfm();
+        self.table_sel = None;
+        self.commit_caret(caret, window, cx);
+    }
+
+    fn table_delete_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_doc_undo();
+        let Some(caret) = self.doc.delete_table_row(self.caret) else {
+            return;
+        };
+        self.sync_gfm();
+        self.table_sel = None;
+        self.commit_caret(caret, window, cx);
+    }
+
+    fn table_delete_col(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_doc_undo();
+        let Some(caret) = self.doc.delete_table_col(self.caret) else {
+            return;
+        };
+        self.sync_gfm();
+        self.table_sel = None;
+        self.commit_caret(caret, window, cx);
     }
 
     fn delete_current_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let p = self.proj();
-        let d = self.caret;
-        let Some(block) = p.block_at_display(d) else {
+        self.push_doc_undo();
+        let Some(caret) = self.doc.delete_table(self.caret) else {
             return;
         };
-        if !matches!(block.kind, BlockKind::Table) {
-            return;
-        }
-        self.push_doc_undo();
-        let next = splice(&self.source, block.source.clone(), "");
-        self.commit_edit(next, block.source.start, window, cx);
+        self.sync_gfm();
+        self.table_sel = None;
+        self.table_anchor = None;
+        self.commit_caret(caret, window, cx);
     }
 
     fn render_bubble(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3789,6 +4564,10 @@ impl Workspace {
     fn selection_bubble_for_block(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let p = self.proj();
         let this = p.blocks.get(ix)?;
+        // Tables own their floating toolbar (marks + grid controls).
+        if matches!(this.extra, BlockExtra::Table { .. }) {
+            return None;
+        }
         let show = if let Some(sel) = self.sel.as_ref().filter(|s| s.start != s.end) {
             let d0 = p.to_display(sel.start.min(sel.end));
             p.block_at_display(d0)
@@ -3800,7 +4579,7 @@ impl Workspace {
         } else {
             false
         };
-        if !show {
+        if !show || self.mouse_dragging {
             return None;
         }
         // Float above the selected block (same deferred trick as the slash menu).
@@ -3894,9 +4673,10 @@ impl Workspace {
             p.block_at_display(self.caret).map(|b| &b.extra),
             Some(BlockExtra::Table { .. })
         ) {
-            if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, false) {
+            if let Some(caret) = self.doc.table_tab(self.caret, false) {
                 self.push_doc_undo();
-                self.commit_edit(next, caret, window, cx);
+                self.sync_gfm();
+                self.commit_caret(caret, window, cx);
             }
         }
     }
@@ -3933,9 +4713,10 @@ impl Workspace {
             p.block_at_display(self.caret).map(|b| &b.extra),
             Some(BlockExtra::Table { .. })
         ) {
-            if let Some((next, caret)) = wysiwyg::tab(&self.source, self.caret, true) {
+            if let Some(caret) = self.doc.table_tab(self.caret, true) {
                 self.push_doc_undo();
-                self.commit_edit(next, caret, window, cx);
+                self.sync_gfm();
+                self.commit_caret(caret, window, cx);
             }
         }
     }
@@ -3960,6 +4741,9 @@ impl Workspace {
         self.toggle_mark_action(Mark::Underline, window, cx);
     }
     fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if self.sel.as_ref().is_none_or(|s| s.start == s.end) && !self.link_open {
             return;
         }
@@ -3970,6 +4754,9 @@ impl Workspace {
     }
 
     fn on_cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) else {
             return;
         };
@@ -4011,6 +4798,12 @@ impl Workspace {
         if let Some((buf, _)) = self.search.as_ref() {
             if !buf.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(buf.clone()));
+            }
+            return;
+        }
+        if let Some(state) = self.cmd_palette.as_ref() {
+            if !state.query.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(state.query.clone()));
             }
             return;
         }
@@ -4072,6 +4865,15 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if let Some(state) = self.cmd_palette.as_mut() {
+            state.query.push_str(&text.replace('\n', ""));
+            state.index = 0;
+            cx.notify();
+            return;
+        }
+        if self.view_source {
+            return;
+        }
         let gfm = match clip.metadata() {
             Some(meta) if !meta.is_empty() && !meta.trim_start().starts_with('{') => meta.clone(),
             _ => text.clone(),
@@ -4114,6 +4916,9 @@ impl Workspace {
     }
 
     fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         window.prevent_default();
         self.clear_pending();
         let end = self.proj().display.len();
@@ -4124,7 +4929,54 @@ impl Workspace {
         self.refresh(window, cx);
     }
 
+    fn render_source_view(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.hits.clear();
+        let pal = self.palette.clone();
+        let text = self.source.clone();
+        let hs = crate::syntax::highlights("markdown", &text, &pal);
+        let view = cx.entity();
+        let focus = self.focus.clone();
+        let family = Some(gpui::SharedString::from(
+            self.config.buffer_font.family.clone(),
+        ));
+        let font_px = Some(self.buffer_font_px());
+        let body = surface::edit_text(
+            view,
+            focus,
+            &mut self.hits,
+            0,
+            text,
+            hs,
+            None,
+            false,
+            true,
+            false,
+            &pal,
+            Some(""),
+            family,
+            font_px,
+            false,
+            None,
+            |_, _, _, _, _, _| {},
+            |_, _, _| {},
+        );
+        let full_width = self.config.full_width;
+        vec![div()
+            .id("source-view")
+            .when(!full_width, |el| el.w(px(COLUMN_PX)).mx_auto())
+            .when(full_width, |el| el.w_full())
+            .max_w_full()
+            .min_w_0()
+            .px_8()
+            .py_2()
+            .child(body)
+            .into_any_element()]
+    }
+
     fn render_surface(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.view_source {
+            return self.render_source_view(cx);
+        }
         if !cx.has_active_drag() {
             self.block_dragging = None;
             self.block_drag_gap = None;
@@ -4133,6 +4985,7 @@ impl Workspace {
             self.block_menu = None;
         }
         self.hits.clear();
+        let full_width = self.config.full_width;
         let p = self.proj();
         let us = wysiwyg::units(&p);
         let n = us.len();
@@ -4150,10 +5003,10 @@ impl Workspace {
                     .id(("row", ui))
                     .group(group.clone())
                     .relative()
-                    .w(px(COLUMN_PX))
+                    .when(!full_width, |el| el.w(px(COLUMN_PX)).mx_auto())
+                    .when(full_width, |el| el.w_full())
                     .max_w_full()
                     .min_w_0()
-                    .mx_auto()
                     .px_8()
                     .when(list_item.is_some(), |el| el.py_1())
                     .when(list_item.is_none(), |el| el.py_2())
@@ -4709,6 +5562,9 @@ impl Workspace {
     }
 
     fn toggle_mark_action(&mut self, mark: Mark, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_source || self.cmd_palette.is_some() {
+            return;
+        }
         if let Some(sel) = self.sel.clone().filter(|s| s.start != s.end) {
             self.push_doc_undo();
             if let Some(range) = self.doc.toggle_mark(sel, mark) {
@@ -4973,6 +5829,29 @@ fn icon_el(name: &str, color: gpui::Hsla) -> Icon {
         .h(px(16.))
 }
 
+fn table_cell_active(
+    row: usize,
+    col: usize,
+    disp: &std::ops::Range<usize>,
+    block_ix: usize,
+    caret: usize,
+    sel: Option<&std::ops::Range<usize>>,
+    table_sel: Option<TableRect>,
+) -> bool {
+    if let Some(rect) = table_sel.map(|r| r.normalize()) {
+        if rect.block_ix == block_ix {
+            return rect.contains(row, col);
+        }
+    }
+    if let Some(sel) = sel.filter(|s| s.start != s.end) {
+        let a = sel.start.min(sel.end);
+        let b = sel.start.max(sel.end);
+        disp.start <= b && a <= disp.end
+    } else {
+        caret >= disp.start && caret <= disp.end
+    }
+}
+
 pub fn window_title(path: &Path, dirty: bool) -> String {
     let name = path
         .file_name()
@@ -5106,7 +5985,13 @@ impl EntityInputHandler for Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_modal_nav() {
+        if self.is_modal_nav()
+            || self.search.is_some()
+            || self.command.is_some()
+            || self.settings_open
+            || self.cmd_palette.is_some()
+            || self.view_source
+        {
             return;
         }
         if text == "\n" || text == "\r\n" {
@@ -5256,7 +6141,12 @@ impl EntityInputHandler for Workspace {
     }
 
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        !self.is_modal_nav() && self.command.is_none() && self.search.is_none() && !self.link_open
+        !self.is_modal_nav()
+            && self.command.is_none()
+            && self.search.is_none()
+            && self.cmd_palette.is_none()
+            && !self.link_open
+            && !self.view_source
     }
 }
 
@@ -5270,13 +6160,18 @@ impl Render for Workspace {
             .unwrap_or("untitled")
             .to_string();
         let dirty = self.dirty;
-        let status = self.status.clone();
         let theme_name = p.name.clone();
         let mode_label = self.mode.status(self.config.editor);
         let insert = self.mode.is_insert() || self.is_notion();
         let settings_open = self.settings_open;
+        let palette_open = self.cmd_palette.is_some();
         let command = self.command.clone();
         let search = self.search.clone();
+        let status = if self.view_source {
+            SharedString::from("source view — esc/cmd-k to exit")
+        } else {
+            self.status.clone()
+        };
 
         v_flex()
             .id("workspace")
@@ -5333,6 +6228,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_delete_line_back))
             .on_action(cx.listener(Self::on_block_backspace))
             .on_action(cx.listener(Self::on_toggle_settings))
+            .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_command))
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_search_back))
@@ -5570,6 +6466,7 @@ impl Render for Workspace {
                     ),
             )
             .when(settings_open, |el| el.child(self.render_settings(cx)))
+            .when(palette_open, |el| el.child(self.render_palette(cx)))
     }
 }
 

@@ -8,6 +8,7 @@ mod images;
 mod mode;
 mod motion;
 mod notion;
+mod palette;
 mod slash;
 mod surface;
 mod syntax;
@@ -47,6 +48,15 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
+    // Detach before any file I/O / theme load so the shell returns immediately.
+    // Require a path first so a missing arg fails in the foreground.
+    if args.path.is_none() {
+        anyhow::bail!("missing file path\n\n{HELP}");
+    }
+    if !args.wait {
+        detach_and_reexec()?;
+        return Ok(());
+    }
     let path = args
         .path
         .clone()
@@ -68,6 +78,34 @@ fn run() -> Result<()> {
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     launch(path, source, palette, config);
+    Ok(())
+}
+
+/// Spawn a detached `-w` child with the same args, then let the parent exit.
+fn detach_and_reexec() -> Result<()> {
+    let exe = std::env::current_exe().context("resolving crabmd executable")?;
+    let mut child_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    child_args.insert(0, "-w".into());
+    let mut cmd = std::process::Command::new(exe);
+    // Close stdio so panics/logs from the GUI child never leak back into the
+    // launching terminal after the parent returns.
+    cmd.args(&child_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group so the shell job can end with the parent.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().context("launching crabmd window")?;
     Ok(())
 }
 
@@ -128,6 +166,7 @@ struct Args {
     list_themes: bool,
     theme: String,
     theme_from_cli: bool,
+    wait: bool,
     path: Option<PathBuf>,
 }
 
@@ -137,12 +176,14 @@ impl Args {
         let mut list_themes = false;
         let mut theme = theme::DEFAULT_THEME.to_string();
         let mut theme_from_cli = false;
+        let mut wait = false;
         let mut path = None;
         let mut iter = std::env::args().skip(1).peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
                 "--list-themes" => list_themes = true,
+                "-w" | "--wait" => wait = true,
                 "--theme" | "-t" => {
                     theme = iter
                         .next()
@@ -169,6 +210,7 @@ impl Args {
             list_themes,
             theme,
             theme_from_cli,
+            wait,
             path,
         })
     }
@@ -180,9 +222,15 @@ crabmd — a fast native markdown writer
 Usage:
   crabmd <file.md>
   crabmd --theme <name> <file.md>
+  crabmd -w <file.md>
   crabmd --list-themes
 
 If <file.md> does not exist, an empty markdown file is created.
+
+Flags:
+  -w, --wait     Block the terminal until the window closes (default: detach)
+  -t, --theme    Theme name (see --list-themes)
+  -h, --help     Show this help
 
 Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
   opencode, opencode-light, catppuccin, catppuccin-light,
@@ -190,6 +238,9 @@ Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
 
 Keys (Helix / Vim normal — one buffer):
   cmd/ctrl-s    save (explicit write; no autosave)
+  cmd-k         command palette (theme, editor, full width, source)
+  cmd-,         settings
+  cmd-f         find
   :w / :write   write from the command-line; :wq writes and quits
   /             insert a GFM block (headings, lists, code, table, quote, hr, alerts)
   h/j/k/l       h/l stay on the line; j/k wrap-aware file lines

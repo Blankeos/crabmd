@@ -1,6 +1,7 @@
 //! GFM `source` → visible projection. Syntax stays in the file; the caret walks
 //! `display`. Re-parse after every edit — markdown-markdown is just the parser.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
@@ -1041,6 +1042,16 @@ fn list_indent(line: &str) -> usize {
     line.chars().take_while(|c| *c == ' ' || *c == '\t').count() / 2
 }
 
+/// Flatten CR/LF inside a table cell so the display projection can keep using
+/// `\n` as a row separator and `\t` as a cell separator.
+pub(crate) fn flatten_table_cell_text(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b == b'\n' || b == b'\r') {
+        Cow::Owned(s.replace(['\n', '\r'], " "))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 fn project_table(
     src: &str,
     r: &PaintRange,
@@ -1093,8 +1104,19 @@ fn project_table(
             }
             Event::Text(t) => {
                 let text = &slice[range.start.min(slice.len())..range.end.min(slice.len())];
+                let text = flatten_table_cell_text(text);
                 if !text.trim().is_empty() || !t.is_empty() {
-                    emit_plain(display, segments, abs, text, Marks::default());
+                    emit_plain(display, segments, abs, text.as_ref(), Marks::default());
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                // Treat in-cell breaks as spaces so they cannot look like row separators.
+                emit_plain(display, segments, abs, " ", Marks::default());
+            }
+            Event::Html(t) | Event::InlineHtml(t) => {
+                let lower = t.as_ref().trim().to_ascii_lowercase();
+                if matches!(lower.as_str(), "<br>" | "<br/>" | "<br />") {
+                    emit_plain(display, segments, abs, " ", Marks::default());
                 }
             }
             Event::End(TagEnd::TableCell) => {
@@ -1132,7 +1154,9 @@ pub fn serialize_table(headers: &[String], rows: &[Vec<String>]) -> String {
     out.push('|');
     for i in 0..cols {
         out.push(' ');
-        out.push_str(headers.get(i).map(|s| s.as_str()).unwrap_or(""));
+        out.push_str(&flatten_table_cell_text(
+            headers.get(i).map(|s| s.as_str()).unwrap_or(""),
+        ));
         out.push_str(" |");
     }
     out.push('\n');
@@ -1145,7 +1169,9 @@ pub fn serialize_table(headers: &[String], rows: &[Vec<String>]) -> String {
         out.push('|');
         for i in 0..cols {
             out.push(' ');
-            out.push_str(row.get(i).map(|s| s.as_str()).unwrap_or(""));
+            out.push_str(&flatten_table_cell_text(
+                row.get(i).map(|s| s.as_str()).unwrap_or(""),
+            ));
             out.push_str(" |");
         }
     }
@@ -1256,6 +1282,47 @@ mod tests {
         assert!(p.display.contains('a'));
         assert!(p.display.contains('1'));
         assert!(!p.display.contains("---"));
+    }
+
+    #[test]
+    fn table_multiline_cell_flattens_newlines() {
+        assert_eq!(flatten_table_cell_text("foo\nbar"), "foo bar");
+        assert_eq!(flatten_table_cell_text("foo\r\nbar"), "foo  bar");
+        assert_eq!(flatten_table_cell_text("plain"), "plain");
+
+        let src = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let p = project(src);
+        let BlockExtra::Table { rows, cols, .. } = &p.blocks[0].extra else {
+            panic!("{:?}", p.blocks[0].extra);
+        };
+        assert_eq!(*rows, 2);
+        assert_eq!(*cols, 2);
+        let table = &p.display[p.blocks[0].display.clone()];
+        assert_eq!(
+            table.matches('\n').count(),
+            1,
+            "one row separator: {table:?}"
+        );
+        assert!(table.contains('\t'), "{table:?}");
+
+        let src = "| a | b |\n| --- | --- |\n| foo<br>bar | 2 |";
+        let p = project(src);
+        let BlockExtra::Table { rows, cols, .. } = &p.blocks[0].extra else {
+            panic!("{:?}", p.blocks[0].extra);
+        };
+        assert_eq!(*rows, 2);
+        assert_eq!(*cols, 2);
+        let table = &p.display[p.blocks[0].display.clone()];
+        assert_eq!(
+            table.matches('\n').count(),
+            1,
+            "br in a cell is not a row break: {table:?}"
+        );
+        assert!(table.contains("foo"), "{table:?}");
+        assert!(table.contains("bar"), "{table:?}");
+
+        let gfm = serialize_table(&["h".into()], &[vec!["a\nb".into()]]);
+        assert_eq!(gfm, "| h |\n| --- |\n| a b |");
     }
 
     #[test]

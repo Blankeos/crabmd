@@ -30,7 +30,23 @@ async function ensureBinary() {
 async function run() {
   await ensureBinary();
 
-  const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });
+  const args = process.argv.slice(2);
+  const wait = args.includes("-w") || args.includes("--wait");
+
+  if (!wait) {
+    const child = spawn(binaryPath, args, {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.on("error", (err) => {
+      console.error("❌ Failed to start crabmd:", err.message);
+      process.exit(1);
+    });
+    child.unref();
+    return;
+  }
+
+  const child = spawn(binaryPath, args, { stdio: "inherit" });
 
   child.on("error", (err) => {
     console.error("❌ Failed to start crabmd:", err.message);

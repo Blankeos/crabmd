@@ -1,0 +1,13 @@
+- [x] The cli should open the app as fast as possible, get some inspiration from ../crabcode for benching the perf. + running `crabmd` shouldn't be a blocking terminal process, unless there's a `-w` flag? Also bench the idle (only if possible). Look for competing markdown editors.
+- [x] Bug: when settings is open, don't scroll the markdown from behind.
+- [x] Feat: settings `cmd ,` to open.
+- [x] Feat: Lots of commands via `cmd k`: changing themes (subdialog command), changing notion/vim/helix (subdialog command), making the app not have a maxwidth for the markdown (toggle), seeing markdown source.
+- [x] be able to write `[ ]` to trigger making a "tasklist"
+- [x] writing the backticks `` to make inline codeblocks in the editor. Restarting crabmd shows it later though, which is good.
+- done: buffer font, rounded padded CodePillLayer, selection still paints over text
+- [x] Table rendering needs to be more like a table, it breaks if a cell has multiple lines, then you get a brick-like grid which is bad. The table controls like the footer with controls needs to be floating next to the grid I am focusing. Cell highlights and multiple cell highlighting should also be possible.
+- [x] Keyboard accessibility: The up,down seems to be sometimes inaccurate for the same block but wrapped text. Only sometimes, make it more accurate.
+- [x] Bug: when I `cmd+f` to find. Pressing enter still gets listened by the editor, not the search bar.
+- [ ] Bug: when selecting with click and drag the text selection tools popover that floats on top of selections sometimes interferes with the mouse event so when my click and drag is over that tooltip/popover, the mouse movement does not affect me selecting the text behind it.
+- [ ] Table: make the tools tip/popover two-rowed so it fits below for table ops.
+

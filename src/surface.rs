@@ -4,10 +4,10 @@ use std::ops::Range;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, fill, px, size, App, Bounds, Element, ElementId, Entity, EntityInputHandler, FocusHandle,
-    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement as _,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Point,
-    Styled, StyledText, TextLayout, Window,
+    div, fill, px, size, App, Bounds, Corners, Element, ElementId, Entity, EntityInputHandler,
+    FocusHandle, GlobalElementId, HighlightStyle, Hsla, InspectorElementId,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement as _, Pixels, Point, Styled, StyledText, TextLayout, Window,
 };
 
 use crate::display::{Marks, Projection};
@@ -56,8 +56,8 @@ pub fn highlights(
             });
         }
         if m.code {
+            // Color only — rounded padded pill is painted by CodePillLayer.
             h.color = Some(p.markdown_code);
-            h.background_color = Some(p.background_element);
         }
         if m.underline {
             h.underline = Some(gpui::UnderlineStyle {
@@ -139,7 +139,13 @@ pub fn flatten(
         let mut any = false;
         for (r, h) in &items {
             if r.start < b && r.end > a {
+                let prev_bg = style.background_color;
                 style = style.highlight(*h);
+                // Blend stacked backgrounds (e.g. inline code + selection)
+                // so the selection tint still covers code pills.
+                if let (Some(base), Some(over)) = (prev_bg, h.background_color) {
+                    style.background_color = Some(base.blend(over));
+                }
                 any = true;
             }
         }
@@ -289,6 +295,114 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
     }
 }
 
+/// Rounded, padded backgrounds for inline `code` spans.
+pub struct CodePillLayer {
+    pub layout: TextLayout,
+    pub ranges: Vec<Range<usize>>,
+    pub color: Hsla,
+}
+
+impl IntoElement for CodePillLayer {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for CodePillLayer {
+    type RequestLayoutState = ();
+    type PrepaintState = Vec<gpui::PaintQuad>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.).into();
+        style.size.height = gpui::relative(1.).into();
+        style.position = gpui::Position::Absolute;
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        let Some(len) = layout_len(&self.layout) else {
+            return Vec::new();
+        };
+        let line_h =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
+                .unwrap_or(px(16.));
+        let pad_x = px(4.);
+        let pad_y = px(1.5);
+        let radius = px(4.);
+        let mut quads = Vec::new();
+        for range in &self.ranges {
+            if range.start >= range.end || range.end > len {
+                continue;
+            }
+            let Some(start) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.layout.position_for_index(range.start)
+            }))
+            .ok()
+            .flatten() else {
+                continue;
+            };
+            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.layout.position_for_index(range.end.min(len))
+            }))
+            .ok()
+            .flatten()
+            .unwrap_or(start);
+            // Same visual line — single padded pill. Wrapped code is rare;
+            // fall back to one pill spanning the start line width.
+            let (x0, x1, y) = if (start.y - end.y).abs() < px(0.5) {
+                (start.x.min(end.x), start.x.max(end.x), start.y)
+            } else {
+                (start.x, start.x + px(48.), start.y)
+            };
+            let bounds = Bounds::new(
+                Point::new(x0 - pad_x, y - pad_y),
+                size((x1 - x0) + pad_x * 2., line_h + pad_y * 2.),
+            );
+            quads.push(fill(bounds, self.color).corner_radii(Corners::all(radius)));
+        }
+        quads
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        quads: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        for quad in quads.drain(..) {
+            window.paint_quad(quad);
+        }
+    }
+}
+
 pub fn edit_text<V: EntityInputHandler>(
     view: Entity<V>,
     focus: FocusHandle,
@@ -305,6 +419,7 @@ pub fn edit_text<V: EntityInputHandler>(
     font_family: Option<gpui::SharedString>,
     font_px: Option<gpui::Pixels>,
     heading: bool,
+    code_font: Option<(gpui::SharedString, Vec<Range<usize>>)>,
     on_click: impl Fn(usize, bool, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
@@ -352,7 +467,27 @@ pub fn edit_text<V: EntityInputHandler>(
             && shown.is_char_boundary(r.start)
             && shown.is_char_boundary(r.end)
     });
-    let styled = StyledText::new(shown.clone()).with_highlights(hs);
+    let mut styled = StyledText::new(shown.clone()).with_highlights(hs);
+    let mut code_ranges: Vec<Range<usize>> = Vec::new();
+    if let Some((fam, ranges)) = code_font {
+        code_ranges = ranges
+            .iter()
+            .filter(|r| {
+                r.start < r.end
+                    && r.end <= shown.len()
+                    && shown.is_char_boundary(r.start)
+                    && shown.is_char_boundary(r.end)
+            })
+            .cloned()
+            .collect();
+        let overrides: Vec<_> = code_ranges
+            .iter()
+            .map(|r| (r.clone(), fam.clone()))
+            .collect();
+        if !overrides.is_empty() {
+            styled = styled.with_font_family_overrides(overrides);
+        }
+    }
     let layout = styled.layout().clone();
     hits.push(Hit {
         display_start,
@@ -360,6 +495,7 @@ pub fn edit_text<V: EntityInputHandler>(
         layout: layout.clone(),
     });
     let color = p.primary;
+    let pill_color = p.background_element;
     let click_empty = empty;
     div()
         .id(("edit", display_start))
@@ -371,6 +507,13 @@ pub fn edit_text<V: EntityInputHandler>(
         .when(heading, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
         .when(wrap, |el| el.whitespace_normal())
         .when(!wrap, |el| el.whitespace_nowrap())
+        .when(!code_ranges.is_empty(), |el| {
+            el.child(CodePillLayer {
+                layout: layout.clone(),
+                ranges: code_ranges,
+                color: pill_color,
+            })
+        })
         .child(styled)
         .child(CaretLayer {
             layout: layout.clone(),

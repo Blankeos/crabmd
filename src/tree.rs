@@ -640,7 +640,7 @@ impl Doc {
         let node_ix = loc.node;
         let item = loc.item;
         self.maybe_shortcut(node_ix, item);
-        let loc = {
+        let mut offset = {
             // offset may have been consumed by a shortcut
             let inlines = self.inlines_at(Loc {
                 node: node_ix,
@@ -649,14 +649,12 @@ impl Doc {
                 offset: 0,
             });
             let len = inlines_len(inlines);
-            Loc {
-                node: node_ix,
-                item,
-                cell: loc.cell,
-                offset: len.min(loc.offset + text.len()),
-            }
+            len.min(loc.offset + text.len())
         };
-        self.caret_after(loc.node, loc.item, loc.cell, loc.offset)
+        if text.contains('`') {
+            offset = self.maybe_close_backtick_code(node_ix, item, offset);
+        }
+        self.caret_after(node_ix, item, loc.cell, offset)
     }
 
     pub fn delete_display(&mut self, range: Range<usize>) -> usize {
@@ -1144,6 +1142,163 @@ impl Doc {
         }
     }
 
+    /// Insert a column before/after the cell under `caret`. Caret stays in the
+    /// focused cell (shifted if a column was inserted to the left).
+    pub fn insert_table_col(&mut self, caret: usize, before: bool) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, c) = loc.cell?;
+        {
+            let NodeKind::Table { headers, rows } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            let at = (if before { c } else { c + 1 }).min(headers.len());
+            headers.insert(at, vec![]);
+            for row in rows.iter_mut() {
+                while row.len() < at {
+                    row.push(vec![]);
+                }
+                row.insert(at.min(row.len()), vec![]);
+            }
+        }
+        let new_c = if before { c + 1 } else { c };
+        Some(self.caret_after(loc.node, None, Some((r, new_c)), loc.offset))
+    }
+
+    /// Insert a body row before/after the cell under `caret`. Header row stays
+    /// put; "above" the header inserts the first body row.
+    pub fn insert_table_row(&mut self, caret: usize, before: bool) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, c) = loc.cell?;
+        let new_r = {
+            let NodeKind::Table { headers, rows } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            let cols = headers.len().max(1);
+            let empty = vec![vec![]; cols];
+            if r == 0 {
+                rows.insert(0, empty);
+                1
+            } else {
+                let body = r - 1;
+                let at = if before { body } else { body + 1 };
+                rows.insert(at.min(rows.len()), empty);
+                if before {
+                    r + 1
+                } else {
+                    r
+                }
+            }
+        };
+        Some(self.caret_after(loc.node, None, Some((new_r, c)), loc.offset))
+    }
+
+    pub fn delete_table_col(&mut self, caret: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, c) = loc.cell?;
+        {
+            let NodeKind::Table { headers, rows } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            if headers.len() <= 1 {
+                headers.clear();
+                headers.push(vec![]);
+                for row in rows.iter_mut() {
+                    row.clear();
+                    row.push(vec![]);
+                }
+            } else {
+                if c < headers.len() {
+                    headers.remove(c);
+                }
+                for row in rows.iter_mut() {
+                    if c < row.len() {
+                        row.remove(c);
+                    }
+                }
+            }
+        }
+        let max_c = match &self.nodes[loc.node].kind {
+            NodeKind::Table { headers, .. } => headers.len().saturating_sub(1),
+            _ => 0,
+        };
+        Some(self.caret_after(loc.node, None, Some((r, c.min(max_c))), 0))
+    }
+
+    pub fn delete_table_row(&mut self, caret: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, c) = loc.cell?;
+        {
+            let NodeKind::Table { rows, .. } = &mut self.nodes[loc.node].kind else {
+                return None;
+            };
+            if r == 0 {
+                if !rows.is_empty() {
+                    rows.remove(0);
+                }
+            } else {
+                let body = r - 1;
+                if body < rows.len() {
+                    rows.remove(body);
+                }
+            }
+        }
+        let max_r = match &self.nodes[loc.node].kind {
+            NodeKind::Table { rows, .. } => rows.len(),
+            _ => 0,
+        };
+        let new_r = if r == 0 { 0 } else { r.saturating_sub(1).min(max_r) };
+        Some(self.caret_after(loc.node, None, Some((new_r, c)), 0))
+    }
+
+    pub fn delete_table(&mut self, caret: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        if !matches!(
+            self.nodes.get(loc.node).map(|n| &n.kind),
+            Some(NodeKind::Table { .. })
+        ) {
+            return None;
+        }
+        self.nodes[loc.node].kind = NodeKind::Paragraph { inlines: vec![] };
+        Some(self.caret_after(loc.node, None, None, 0))
+    }
+
+    /// Tab between cells. At the last cell, append a body row (tree mutation).
+    pub fn table_tab(&mut self, caret: usize, shift: bool) -> Option<usize> {
+        let loc = self.loc(caret);
+        let (r, c) = loc.cell?;
+        let (headers_len, body_len) = match &self.nodes.get(loc.node)?.kind {
+            NodeKind::Table { headers, rows } => (headers.len().max(1), rows.len()),
+            _ => return None,
+        };
+        let total_rows = body_len + 1;
+        if shift {
+            if c > 0 {
+                return Some(self.caret_after(loc.node, None, Some((r, c - 1)), 0));
+            }
+            if r > 0 {
+                return Some(self.caret_after(
+                    loc.node,
+                    None,
+                    Some((r - 1, headers_len - 1)),
+                    0,
+                ));
+            }
+            return Some(self.caret_after(loc.node, None, Some((0, 0)), 0));
+        }
+        if c + 1 < headers_len {
+            return Some(self.caret_after(loc.node, None, Some((r, c + 1)), 0));
+        }
+        if r + 1 < total_rows {
+            return Some(self.caret_after(loc.node, None, Some((r + 1, 0)), 0));
+        }
+        {
+            if let NodeKind::Table { headers, rows } = &mut self.nodes[loc.node].kind {
+                rows.push(vec![vec![]; headers.len().max(1)]);
+            }
+        }
+        Some(self.caret_after(loc.node, None, Some((r + 1, 0)), 0))
+    }
+
     pub fn delete_unit(&mut self, unit: usize) -> usize {
         let row_units = units(&self.project());
         if unit >= row_units.len() {
@@ -1412,6 +1567,65 @@ impl Doc {
         }
     }
 
+    /// After typing a closing `` ` ``, wrap the span between the previous
+    /// unmatched backtick on this block into an inline code mark and drop both
+    /// delimiters. Empty `` `` is left alone (fence / escape).
+    fn maybe_close_backtick_code(
+        &mut self,
+        node: usize,
+        item: Option<usize>,
+        caret: usize,
+    ) -> usize {
+        let inlines = match (&mut self.nodes[node].kind, item) {
+            (NodeKind::Paragraph { inlines }, None)
+            | (NodeKind::Heading { inlines, .. }, None)
+            | (NodeKind::Quote { inlines }, None)
+            | (NodeKind::Alert { inlines, .. }, None) => inlines,
+            (NodeKind::List { items, .. }, Some(i)) => match items.get_mut(i) {
+                Some(it) => &mut it.inlines,
+                None => return caret,
+            },
+            _ => return caret,
+        };
+        let text = inlines_text(inlines);
+        if caret == 0 || caret > text.len() {
+            return caret;
+        }
+        if !text[..caret].ends_with('`') {
+            return caret;
+        }
+        let close = caret - '`'.len_utf8();
+        let Some(open) = text[..close].rfind('`') else {
+            return caret;
+        };
+        let inner = open + '`'.len_utf8()..close;
+        if inner.start >= inner.end {
+            return caret;
+        }
+        if text[inner.clone()].contains('\n') {
+            return caret;
+        }
+        // Opening backtick must not already sit inside a code run.
+        let mut at = 0usize;
+        for run in inlines.iter() {
+            let end = at + run.text.len();
+            if open >= at && open < end {
+                if run.marks.code {
+                    return caret;
+                }
+                break;
+            }
+            at = end;
+        }
+        let content = text[inner.clone()].to_string();
+        delete_inlines(inlines, open, caret);
+        let mut code_marks = Marks::default();
+        code_marks.code = true;
+        insert_inlines(inlines, open, &content, code_marks);
+        *inlines = merge_inlines(std::mem::take(inlines));
+        open + content.len()
+    }
+
     fn loc(&self, d: usize) -> Loc {
         let p = self.project();
         let d = d.min(p.display.len());
@@ -1443,15 +1657,18 @@ impl Doc {
             }
         }
         if let BlockExtra::Table { cells, .. } = &b.extra {
-            if let Some(c) = cells
+            let cell = cells
                 .iter()
                 .find(|c| d >= c.display.start && d <= c.display.end)
-            {
+                .or_else(|| cells.iter().rev().find(|c| d >= c.display.start))
+                .or_else(|| cells.first());
+            if let Some(c) = cell {
+                let len = c.display.end.saturating_sub(c.display.start);
                 return Loc {
                     node,
                     item: None,
                     cell: Some((c.row, c.col)),
-                    offset: d.saturating_sub(c.display.start),
+                    offset: d.saturating_sub(c.display.start).min(len),
                 };
             }
         }
@@ -1473,6 +1690,17 @@ impl Doc {
                 .get(loc.item.unwrap_or(0))
                 .map(|i| i.inlines.as_slice())
                 .unwrap_or(&[]),
+            Some(NodeKind::Table { headers, rows }) => {
+                let (r, c) = loc.cell.unwrap_or((0, 0));
+                if r == 0 {
+                    headers.get(c).map(|h| h.as_slice()).unwrap_or(&[])
+                } else {
+                    rows.get(r - 1)
+                        .and_then(|row| row.get(c))
+                        .map(|cell| cell.as_slice())
+                        .unwrap_or(&[])
+                }
+            }
             _ => &[],
         }
     }
@@ -1528,7 +1756,7 @@ impl Doc {
         &self,
         node: usize,
         item: Option<usize>,
-        _cell: Option<(usize, usize)>,
+        cell: Option<(usize, usize)>,
         offset: usize,
     ) -> usize {
         let p = self.project();
@@ -1539,6 +1767,12 @@ impl Doc {
             if let Some(it) = items.get(i) {
                 let len = it.display.end.saturating_sub(it.display.start);
                 return it.display.start + offset.min(len);
+            }
+        }
+        if let (Some((r, c)), BlockExtra::Table { cells, .. }) = (cell, &b.extra) {
+            if let Some(tc) = cells.iter().find(|x| x.row == r && x.col == c) {
+                let len = tc.display.end.saturating_sub(tc.display.start);
+                return tc.display.start + offset.min(len);
             }
         }
         let len = b.display.end.saturating_sub(b.display.start);
@@ -2092,6 +2326,9 @@ fn parse_shortcut(text: &str) -> Option<(NodeKind, String)> {
         }
     }
     for (prefix, ordered, checked) in [
+        ("[] ", false, Some(false)),
+        ("[ ] ", false, Some(false)),
+        ("[x] ", false, Some(true)),
         ("- [ ] ", false, Some(false)),
         ("- [x] ", false, Some(true)),
         ("- ", false, None),
@@ -2413,7 +2650,7 @@ fn emit_node(
                     });
                 }
                 let d0 = display.len();
-                emit_inlines(h, display, segments, links);
+                emit_table_inlines(h, display, segments, links);
                 cells.push(TableCell {
                     display: d0..display.len(),
                     source: d0..display.len(),
@@ -2441,7 +2678,7 @@ fn emit_node(
                         });
                     }
                     let d0 = display.len();
-                    emit_inlines(cell, display, segments, links);
+                    emit_table_inlines(cell, display, segments, links);
                     cells.push(TableCell {
                         display: d0..display.len(),
                         source: d0..display.len(),
@@ -2540,15 +2777,38 @@ fn emit_inlines(
     segments: &mut Vec<Segment>,
     links: &mut Vec<String>,
 ) {
+    emit_inlines_inner(inlines, display, segments, links, false);
+}
+
+fn emit_table_inlines(
+    inlines: &[Inline],
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+    links: &mut Vec<String>,
+) {
+    emit_inlines_inner(inlines, display, segments, links, true);
+}
+
+fn emit_inlines_inner(
+    inlines: &[Inline],
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+    links: &mut Vec<String>,
+    flatten_newlines: bool,
+) {
     for run in inlines {
-        let mut marks = run.marks;
+        let marks = run.marks;
         if let Some(id) = marks.link {
             while links.len() as u32 <= id {
                 links.push(String::new());
             }
         }
         let d0 = display.len();
-        display.push_str(&run.text);
+        if flatten_newlines {
+            display.push_str(&crate::display::flatten_table_cell_text(&run.text));
+        } else {
+            display.push_str(&run.text);
+        }
         segments.push(Segment {
             display: d0..display.len(),
             source: d0..display.len(),
@@ -2573,6 +2833,40 @@ mod tests {
         ));
         assert_eq!(d.project().display, "");
         let _ = c;
+    }
+
+    #[test]
+    fn table_cell_newlines_flatten_in_display() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |");
+        match &mut d.nodes[0].kind {
+            NodeKind::Table { rows, .. } => {
+                rows[0][0] = vec![Inline {
+                    text: "foo\nbar".into(),
+                    marks: Marks::default(),
+                }];
+            }
+            other => panic!("{other:?}"),
+        }
+        let p = d.project();
+        let BlockExtra::Table { cells, rows, cols } = &p.blocks[0].extra else {
+            panic!("{:?}", p.blocks[0].extra);
+        };
+        assert_eq!(*rows, 2);
+        assert_eq!(*cols, 2);
+        assert_eq!(cells.len(), 4);
+        let table = &p.display[p.blocks[0].display.clone()];
+        assert_eq!(
+            table.matches('\n').count(),
+            1,
+            "row separators stay unique: {table:?}"
+        );
+        assert!(table.contains("foo bar"), "{table:?}");
+        assert!(!table.contains("foo\nbar"), "{table:?}");
+        // Tree still stores the original newline.
+        match &d.nodes[0].kind {
+            NodeKind::Table { rows, .. } => assert_eq!(rows[0][0][0].text, "foo\nbar"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -2853,5 +3147,113 @@ mod feature_tests {
             d.nodes[1].kind,
             NodeKind::Heading { level: 1, .. }
         ));
+    }
+
+    #[test]
+    fn bracket_space_makes_tasklist() {
+        let mut d = Doc::empty();
+        let mut c = d.insert_text(0, None, "[", Marks::default());
+        c = d.insert_text(c, None, " ", Marks::default());
+        c = d.insert_text(c, None, "]", Marks::default());
+        c = d.insert_text(c, None, " ", Marks::default());
+        assert!(
+            matches!(
+                &d.nodes[0].kind,
+                NodeKind::List {
+                    items,
+                    ..
+                } if items[0].checked == Some(false)
+            ),
+            "{:?}",
+            d.nodes[0].kind
+        );
+        assert_eq!(d.to_gfm().trim(), "- [ ]");
+        let _ = c;
+    }
+
+    #[test]
+    fn empty_brackets_space_makes_tasklist() {
+        let mut d = Doc::empty();
+        let mut c = d.insert_text(0, None, "[", Marks::default());
+        c = d.insert_text(c, None, "]", Marks::default());
+        c = d.insert_text(c, None, " ", Marks::default());
+        assert!(
+            matches!(
+                &d.nodes[0].kind,
+                NodeKind::List {
+                    items,
+                    ..
+                } if items[0].checked == Some(false)
+            ),
+            "{:?}",
+            d.nodes[0].kind
+        );
+        assert_eq!(d.to_gfm().trim(), "- [ ]");
+        let _ = c;
+    }
+
+    #[test]
+    fn closing_backtick_makes_inline_code() {
+        let mut d = Doc::empty();
+        let mut c = d.insert_text(0, None, "`", Marks::default());
+        c = d.insert_text(c, None, "code", Marks::default());
+        c = d.insert_text(c, None, "`", Marks::default());
+        let p = d.project();
+        assert_eq!(p.display, "code");
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).code);
+        assert!(d.to_gfm().contains("`code`"), "{}", d.to_gfm());
+        let _ = c;
+    }
+
+    #[test]
+    fn table_typing_stays_in_cell() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!("{:?}", p.blocks[0].extra);
+        };
+        let cell = cells
+            .iter()
+            .find(|c| !c.header && c.row == 1 && c.col == 1)
+            .unwrap();
+        let caret = cell.display.end;
+        let next = d.insert_text(caret, None, "x", Marks::default());
+        let p2 = d.project();
+        let BlockExtra::Table { cells, .. } = &p2.blocks[0].extra else {
+            panic!();
+        };
+        let cell2 = cells
+            .iter()
+            .find(|c| !c.header && c.row == 1 && c.col == 1)
+            .unwrap();
+        assert!(
+            p2.display[cell2.display.clone()].contains('x'),
+            "typed into {:?}",
+            &p2.display[cell2.display.clone()]
+        );
+        assert!(
+            next >= cell2.display.start && next <= cell2.display.end,
+            "caret {next} not in {}..{}",
+            cell2.display.start,
+            cell2.display.end
+        );
+    }
+
+    #[test]
+    fn table_insert_col_mutates_tree() {
+        let mut d = Doc::from_gfm("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let p = d.project();
+        let BlockExtra::Table { cells, .. } = &p.blocks[0].extra else {
+            panic!();
+        };
+        let cell = cells.iter().find(|c| c.row == 0 && c.col == 0).unwrap();
+        d.insert_table_col(cell.display.start, false).unwrap();
+        let NodeKind::Table { headers, rows } = &d.nodes[0].kind else {
+            panic!();
+        };
+        assert_eq!(headers.len(), 3);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(inlines_text(&headers[0]), "a");
+        assert_eq!(inlines_text(&headers[2]), "b");
     }
 }

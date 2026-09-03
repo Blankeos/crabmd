@@ -85,6 +85,9 @@ pub struct Config {
     /// When true, `j`/`k` count wrapped visual lines. Default on.
     #[serde(default = "default_wrap")]
     pub wrap_motions: bool,
+    /// When true, markdown is not constrained to `COLUMN_PX`. Default off.
+    #[serde(default)]
+    pub full_width: bool,
     /// Titlebar, footer, settings chrome.
     #[serde(default = "default_ui_font")]
     pub ui_font: FontSpec,
@@ -102,6 +105,7 @@ impl Default for Config {
             editor: EditorKind::Helix,
             theme: default_theme(),
             wrap_motions: true,
+            full_width: false,
             ui_font: default_ui_font(),
             markdown_font: default_markdown_font(),
             buffer_font: default_buffer_font(),
@@ -118,6 +122,8 @@ struct RawConfig {
     theme: String,
     #[serde(default = "default_wrap")]
     wrap_motions: bool,
+    #[serde(default)]
+    full_width: bool,
     #[serde(default)]
     ui_font: Option<FontSpec>,
     #[serde(default)]
@@ -142,6 +148,7 @@ impl From<RawConfig> for Config {
             editor: raw.editor,
             theme: raw.theme,
             wrap_motions: raw.wrap_motions,
+            full_width: raw.full_width,
             ui_font: raw.ui_font.unwrap_or_else(default_ui_font).clamp(),
             markdown_font: raw
                 .markdown_font
@@ -199,6 +206,7 @@ mod tests {
             editor: EditorKind::Vim,
             theme: "catppuccin".into(),
             wrap_motions: false,
+            full_width: true,
             ui_font: FontSpec::new("SF Pro", 13),
             markdown_font: FontSpec::new("Menlo", 15),
             buffer_font: FontSpec::new("JetBrainsMono Nerd Font", 14),
@@ -222,6 +230,7 @@ mod tests {
         assert_eq!(cfg.editor, EditorKind::Helix);
         assert_eq!(cfg.theme, "opencode");
         assert!(cfg.wrap_motions);
+        assert!(!cfg.full_width);
         assert_eq!(cfg.markdown_font.family, "JetBrainsMono Nerd Font");
         assert_eq!(cfg.markdown_font.size, 15);
         assert_eq!(cfg.buffer_font.size, 14);
