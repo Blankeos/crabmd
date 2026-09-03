@@ -1330,6 +1330,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tinyvec",
  "toml 0.8.23",
  "yscv-video",
 ]
@@ -2403,7 +2404,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
+source = "git+https://github.com/longbridge/gpui-component?rev=b4393e22d3a04a880bc187dfdabca9b1eeee270a#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2435,7 +2436,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
+source = "git+https://github.com/longbridge/gpui-component?rev=b4393e22d3a04a880bc187dfdabca9b1eeee270a#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2486,7 +2487,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
+source = "git+https://github.com/longbridge/gpui-component?rev=b4393e22d3a04a880bc187dfdabca9b1eeee270a#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2500,7 +2501,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
+source = "git+https://github.com/longbridge/gpui-component?rev=b4393e22d3a04a880bc187dfdabca9b1eeee270a#b4393e22d3a04a880bc187dfdabca9b1eeee270a"
 dependencies = [
  "proc-macro2",
  "quote",
