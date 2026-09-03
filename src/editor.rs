@@ -28,7 +28,7 @@ use crate::display::{
     CODE_LANGS, COLUMN_PX,
 };
 use crate::document::{
-    alert_icon_name, extract_links, parse_ranges, splice, BlockKind, PaintRange,
+    alert_icon_name, extract_links, parse_ranges, splice, take_bare_url, BlockKind, PaintRange,
 };
 use crate::images;
 use crate::mode::{self, Caret, ExCommand, Mode};
@@ -812,6 +812,7 @@ impl Workspace {
             self.apply_slash(item, window, cx);
             return;
         }
+        let prev_caret = self.caret;
         self.push_doc_undo();
         self.caret = self.doc.enter(self.caret, hard);
         self.sync_gfm();
@@ -819,6 +820,14 @@ impl Workspace {
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
+
+        // Check if the token before Enter was a bare URL. If so, auto-link it.
+        // `push_doc_undo` above already recorded the state before Enter, and
+        // `try_auto_link_preceding_url` pushes another snapshot of the state
+        // with the Enter applied but before the link transformation.
+        // Therefore, first Cmd-Z undoes the link, and second Cmd-Z undoes Enter.
+        self.try_auto_link_preceding_url(prev_caret);
+
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -4091,6 +4100,15 @@ impl Workspace {
         self.sel = None;
         self.dirty = true;
         self.status = "unsaved".into();
+
+        // If the pasted text was or ended with a bare URL, auto-link it with a two-step undo stack.
+        // `push_doc_undo` above already recorded the state before pasting (step 1).
+        // `try_auto_link_preceding_url` will push the plaintext-pasted state before linkifying (step 2).
+        // So first Cmd-Z undoes the link (leaving plaintext URL), second Cmd-Z undoes the paste.
+        if !in_code {
+            self.try_auto_link_preceding_url(self.caret);
+        }
+
         self.refresh(window, cx);
         self.sync_title(window);
     }
@@ -4730,7 +4748,7 @@ impl Workspace {
         self.sync_title(window);
     }
 
-    fn open_link_url(&self, raw: &str, cx: &mut App) {
+    fn open_link_url(&self, raw: &str, _cx: &mut App) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             eprintln!("crabmd: open_link_url: empty url");
@@ -4745,7 +4763,81 @@ impl Workspace {
             format!("https://{trimmed}")
         };
         open_in_browser(&url);
-        cx.open_url(&url);
+    }
+
+    /// Check if the word directly before `end_display` is a bare URL (http://, https://, or www.)
+    /// that is not already marked as a link, and auto-link it with a dedicated undo step.
+    ///
+    /// When auto-linking triggers, a snapshot of the current state (prior to linkifying)
+    /// is pushed to `undo`, so Cmd-Z first reverts the link transformation to plain text,
+    /// and a second Cmd-Z reverts the preceding action (space, enter, or paste).
+    fn try_auto_link_preceding_url(&mut self, end_display: usize) -> bool {
+        let p = self.proj();
+        let end = end_display.min(p.display.len());
+        let before = &p.display[..end];
+
+        // Find the start of the token right before `end` (skip trailing whitespace if any)
+        let token_end = before
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        if token_end == 0 {
+            return false;
+        }
+
+        // Find start of this token (bounded by whitespace or start of string)
+        let token_start = before[..token_end]
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        let candidate = &before[token_start..token_end];
+        let url_candidate = candidate.trim_start_matches(['(', '[', '<', '"', '\'']);
+        let trim_lead_len = candidate.len() - url_candidate.len();
+        let url_start = token_start + trim_lead_len;
+
+        if !url_candidate.starts_with("http://")
+            && !url_candidate.starts_with("https://")
+            && !url_candidate.starts_with("www.")
+        {
+            return false;
+        }
+
+        let bare = take_bare_url(url_candidate);
+        if bare.is_empty() || bare.len() < 4 {
+            return false;
+        }
+        let url_end = url_start + bare.len();
+
+        // Make sure it's not already linked
+        if (url_start..url_end).any(|i| p.link_at(i).is_some()) {
+            return false;
+        }
+
+        // Make sure it's not inside a code block
+        if let Some(b) = p.block_at_display(url_start) {
+            if matches!(b.kind, BlockKind::Code) {
+                return false;
+            }
+        }
+
+        let full_url = if bare.starts_with("www.") {
+            format!("https://{bare}")
+        } else {
+            bare.clone()
+        };
+
+        // Snapshot current state (text typed/pasted) as an undo point, so first undo
+        // reverts the link transformation back to plain text.
+        let before_link = self.snapshot();
+        self.doc.apply_link(url_start..url_end, &full_url);
+        self.sync_gfm();
+        self.undo.push(before_link);
+        self.dirty = true;
+        self.status = "unsaved".into();
+        true
     }
 
     fn remove_link_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5084,6 +5176,15 @@ impl EntityInputHandler for Workspace {
             self.last_slash_query = q;
             self.slash_index = 0;
         }
+
+        // If user typed a space (or ends with whitespace), check if preceding token is a bare URL.
+        // Flush any active insert batch first so the typed space is its own undo step,
+        // then auto-linking pushes another undo step so Cmd-Z first reverts the link.
+        if text.chars().any(char::is_whitespace) {
+            self.finish_insert_undo();
+            self.try_auto_link_preceding_url(self.caret);
+        }
+
         self.refresh(window, cx);
         self.sync_title(window);
     }

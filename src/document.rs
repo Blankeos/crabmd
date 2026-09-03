@@ -651,7 +651,7 @@ fn parse_autolink_at(s: &str) -> Option<(String, usize)> {
     }
 }
 
-fn take_bare_url(s: &str) -> String {
+pub fn take_bare_url(s: &str) -> String {
     let n = s
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != ')' && *c != ']' && *c != '>')
