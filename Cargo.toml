@@ -62,3 +62,8 @@ objc = "0.2"
 name = "CrabMD"
 identifier = "ai.blankeos.crabmd"
 icon = ["assets/app-icon.png"]
+
+[package.metadata.dist]
+# publish = false above opts out of crates.io, but that also hides the
+# binary from cargo-dist. Re-enable dist explicitly.
+dist = true
