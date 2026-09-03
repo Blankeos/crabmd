@@ -1,11 +1,14 @@
 //! One markdown buffer. GFM `source` is truth; paint and the caret walk a
 //! visible projection. No textarea — WYSIWYG overlay on every block.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
-    actions, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb, AnyElement,
+    actions, canvas, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb,
+    AnyElement,
     App, AppContext as _, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DragMoveEvent, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -496,6 +499,7 @@ pub struct Workspace {
     link_open: bool,
     link_draft: LineField,
     palette_scroll: ScrollHandle,
+    slash_scroll: ScrollHandle,
     hits: Vec<Hit>,
     pending_replace: Option<usize>,
     pending_find: Option<(FindKind, usize)>,
@@ -551,6 +555,10 @@ pub struct Workspace {
     /// Live Mermaid diagrams, keyed by block source. Themed at render time,
     /// so a theme switch clears the cache.
     mermaid: MermaidStore,
+    /// Inline video clips, keyed by resolved path (or `remote:<url>` once
+    /// downloaded to temp). Pure-Rust `yscv-video` decode — no GStreamer /
+    /// FFmpeg system libs, so the bundle stays self-contained.
+    video: crate::video::VideoStore,
 }
 
 impl Workspace {
@@ -608,6 +616,7 @@ impl Workspace {
             link_open: false,
             link_draft: LineField::new(),
             palette_scroll: ScrollHandle::new(),
+            slash_scroll: ScrollHandle::new(),
             hits: Vec::new(),
             pending_replace: None,
             pending_find: None,
@@ -644,6 +653,7 @@ impl Workspace {
             pending_chord: false,
             palette_theme_backup: None,
             mermaid: MermaidStore::default(),
+            video: crate::video::VideoStore::default(),
         };
 
         if let Some((line, col)) = initial {
@@ -2254,6 +2264,7 @@ impl Workspace {
             window.prevent_default();
             let n = self.slash_items().len();
             self.slash_index = slash::move_index(self.slash_index, n, -1);
+            self.scroll_slash_to_selected();
             cx.notify();
             return;
         }
@@ -2269,6 +2280,7 @@ impl Workspace {
             window.prevent_default();
             let n = self.slash_items().len();
             self.slash_index = slash::move_index(self.slash_index, n, 1);
+            self.scroll_slash_to_selected();
             cx.notify();
             return;
         }
@@ -2324,6 +2336,7 @@ impl Workspace {
         if q != self.last_slash_query {
             self.last_slash_query = q;
             self.slash_index = 0;
+            self.slash_scroll.scroll_to_item(0);
         }
         self.refresh(window, cx);
         self.sync_title(window);
@@ -3237,6 +3250,55 @@ impl Workspace {
         self.palette_scroll
             .scroll_to_item(state.index.min(n.saturating_sub(1)));
     }
+    /// Keep the keyboard-selected slash row in view (up/down + filtering).
+    /// Hover doesn't scroll — the mouse user owns the wheel.
+    fn scroll_slash_to_selected(&self) {
+        let n = self.slash_items().len();
+        if n == 0 {
+            return;
+        }
+        self.slash_scroll
+            .scroll_to_item(self.slash_index.min(n.saturating_sub(1)));
+    }
+    /// Floating-style placement for the `/` popover: prefer below the caret
+    /// block, flip above when there isn't room (judged against the minimum
+    /// height), and shrink the menu to whatever space the winning side has.
+    /// Returns `(above, max_h)`.
+    fn slash_placement(&self) -> (bool, Pixels) {
+        const MIN_H: f32 = 120.;
+        const MAX_H: f32 = 304.;
+        const GAP: f32 = 8.;
+        let viewport = self.scroll_handle.bounds();
+        if viewport.size.height <= px(0.) {
+            return (false, px(MAX_H));
+        }
+        let cap = (viewport.size.height - px(16.)).min(px(MAX_H));
+        let cap = cap.max(px(80.));
+        let p = self.proj();
+        let d = self.caret;
+        let ix = wysiwyg::units(&p).iter().position(|u| {
+            let r = wysiwyg::unit_display(&p, *u);
+            d >= r.start && d <= r.end
+        });
+        let Some(ix) = ix else {
+            return (false, cap);
+        };
+        let Some(b) = self.scroll_handle.bounds_for_item(ix) else {
+            return (false, cap);
+        };
+        let offset = self.scroll_handle.offset();
+        let block_top = b.top() + offset.y;
+        let block_bottom = b.bottom() + offset.y;
+        let below = viewport.bottom() - block_bottom - px(GAP);
+        let above = block_top - viewport.top() - px(GAP);
+        let flip = below < px(MIN_H) && above > below;
+        let avail = if flip { above } else { below };
+        // Shrink to the winning side; never exceed the viewport.
+        let h = avail.max(px(0.)).min(cap);
+        // Floor so the menu stays usable in tiny spaces (may overflow by a
+        // few px only when there is no room on either side).
+        (flip, h.max(px(80.)).min(cap.max(px(80.))))
+    }
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         if self.write_to_disk(cx) {
             self.status = "saved".into();
@@ -3963,49 +4025,91 @@ impl Workspace {
         false
     }
 
+    /// Positioned `/` popover: preferred side is below the `/` block, flips
+    /// above when there is no room (see `slash_placement`). Height shrinks
+    /// to fit the winning side; width is capped so it never leaves the view.
+    fn render_slash_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (above, _) = self.slash_placement();
+        let mut anchor = div().absolute().left_0().occlude();
+        anchor = if above {
+            // bottom:100% pins the menu's bottom edge to the block's top
+            // edge, so it sits fully above regardless of menu height.
+            anchor.bottom(relative(1.)).mb_1()
+        } else {
+            anchor.top(px(28.))
+        };
+        deferred(
+            anchor
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(self.render_slash_menu(cx)),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+
     fn render_slash_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let items = self.slash_items();
         if items.is_empty() {
             return div().into_any_element();
         }
         let selected = slash::clamp_index(self.slash_index, items.len());
+        let (_, max_h) = self.slash_placement();
         let p = &self.palette;
         v_flex()
             .w(px(340.))
-            .py_1()
+            .max_w(relative(0.9))
+            .max_h(max_h)
+            .min_h(px(0.))
             .rounded(px(8.))
             .border_1()
             .border_color(p.border)
             .bg(p.background_panel)
             .shadow_lg()
-            .children(items.into_iter().enumerate().map(|(i, item)| {
-                let active = i == selected;
-                div()
-                    .id(("slash-item", i))
-                    .px_3()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .id("slash-list")
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.slash_scroll)
                     .py_1()
-                    .cursor_pointer()
-                    .when(active, |el| el.bg(p.background_element))
-                    .hover(|el| el.bg(p.background_element))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.apply_slash(item, window, cx);
-                        }),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            .child(icon_el(
-                                item.icon,
-                                if active { p.primary } else { p.text_muted },
-                            ))
-                            .child(div().flex_1().text_color(p.markdown_text).child(item.label))
-                            .child(div().text_xs().text_color(p.text_muted).child(item.hint)),
-                    )
-            }))
+                    .children(items.into_iter().enumerate().map(|(i, item)| {
+                        let active = i == selected;
+                        div()
+                            .id(("slash-item", i))
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(active, |el| el.bg(p.background_element))
+                            .hover(|el| el.bg(p.background_element))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.apply_slash(item, window, cx);
+                                }),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(icon_el(
+                                        item.icon,
+                                        if active { p.primary } else { p.text_muted },
+                                    ))
+                                    .child(div().flex_1().text_color(p.markdown_text).child(item.label))
+                                    .child(div().text_xs().text_color(p.text_muted).child(item.hint)),
+                            )
+                    }))
+                    // Scrollbar last: the overlay is an extra tracked
+                    // child, so it must not shift item indices used
+                    // by keyboard scroll-into-view.
+                    .vertical_scrollbar(&self.slash_scroll),
+            )
             .into_any_element()
     }
 
@@ -5078,17 +5182,7 @@ impl Workspace {
                     .when(*level <= 2, |el| el.pt_2())
                     .child(body);
                 if slash {
-                    el = el.child(
-                        deferred(
-                            div()
-                                .absolute()
-                                .top(px(28.))
-                                .left_0()
-                                .occlude()
-                                .child(self.render_slash_menu(cx)),
-                        )
-                        .with_priority(1),
-                    );
+                    el = el.child(self.render_slash_popover(cx));
                 }
                 el.into_any_element()
             }
@@ -5130,17 +5224,7 @@ impl Workspace {
                 if slash {
                     // `deferred` paints after later sibling blocks so the menu
                     // floats above the document instead of sitting underneath.
-                    el = el.child(
-                        deferred(
-                            div()
-                                .absolute()
-                                .top(px(28.))
-                                .left_0()
-                                .occlude()
-                                .child(self.render_slash_menu(cx)),
-                        )
-                        .with_priority(1),
-                    );
+                    el = el.child(self.render_slash_popover(cx));
                 }
                 el.into_any_element()
             }
@@ -5148,7 +5232,7 @@ impl Workspace {
     }
 
     fn render_image_hit(
-        &self,
+        &mut self,
         alt: &str,
         src: &str,
         display_start: usize,
@@ -5321,20 +5405,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// GitHub-style video (`![alt](clip.mp4)` or `<video src=…>`).
-    /// Deliberately NOT `gpui-video-player`: that crate needs a system
-    /// GStreamer install, spawns a thread + playbin pipeline per video, and
-    /// assumes tight NV12 layouts — too static/inflexible inside a scrolling
-    /// doc and hostile to a self-contained bundle. (The FFmpeg fork
-    /// `gpui-video` trades GStreamer for FFmpeg dev libraries + CPAL —
-    /// same bundle problem.) There is also no HTML renderer in the GPUI
-    /// ecosystem (awesome-gpui lists no webview/HTML crate), so remote pages
-    /// and `<iframe>` stay as cards. Instead the block renders a 16:9
-    /// preview tile like a GitHub README embed — `Play` opens the system
-    /// player (or browser for remote) — with the same click-to-edit
-    /// toolbar as images.
+    /// GitHub-style video (`![alt](clip.mp4)` or `<video src=…>`) with
+    /// INLINE playback: pure-Rust `yscv-video` decodes MP4 (H.264/HEVC)
+    /// off-thread into `RenderImage` frames — no GStreamer/FFmpeg system
+    /// libs, so the bundle stays self-contained (this is why we deliberately
+    /// do NOT use awesome-gpui's `gpui-video-player`: system GStreamer +
+    /// per-video playbin pipelines break the self-contained bundle).
+    /// Playback is silent (yscv exposes audio metadata only); `Open` still
+    /// shells to the system player for audio. Remote URLs download to temp
+    /// (`curl`) and decode through the same path. No HTML renderer exists
+    /// in the GPUI ecosystem, so `<iframe>` etc. stay as cards.
     fn render_video_hit(
-        &self,
+        &mut self,
         alt: &str,
         src: &str,
         display_start: usize,
@@ -5344,40 +5426,500 @@ impl Workspace {
         let path = images::resolve_beside(&self.path, src);
         let selected = self.media_sel == Some(display_start);
         let remote = !path.exists() && images::is_remote_src(src);
-        let playable = path.exists() || remote;
         let name = Path::new(src)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(src);
-        let meta = if path.exists() {
-            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            format!("{} · {}", name, crate::images::human_size(bytes))
-        } else {
-            name.to_string()
-        };
-        let caption = if alt.is_empty() {
-            if playable {
-                meta.clone()
-            } else {
-                format!("missing video: {src}")
-            }
-        } else if playable {
-            format!("{meta} · {alt}")
-        } else {
-            format!("missing video: {src}")
-        };
         let src_owned = src.to_string();
-        let url_owned = src.to_string();
-        let path_owned = path.clone();
         let alt_owned = alt.to_string();
-        let missing = !playable;
-        let title = if missing {
-            "Missing video".to_string()
-        } else if remote {
-            "Video · remote".to_string()
+
+        // Missing local file — same guidance card as before.
+        if !path.exists() && !remote {
+            let title = "Missing video".to_string();
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, {
+                    let view = cx.entity();
+                    move |ev: &MouseDownEvent, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.click_display(
+                                display_start,
+                                ev.modifiers.shift,
+                                ev.modifiers.platform || ev.modifiers.control,
+                                ev.click_count,
+                                window,
+                                cx,
+                            )
+                        });
+                    }
+                })
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(if selected { pal.primary } else { pal.border })
+                        .bg(pal.background_panel)
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(220.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(gpui::black().opacity(0.85))
+                                .child(icon_el_px(
+                                    "image",
+                                    gpui::white().opacity(0.4),
+                                    px(40.),
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .p_3()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    v_flex().flex_1().min_w_0().gap_1()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(pal.markdown_text)
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(pal.text_muted)
+                                                .child(format!(
+                                                    "{src} — not found beside this file; edit the path below"
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    Button::new(("video-edit", display_start))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(if selected { "Editing…" } else { "Edit" })
+                                        .on_click({
+                                            let src = src_owned.clone();
+                                            let alt = alt_owned.clone();
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.select_media_knob(
+                                                    display_start,
+                                                    alt.clone(),
+                                                    src.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                        }),
+                                ),
+                        ),
+                )
+                .when(selected, |el| {
+                    el.child(self.render_media_toolbar(false, display_start, cx))
+                })
+                .into_any_element();
+        }
+
+        // Decode key: local path, or the remote URL (decoded from temp).
+        let key = if remote {
+            crate::video::VideoStore::remote_key(src)
         } else {
-            "Video".to_string()
+            crate::video::VideoStore::key_for(&path)
         };
+
+        // Kick off decode at most once per clip.
+        if self.video.begin(key.clone()) {
+            let view = cx.entity();
+            if remote {
+                let url = src.to_string();
+                let key = key.clone();
+                cx.spawn(async move |_, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            let tmp = crate::video::remote_cache_path(&url);
+                            if !tmp.exists() || tmp.metadata().map(|m| m.len()).unwrap_or(0) == 0
+                            {
+                                if let Some(dir) = tmp.parent() {
+                                    let _ = std::fs::create_dir_all(dir);
+                                }
+                                let out = std::process::Command::new("curl")
+                                    .args([
+                                        "--fail",
+                                        "--location",
+                                        "--max-time",
+                                        "90",
+                                        &url,
+                                        "-o",
+                                        &tmp.to_string_lossy(),
+                                    ])
+                                    .output()
+                                    .map_err(|e| format!("download failed ({e}); is curl installed?"))?;
+                                if !out.status.success() {
+                                    return Err(format!(
+                                        "download failed ({}): {}",
+                                        out.status,
+                                        String::from_utf8_lossy(&out.stderr).trim()
+                                    ));
+                                }
+                            }
+                            crate::video::decode_file(&tmp)
+                        })
+                        .await;
+                    let _ = cx.update(|cx| {
+                        view.update(cx, |this, cx| {
+                            this.video.finish(key, result);
+                            cx.notify();
+                        })
+                    });
+                })
+                .detach();
+            } else {
+                let file = path.clone();
+                let key = key.clone();
+                cx.spawn(async move |_, cx| {
+                    let result = cx
+                        .background_spawn(async move { crate::video::decode_file(&file) })
+                        .await;
+                    let _ = cx.update(|cx| {
+                        view.update(cx, |this, cx| {
+                            this.video.finish(key, result);
+                            cx.notify();
+                        })
+                    });
+                })
+                .detach();
+            }
+        }
+
+        // Decode error — card with the message + external fallback.
+        if let Some(err) = self.video.error(&key) {
+            let first = err.lines().next().unwrap_or("decode failed").to_string();
+            let url_owned = src_owned.clone();
+            let path_owned = path.clone();
+            let inner = v_flex()
+                .w_full()
+                .min_w_0()
+                .p_3()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(icon_el("play", pal.error))
+                        .child(
+                            v_flex().flex_1().min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(pal.markdown_text)
+                                        .child("Video — could not play inline"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.text_muted)
+                                        .child(format!("{first} — try Open for audio/full playback")),
+                                ),
+                        )
+                        .child(
+                            Button::new(("video-open", display_start))
+                                .xsmall()
+                                .label("Open")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    if remote {
+                                        cx.open_url(&url_owned);
+                                    } else {
+                                        open_video_src(&url_owned, &path_owned, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new(("video-edit", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label(if selected { "Editing…" } else { "Edit" })
+                                .on_click({
+                                    let src = src_owned.clone();
+                                    let alt = alt_owned.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.select_media_knob(
+                                            display_start,
+                                            alt.clone(),
+                                            src.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                }),
+                        ),
+                )
+                .into_any_element();
+            return self.render_video_card(inner, display_start, selected, cx);
+        }
+
+        // Ready — the inline player.
+        if let Some((clip, stamps)) = self.video.get(&key) {
+            let n = clip.frames.len();
+            let (playing, frame) = self.video.play_state(&key);
+            let frame = frame.min(n.saturating_sub(1));
+            let image = clip.frames[frame].clone();
+            let (cw, ch) = (clip.width.max(1) as f32, clip.height.max(1) as f32);
+            // Fit inside a 560-wide letterbox; fixed height avoids reflow.
+            let box_h = (560.0 * ch / cw).clamp(180.0, 400.0);
+            let (iw, ih) = if cw / ch > 560.0 / box_h {
+                (560.0, 560.0 * ch / cw)
+            } else {
+                (box_h * cw / ch, box_h)
+            };
+            let cur_us = stamps.get(frame).copied().unwrap_or(0);
+            let frac = if n <= 1 {
+                1.0
+            } else {
+                frame as f32 / (n - 1) as f32
+            };
+            let time = format!(
+                "{} / {}",
+                crate::video::fmt_time(cur_us),
+                crate::video::fmt_time(clip.duration_us)
+            );
+            let truncated = clip.truncated;
+            let pal2 = pal.clone();
+            // Bounds tracker: the canvas paints nothing but records the
+            // scrub bar's window bounds each frame, so click-to-seek can
+            // map the (window-space) mouse position to a frame.
+            let bar_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+            let bar_bounds_paint = bar_bounds.clone();
+            let view = cx.entity();
+            let key_seek = key.clone();
+            let n_seek = n;
+            let scrub = div()
+                .id(("video-scrub", display_start))
+                .w_full()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, cx| {
+                    if let Some(b) = *bar_bounds.borrow() {
+                        let w = b.size.width.as_f32().max(1.0);
+                        let f = ((ev.position.x.as_f32() - b.origin.x.as_f32()) / w)
+                            .clamp(0.0, 1.0);
+                        let frame = (f * (n_seek - 1) as f32).round() as usize;
+                        view.update(cx, |this, cx| {
+                            this.video.scrub(&key_seek, frame);
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(6.))
+                        .rounded_full()
+                        .bg(pal2.border)
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(relative(frac))
+                                .rounded_full()
+                                .bg(pal2.primary),
+                        )
+                        .child(canvas(
+                            move |bounds, _, _| {
+                                *bar_bounds_paint.borrow_mut() = Some(bounds);
+                            },
+                            |_, _, _, _| {},
+                        )),
+                );
+            let inner = v_flex()
+                .w_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(box_h))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black())
+                        .child(img(image).w(px(iw)).h(px(ih))),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new(("video-play", display_start))
+                                .xsmall()
+                                .label(if playing { "Pause" } else { "Play" })
+                                .on_click({
+                                    let key = key.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.toggle_video(&key, cx);
+                                    })
+                                }),
+                        )
+                        .child(
+                            Button::new(("video-back", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label("-1s")
+                                .on_click({
+                                    let key = key.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.step_video(&key, -30, cx);
+                                    })
+                                }),
+                        )
+                        .child(
+                            Button::new(("video-fwd", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label("+1s")
+                                .on_click({
+                                    let key = key.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.step_video(&key, 30, cx);
+                                    })
+                                }),
+                        )
+                        .child(div().flex_1().min_w_0().child(scrub))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal.text_muted)
+                                .child(time),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .pb_3()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            v_flex().flex_1().min_w_0()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(pal.text_muted)
+                                        .child(if truncated {
+                                            format!(
+                                                "{name} · preview of first {n} frames · Open for full"
+                                            )
+                                        } else if alt.is_empty() {
+                                            format!("{name} · silent preview")
+                                        } else {
+                                            format!("{name} · {alt} · silent preview")
+                                        }),
+                                ),
+                        )
+                        .when(remote, |el| {
+                            el.child(
+                                Button::new(("video-open", display_start))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Open")
+                                    .on_click({
+                                        let url = src_owned.clone();
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.open_url(&url);
+                                        })
+                                    }),
+                            )
+                        })
+                        .child(
+                            Button::new(("video-edit", display_start))
+                                .ghost()
+                                .xsmall()
+                                .label(if selected { "Editing…" } else { "Edit" })
+                                .on_click({
+                                    let src = src_owned.clone();
+                                    let alt = alt_owned.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.select_media_knob(
+                                            display_start,
+                                            alt.clone(),
+                                            src.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                }),
+                        ),
+                )
+                .into_any_element();
+            return self.render_video_card(inner, display_start, selected, cx);
+        }
+
+        // Still decoding (or downloading a remote) — placeholder tile.
+        let fetching_remote =
+            remote && !crate::video::remote_cache_path(src).exists();
+        let label = if fetching_remote {
+            "Fetching remote video…"
+        } else {
+            "Decoding video…"
+        };
+        let inner = v_flex()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(220.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::black().opacity(0.85))
+                    .child(icon_el_px("play", gpui::white().opacity(0.4), px(40.))),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_3()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(pal.text_muted)
+                            .child(format!("{label} · {name}")),
+                    ),
+            )
+            .into_any_element();
+        self.render_video_card(inner, display_start, selected, cx)
+    }
+
+    /// Video card shell: bordered panel + click-to-select + the Alt/Path
+    /// toolbar when selected. Shared by missing/error/loading/player.
+    fn render_video_card(
+        &self,
+        inner: AnyElement,
+        display_start: usize,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = &self.palette;
         v_flex()
             .w_full()
             .min_w_0()
@@ -5407,115 +5949,49 @@ impl Workspace {
                     .border_1()
                     .border_color(if selected { pal.primary } else { pal.border })
                     .bg(pal.background_panel)
-                    // 16:9-ish preview tile (fixed height keeps every embed
-                    // aligned in the scroll). Clicking it plays.
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(220.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(gpui::black().opacity(0.85))
-                            .child(icon_el_px(
-                                if playable { "play" } else { "image" },
-                                gpui::white().opacity(if playable { 0.9 } else { 0.4 }),
-                                px(40.),
-                            ))
-                            .when(playable, |el| {
-                                el.on_mouse_down(MouseButton::Left, {
-                                    let src = src_owned.clone();
-                                    let path = path_owned.clone();
-                                    let view = cx.entity();
-                                    move |_: &MouseDownEvent, _, cx| {
-                                        let src = src.clone();
-                                        let path = path.clone();
-                                        view.update(cx, |_, cx| {
-                                            open_video_src(&src, &path, cx);
-                                        });
-                                    }
-                                })
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .p_3()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                v_flex().flex_1().min_w_0().gap_1()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(pal.markdown_text)
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(pal.text_muted)
-                                            .child(if missing {
-                                                format!("{src} — not found beside this file; edit the path below")
-                                            } else {
-                                                caption
-                                            }),
-                                    ),
-                            )
-                            .when(playable, |el| {
-                                el.child(
-                                    Button::new(("video-play", display_start))
-                                        .xsmall()
-                                        .label("Play")
-                                        .on_click({
-                                            let src = src_owned.clone();
-                                            let path = path_owned.clone();
-                                            cx.listener(move |_, _, _, cx| {
-                                                open_video_src(&src, &path, cx);
-                                            })
-                                        }),
-                                )
-                            })
-                            .when(remote, |el| {
-                                el.child(
-                                    Button::new(("video-open", display_start))
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Open")
-                                        .on_click({
-                                            let url = url_owned.clone();
-                                            cx.listener(move |_, _, _, cx| {
-                                                cx.open_url(&url);
-                                            })
-                                        }),
-                                )
-                            })
-                            .child(
-                                Button::new(("video-edit", display_start))
-                                    .ghost()
-                                    .xsmall()
-                                    .label(if selected { "Editing…" } else { "Edit" })
-                                    .on_click({
-                                        let src = src_owned.clone();
-                                        let alt = alt_owned.clone();
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.select_media_knob(
-                                                display_start,
-                                                alt.clone(),
-                                                src.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                    }),
-                            ),
-                    ),
+                    .child(inner),
             )
             .when(selected, |el| {
                 el.child(self.render_media_toolbar(false, display_start, cx))
             })
             .into_any_element()
+    }
+
+    /// Play/pause toggle for an inline clip. Starting playback spawns a
+    /// frame-pacing loop (`background_executor().timer`, same pattern as
+    /// Zed's blink manager); the `generation` guard kills stale loops.
+    fn toggle_video(&mut self, key: &str, cx: &mut Context<Self>) {
+        let (playing, gen) = self.video.toggle(key);
+        cx.notify();
+        if playing {
+            let dt = self.video.frame_dt(key);
+            let key = key.to_string();
+            let view = cx.entity();
+            cx.spawn(async move |_, cx| {
+                loop {
+                    cx.background_executor().timer(dt).await;
+                    let cont = cx.update(|cx| {
+                        view.update(cx, |this, cx| {
+                            let live = this.video.advance_if_active(&key, gen);
+                            cx.notify();
+                            live
+                        })
+                    });
+                    if !cont {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Step ±frames (the -1s/+1s buttons ≈ ±30 frames at 30fps).
+    fn step_video(&mut self, key: &str, delta: isize, cx: &mut Context<Self>) {
+        let (_, frame) = self.video.play_state(key);
+        let next = (frame as isize + delta).clamp(0, usize::MAX as isize) as usize;
+        self.video.scrub(key, next);
+        cx.notify();
     }
 
     /// Generic HTML blocks (`<iframe>`, `<details>`, raw `<div>`…): a small
@@ -8420,6 +8896,7 @@ impl EntityInputHandler for Workspace {
         if q != self.last_slash_query {
             self.last_slash_query = q;
             self.slash_index = 0;
+            self.slash_scroll.scroll_to_item(0);
         }
 
         // If user typed a space (or ends with whitespace), check if preceding token is a bare URL.

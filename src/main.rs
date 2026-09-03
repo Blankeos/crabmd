@@ -16,6 +16,7 @@ mod syntax;
 mod theme;
 mod tree;
 mod undo;
+mod video;
 mod wysiwyg;
 
 use std::path::PathBuf;
