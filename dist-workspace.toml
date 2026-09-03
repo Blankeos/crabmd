@@ -20,3 +20,18 @@ targets = [
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 ]
+# Native ARM runner: aarch64-linux links C system libs (xkbcommon, xcb)
+# which cross-compile via zigbuild can't find. Native build fixes that.
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+# GPUI/Linux system libs (Zed script/linux set, trimmed to link deps).
+# Without these, Linux link fails with:
+#   rust-lld: error: unable to find library -lxkbcommon
+[dist.dependencies.apt]
+libxkbcommon-dev = "*"
+libxkbcommon-x11-dev = "*"
+libx11-xcb-dev = "*"
+libxcb1-dev = "*"
+libfontconfig-dev = "*"
+libfreetype-dev = "*"
+libwayland-dev = "*"
