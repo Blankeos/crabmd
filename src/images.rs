@@ -7,10 +7,54 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff",
 ];
 
+/// GitHub-style video attachments (`![alt](clip.mp4)`, `<video src=…>`).
+pub const VIDEO_EXTS: &[&str] = &["mp4", "mov", "webm", "m4v", "ogv", "ogg"];
+
 pub fn is_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMAGE_EXTS.iter().any(|ok| e.eq_ignore_ascii_case(ok)))
+}
+
+/// Image or video file (paste/drop peer of images).
+pub fn is_media_path(path: &Path) -> bool {
+    is_image_path(path) || is_video_path(path)
+}
+
+pub fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| VIDEO_EXTS.iter().any(|ok| e.eq_ignore_ascii_case(ok)))
+}
+
+/// True when an `![alt](src)` target is a video (extension or URL guess).
+pub fn is_video_src(src: &str) -> bool {
+    let base = src.split(['?', '#']).next().unwrap_or(src);
+    Path::new(base)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| VIDEO_EXTS.iter().any(|ok| e.eq_ignore_ascii_case(ok)))
+}
+
+/// `<video src="clip.mp4">…</video>` (or bare `<video src=…>`) -> src.
+pub fn parse_video_src(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let tag = lower.find("<video")?;
+    let rest = &raw[tag..];
+    let src_ix = rest.to_ascii_lowercase().find("src")?;
+    let after = rest[src_ix + 3..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.as_bytes().first()?;
+    if *quote == b'"' || *quote == b'\'' {
+        let end = after[1..].find(*quote as char)?;
+        Some(after[1..1 + end].to_string())
+    } else {
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        let src = after[..end].trim();
+        (!src.is_empty()).then(|| src.to_string())
+    }
 }
 
 pub fn unique_filename(existing: &HashSet<String>, preferred: &str) -> String {
@@ -154,5 +198,31 @@ mod tests {
     #[test]
     fn gfm_line() {
         assert_eq!(gfm_image("cat", "cat.png"), "![cat](cat.png)");
+    }
+
+    #[test]
+    fn video_exts() {
+        assert!(is_video_path(Path::new("clip.mp4")));
+        assert!(is_video_path(Path::new("clip.MOV")));
+        assert!(!is_video_path(Path::new("clip.png")));
+        assert!(is_media_path(Path::new("clip.webm")));
+        assert!(is_media_path(Path::new("pic.png")));
+        assert!(!is_media_path(Path::new("notes.md")));
+        assert!(is_video_src("clip.mp4"));
+        assert!(is_video_src("https://x.test/v.mov?dl=1"));
+        assert!(!is_video_src("pic.png"));
+    }
+
+    #[test]
+    fn video_tag_src() {
+        assert_eq!(
+            parse_video_src(r#"<video src="clip.mp4" controls></video>"#),
+            Some("clip.mp4".to_string())
+        );
+        assert_eq!(
+            parse_video_src("<video src=clip.mp4>"),
+            Some("clip.mp4".to_string())
+        );
+        assert_eq!(parse_video_src("![a](b.png)"), None);
     }
 }

@@ -8,23 +8,70 @@ use serde::Deserialize;
 pub const DEFAULT_THEME: &str = "opencode";
 
 pub const THEME_FILES: &[(&str, &str)] = &[
-    ("opencode", include_str!("../themes/opencode.json")),
-    (
-        "opencode-light",
-        include_str!("../themes/opencode-light.json"),
-    ),
+    ("aura", include_str!("../themes/aura.json")),
+    ("ayu", include_str!("../themes/ayu.json")),
+    ("carbonfox-light", include_str!("../themes/carbonfox-light.json")),
+    ("carbonfox", include_str!("../themes/carbonfox.json")),
+    ("catppuccin-frappe", include_str!("../themes/catppuccin-frappe.json")),
+    ("catppuccin-light", include_str!("../themes/catppuccin-light.json")),
+    ("catppuccin-macchiato", include_str!("../themes/catppuccin-macchiato.json")),
     ("catppuccin", include_str!("../themes/catppuccin.json")),
-    (
-        "catppuccin-light",
-        include_str!("../themes/catppuccin-light.json"),
-    ),
-    ("tokyonight", include_str!("../themes/tokyonight.json")),
-    (
-        "tokyonight-light",
-        include_str!("../themes/tokyonight-light.json"),
-    ),
-    ("github", include_str!("../themes/github.json")),
+    ("cobalt2-light", include_str!("../themes/cobalt2-light.json")),
+    ("cobalt2", include_str!("../themes/cobalt2.json")),
+    ("crabcode-orange", include_str!("../themes/crabcode-orange.json")),
+    ("cursor-light", include_str!("../themes/cursor-light.json")),
+    ("cursor", include_str!("../themes/cursor.json")),
+    ("dracula-light", include_str!("../themes/dracula-light.json")),
+    ("dracula", include_str!("../themes/dracula.json")),
+    ("everforest-light", include_str!("../themes/everforest-light.json")),
+    ("everforest", include_str!("../themes/everforest.json")),
+    ("flexoki-light", include_str!("../themes/flexoki-light.json")),
+    ("flexoki", include_str!("../themes/flexoki.json")),
     ("github-light", include_str!("../themes/github-light.json")),
+    ("github", include_str!("../themes/github.json")),
+    ("grokday", include_str!("../themes/grokday.json")),
+    ("groknight", include_str!("../themes/groknight.json")),
+    ("gruvbox-light", include_str!("../themes/gruvbox-light.json")),
+    ("gruvbox", include_str!("../themes/gruvbox.json")),
+    ("kanagawa-light", include_str!("../themes/kanagawa-light.json")),
+    ("kanagawa", include_str!("../themes/kanagawa.json")),
+    ("lucent-orng-light", include_str!("../themes/lucent-orng-light.json")),
+    ("lucent-orng", include_str!("../themes/lucent-orng.json")),
+    ("material-light", include_str!("../themes/material-light.json")),
+    ("material", include_str!("../themes/material.json")),
+    ("matrix-light", include_str!("../themes/matrix-light.json")),
+    ("matrix", include_str!("../themes/matrix.json")),
+    ("mercury-light", include_str!("../themes/mercury-light.json")),
+    ("mercury", include_str!("../themes/mercury.json")),
+    ("monokai-light", include_str!("../themes/monokai-light.json")),
+    ("monokai", include_str!("../themes/monokai.json")),
+    ("nightowl", include_str!("../themes/nightowl.json")),
+    ("nord-light", include_str!("../themes/nord-light.json")),
+    ("nord", include_str!("../themes/nord.json")),
+    ("one-dark-light", include_str!("../themes/one-dark-light.json")),
+    ("one-dark", include_str!("../themes/one-dark.json")),
+    ("opencode-light", include_str!("../themes/opencode-light.json")),
+    ("opencode", include_str!("../themes/opencode.json")),
+    ("orng-light", include_str!("../themes/orng-light.json")),
+    ("orng", include_str!("../themes/orng.json")),
+    ("osaka-jade-light", include_str!("../themes/osaka-jade-light.json")),
+    ("osaka-jade", include_str!("../themes/osaka-jade.json")),
+    ("palenight-light", include_str!("../themes/palenight-light.json")),
+    ("palenight", include_str!("../themes/palenight.json")),
+    ("rosepine-light", include_str!("../themes/rosepine-light.json")),
+    ("rosepine", include_str!("../themes/rosepine.json")),
+    ("solarized-light", include_str!("../themes/solarized-light.json")),
+    ("solarized", include_str!("../themes/solarized.json")),
+    ("synthwave84-light", include_str!("../themes/synthwave84-light.json")),
+    ("synthwave84", include_str!("../themes/synthwave84.json")),
+    ("tokyonight-light", include_str!("../themes/tokyonight-light.json")),
+    ("tokyonight", include_str!("../themes/tokyonight.json")),
+    ("vercel-light", include_str!("../themes/vercel-light.json")),
+    ("vercel", include_str!("../themes/vercel.json")),
+    ("vesper-light", include_str!("../themes/vesper-light.json")),
+    ("vesper", include_str!("../themes/vesper.json")),
+    ("zenburn-light", include_str!("../themes/zenburn-light.json")),
+    ("zenburn", include_str!("../themes/zenburn.json")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +152,20 @@ pub fn load_named(name: &str) -> anyhow::Result<Palette> {
 }
 
 pub fn load_json(name: &str, json: &str) -> anyhow::Result<Palette> {
-    let file: ThemeFile = serde_json::from_str(json)?;
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    if value.get("defs").is_some() && value.get("theme").is_some() {
+        let file: ThemeFile = serde_json::from_value(value)?;
+        return load_tui(name, &file);
+    }
+    // Same desktop-theme schema crabcode ships (`light`/`dark` overrides):
+    // grokday, groknight, crabcode-orange.
+    if value.get("light").is_some() && value.get("dark").is_some() {
+        return load_desktop(name, &value);
+    }
+    anyhow::bail!("unsupported theme schema for `{name}`")
+}
+
+fn load_tui(name: &str, file: &ThemeFile) -> anyhow::Result<Palette> {
     let appearance = match file.appearance.as_deref() {
         Some("light") => Appearance::Light,
         _ => {
@@ -151,6 +211,107 @@ pub fn load_json(name: &str, json: &str) -> anyhow::Result<Palette> {
         markdown_horizontal_rule: resolve("markdownHorizontalRule", "#808080"),
         markdown_list_item: resolve("markdownListItem", "#fab283"),
         markdown_code_block: resolve("markdownCodeBlock", "#eeeeee"),
+    })
+}
+
+/// Desktop-theme schema (`light`/`dark` with `seeds` + `overrides`), the
+/// same files crabcode ships for grokday / groknight / crabcode-orange.
+#[derive(Debug, Deserialize)]
+struct DesktopMode {
+    #[serde(default)]
+    seeds: HashMap<String, String>,
+    #[serde(default)]
+    overrides: HashMap<String, String>,
+}
+
+fn load_desktop(name: &str, value: &serde_json::Value) -> anyhow::Result<Palette> {
+    let appearance = match value
+        .get("appearance")
+        .and_then(|v| v.as_str())
+    {
+        Some("light") => Appearance::Light,
+        Some("dark") => Appearance::Dark,
+        _ => {
+            if name.ends_with("-light") {
+                Appearance::Light
+            } else {
+                Appearance::Dark
+            }
+        }
+    };
+    let side = match appearance {
+        Appearance::Dark => "dark",
+        Appearance::Light => "light",
+    };
+    let mode: DesktopMode = serde_json::from_value(
+        value
+            .get(side)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )?;
+    let seed = |key: &str| mode.seeds.get(key).map(String::as_str);
+    let over = |key: &str| mode.overrides.get(key).map(String::as_str);
+    // Seeds first, overrides win (mirrors crabcode's get_colors_with).
+    let pick = |seeds: &[&str], overs: &[&str], fallback: &str| -> Hsla {
+        for key in overs {
+            if let Some(hex) = over(key) {
+                if let Some(c) = parse_hex(hex) {
+                    return c;
+                }
+            }
+        }
+        for key in seeds {
+            if let Some(hex) = seed(key) {
+                if let Some(c) = parse_hex(hex) {
+                    return c;
+                }
+            }
+        }
+        parse_hex(fallback).unwrap()
+    };
+    let text_base = pick(&[], &["text-base"], "#eeeeee");
+    Ok(Palette {
+        name: name.to_string(),
+        appearance,
+        background: pick(&["neutral"], &["background-base"], "#0a0a0a"),
+        background_panel: pick(
+            &[],
+            &[
+                "background-stronger",
+                "background-strong",
+                "surface-raised-stronger-non-alpha",
+            ],
+            "#141414",
+        ),
+        background_element: pick(
+            &[],
+            &["surface-raised-base-hover", "background-strong"],
+            "#1e1e1e",
+        ),
+        border: pick(&[], &["border-base", "border-weak-base"], "#484848"),
+        text: text_base,
+        text_muted: pick(&[], &["text-weak"], "#808080"),
+        primary: pick(&["interactive", "primary"], &[], "#fab283"),
+        secondary: pick(&["primary"], &[], "#5c9cf5"),
+        accent: pick(&["primary"], &["markdown-heading"], "#9d7cd8"),
+        error: pick(&["error"], &[], "#e06c75"),
+        warning: pick(&["warning"], &[], "#f5a742"),
+        success: pick(&["success", "diffAdd"], &[], "#7fd88f"),
+        info: pick(&["info"], &[], "#56b6c2"),
+        markdown_text: pick(&[], &["markdown-text", "text-base"], "#eeeeee"),
+        markdown_heading: pick(&[], &["markdown-heading", "text-strong"], "#9d7cd8"),
+        markdown_link: pick(&["interactive"], &["markdown-link"], "#fab283"),
+        markdown_code: pick(&[], &["markdown-code", "text-base"], "#7fd88f"),
+        markdown_block_quote: pick(&[], &["markdown-block-quote", "text-weak"], "#e5c07b"),
+        markdown_emph: pick(&[], &["markdown-emph", "text-weak"], "#e5c07b"),
+        markdown_strong: pick(&[], &["markdown-strong", "text-strong"], "#f5a742"),
+        markdown_horizontal_rule: pick(
+            &[],
+            &["markdown-horizontal-rule", "border-base"],
+            "#808080",
+        ),
+        markdown_list_item: pick(&[], &["markdown-list-item", "text-base"], "#fab283"),
+        markdown_code_block: pick(&[], &["markdown-code-block", "text-base"], "#eeeeee"),
     })
 }
 
@@ -202,21 +363,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ships_the_small_set() {
+    fn ships_the_full_set() {
         let names = list_theme_names();
-        assert_eq!(
-            names,
-            [
-                "opencode",
-                "opencode-light",
-                "catppuccin",
-                "catppuccin-light",
-                "tokyonight",
-                "tokyonight-light",
-                "github",
-                "github-light",
-            ]
-        );
+        assert_eq!(names.len(), THEME_FILES.len());
+        for want in [
+            "opencode",
+            "opencode-light",
+            "catppuccin",
+            "catppuccin-light",
+            "tokyonight",
+            "tokyonight-light",
+            "github",
+            "github-light",
+            "grokday",
+            "groknight",
+            "aura",
+            "dracula",
+            "nightowl",
+        ] {
+            assert!(names.contains(&want), "missing theme {want}");
+        }
+    }
+
+    #[test]
+    fn all_bundled_themes_load() {
+        for name in list_theme_names() {
+            load_named(name)
+                .unwrap_or_else(|err| panic!("theme {name} failed: {err:#}"));
+        }
     }
 
     #[test]

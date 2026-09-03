@@ -16,4 +16,17 @@
 - [x] Table: text selection should still be possible. Tip since the bg color of selection is the same for cells and the text selection. Make the border colored for selected cells instead. And 2x2 cells selected means the inside borders are not colored, just the outer ones, kinda like notion.
 - [x] Table: since text selection is possible, cmd-b should still work in tables.
 - [x] Table: shift+enter should be possible
+- [x] Load at top (cursor/scroll starts at bottom)
+- [x] CLI `path:line:col` like zed, nearest visible pick
+- [x] Image toolbar on click: edit alt, change path; video support like GFM/images
+- [x] Fix settings font input: backspace/keys leak to markdown
+- [x] Fix line editing caret: opt/cmd-backspace + opt-arrows keep caret (not end)
+- [x] Theme setting → pure input, pick via palette; `cmd-shift-p` palette, `cmd-k t` opens themes; live preview on hover/up-down
+- [x] Port all crabcode themes + grokday/groknight
+- [x] Full-width toggle as Preferences setting
+- [x] Editor mode radios → card radios (icon + label + desc)
+- [x] Font size numeric-only; per-field inline reset icon when customized, minor global reset
+- [x] Palette list mouse-wheel scroll + mac-like fading scrollbars (doc, palette, settings)
+- [x] Vim/Helix block caret inverts the covered character instead of hiding it
+- [x] Fix `cmd-k t` chord (capture-level starter), block-caret inversion under formatting (re-flatten), thumb-only scrollbars, palette keyboard scroll-follow, settings scroll reach/edge, font-family reset icon (12px), smaller Choose button
 

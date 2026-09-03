@@ -191,6 +191,8 @@ pub struct CaretLayer<V: EntityInputHandler> {
     pub layout: TextLayout,
     pub local_caret: Option<usize>,
     pub block: bool,
+    /// Skip the block quad (the character is already inverted via highlight).
+    pub skip_block: bool,
     pub color: Hsla,
     pub view: Entity<V>,
     pub focus: FocusHandle,
@@ -242,6 +244,9 @@ impl<V: EntityInputHandler> Element for CaretLayer<V> {
         let Some(local) = self.local_caret else {
             return None;
         };
+        if self.block && self.skip_block {
+            return None;
+        }
         let Some(len) = layout_len(&self.layout) else {
             return None;
         };
@@ -467,6 +472,32 @@ pub fn edit_text<V: EntityInputHandler>(
             && shown.is_char_boundary(r.start)
             && shown.is_char_boundary(r.end)
     });
+    // Vim/Helix block caret: invert the covered character (block-colored
+    // background, editor-background glyph) so it reads as a true block
+    // cursor instead of a solid quad hiding the char. The painted quad is
+    // skipped when inversion applies; empty blocks keep the quad fallback.
+    // NOTE: re-flatten after pushing — `hs` is already disjoint (overlapping
+    // heading/bold/italic/code/link/syntax ranges would otherwise swallow
+    // the inversion in StyledText, which is why the caret vanished on
+    // formatted text). Last writer wins, so the caret colors take over.
+    let mut inverted = false;
+    if block_caret && !text.is_empty() {
+        if let Some(local) = caret_local {
+            let range = crate::motion::block_caret_range(&text, local);
+            if range.start < range.end {
+                hs.push((
+                    range,
+                    HighlightStyle {
+                        color: Some(p.background),
+                        background_color: Some(p.primary),
+                        ..Default::default()
+                    },
+                ));
+                hs = flatten(shown.len(), hs);
+                inverted = true;
+            }
+        }
+    }
     let mut styled = StyledText::new(shown.clone()).with_highlights(hs);
     let mut code_ranges: Vec<Range<usize>> = Vec::new();
     if let Some((fam, ranges)) = code_font {
@@ -523,6 +554,7 @@ pub fn edit_text<V: EntityInputHandler>(
                 caret_local
             },
             block: block_caret,
+            skip_block: inverted,
             color,
             view,
             focus,

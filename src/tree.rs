@@ -1038,6 +1038,32 @@ impl Doc {
         self.caret_after(at.min(self.nodes.len().saturating_sub(1)), None, None, 0)
     }
 
+    /// Rewrite alt/src of the image block under display `caret` (media toolbar).
+    pub fn update_image(&mut self, caret: usize, alt: String, src: String) -> usize {
+        let loc = self.loc(caret);
+        if let Some(node) = self.nodes.get_mut(loc.node) {
+            if let NodeKind::Image {
+                alt: a, src: s, ..
+            } = &mut node.kind
+            {
+                *a = alt;
+                *s = src;
+            }
+        }
+        self.caret_after(loc.node, None, None, 0)
+    }
+
+    /// Rewrite the `src` attribute of an HTML `<video>` block under `caret`.
+    pub fn update_html_video_src(&mut self, caret: usize, src: String) -> Option<usize> {
+        let loc = self.loc(caret);
+        let node = self.nodes.get_mut(loc.node)?;
+        if let NodeKind::Html { raw } = &mut node.kind {
+            *raw = replace_video_src(raw, &src)?;
+            return Some(self.caret_after(loc.node, None, None, 0));
+        }
+        None
+    }
+
     pub fn enter(&mut self, caret: usize, hard: bool) -> usize {
         let loc = self.loc(caret);
         match &self.nodes[loc.node].kind {
@@ -3389,6 +3415,36 @@ mod tests {
             at = d.insert_text(at, None, ch, Marks::default());
         }
         assert_eq!(d.project().display, "a\nb\ncarlo");
+    }
+}
+
+/// Splice a new `src` attribute value into an HTML `<video>` tag.
+/// Returns None when no `src=` attribute is found.
+fn replace_video_src(raw: &str, src: &str) -> Option<String> {    let lower = raw.to_ascii_lowercase();
+    let tag = lower.find("<video")?;
+    let rest_start = tag;
+    let rest_lower = &lower[rest_start..];
+    let src_ix = rest_lower.find("src")?;
+    let abs_ix = rest_start + src_ix + 3;
+    let after = raw[abs_ix..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.as_bytes().first()?;
+    let base = abs_ix + (raw[abs_ix..].len() - after.len());
+    if *quote == b'"' || *quote == b'\'' {
+        let q = *quote as char;
+        let end_rel = after[1..].find(q)?;
+        let start = base + 1;
+        let end = base + 1 + end_rel;
+        let mut out = raw.to_string();
+        out.replace_range(start..end, src);
+        Some(out)
+    } else {
+        let end_rel = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        let mut out = raw.to_string();
+        out.replace_range(base..base + end_rel, src);
+        Some(out)
     }
 }
 

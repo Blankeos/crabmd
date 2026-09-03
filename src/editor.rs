@@ -17,7 +17,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
-    radio::Radio,
+    scroll::ScrollableElement as _,
     switch::Switch,
     v_flex, Icon, Sizable as _, Theme, ThemeMode, ThemeTokens,
 };
@@ -38,7 +38,7 @@ use crate::motion::{
     push_count, search_next, search_prev, take_count, visual_line_range, whichwrap, word_range_at,
     FindKind, Motion,
 };
-use crate::palette::{PaletteAction, PaletteMode, PaletteState};
+use crate::palette::{LineField, PaletteAction, PaletteMode, PaletteState};
 use crate::slash::{self, SlashItem};
 use crate::surface::{self, Hit};
 use crate::syntax;
@@ -97,6 +97,7 @@ actions!(
         BlockBackspace,
         ToggleSettings,
         OpenPalette,
+        KeyChord,
         OpenCommand,
         OpenSearch,
         SearchBack,
@@ -223,8 +224,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("ctrl-e", ToggleCode, Some("Workspace")),
         KeyBinding::new("cmd-shift-s", ToggleStrike, Some("Workspace")),
-        KeyBinding::new("cmd-k", OpenPalette, Some("Workspace")),
-        KeyBinding::new("ctrl-k", OpenPalette, Some("Workspace")),
+        KeyBinding::new("cmd-shift-p", OpenPalette, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-p", OpenPalette, Some("Workspace")),
+        KeyBinding::new("cmd-k", KeyChord, Some("Workspace")),
+        KeyBinding::new("ctrl-k", KeyChord, Some("Workspace")),
         KeyBinding::new("cmd-shift-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("ctrl-shift-k", ToggleLink, Some("Workspace")),
         KeyBinding::new("cmd-x", CutSelection, Some("Workspace")),
@@ -367,7 +370,10 @@ impl FontInputs {
             subs.push(cx.subscribe(size, move |this, input, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     let raw = input.read(cx).value().to_string();
-                    if let Ok(n) = raw.trim().parse::<u32>() {
+                    // Numeric-only: ignore (never apply) anything without digits.
+                    let digits: String =
+                        raw.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = digits.parse::<u32>() {
                         this.apply_font_size(slot, n, cx);
                     }
                 }
@@ -401,9 +407,35 @@ impl FontInputs {
     }
 }
 
+/// 1-based `(line, col)` in GFM source -> byte offset. Columns count
+/// characters and clamp to the line end.
+fn source_offset_for_line_col(source: &str, line: usize, col: usize) -> usize {
+    let line = line.max(1);
+    let col = col.max(1);
+    let mut offset = 0;
+    let mut cur = 1;
+    for raw in source.split_inclusive('\n') {
+        if cur == line {
+            let line_body = raw.strip_suffix('\n').unwrap_or(raw);
+            let mut ix = 0;
+            let mut c = 1;
+            for ch in line_body.chars() {
+                if c >= col {
+                    break;
+                }
+                ix += ch.len_utf8();
+                c += 1;
+            }
+            return offset + ix;
+        }
+        offset += raw.len();
+        cur += 1;
+    }
+    source.len()
+}
+
 pub struct Workspace {
-    path: PathBuf,
-    doc: crate::tree::Doc,
+    path: PathBuf,    doc: crate::tree::Doc,
     source: String,
     caret: usize,
     sel: Option<Range<usize>>,
@@ -420,8 +452,8 @@ pub struct Workspace {
     /// Source as last saved/opened. Undo back to this clears the dirty dot.
     clean_source: String,
     status: SharedString,
-    command: Option<String>,
-    search: Option<(String, bool)>,
+    command: Option<LineField>,
+    search: Option<(LineField, bool)>,
     last_search: Option<(String, bool)>,
     cmd_palette: Option<PaletteState>,
     view_source: bool,
@@ -429,7 +461,8 @@ pub struct Workspace {
     marked: Option<Range<usize>>,
     sticky: crate::display::Marks,
     link_open: bool,
-    link_draft: String,
+    link_draft: LineField,
+    palette_scroll: ScrollHandle,
     hits: Vec<Hit>,
     pending_replace: Option<usize>,
     pending_find: Option<(FindKind, usize)>,
@@ -462,6 +495,15 @@ pub struct Workspace {
     block_menu: Option<usize>,
     loading: bool,
     fonts: FontInputs,
+    /// Read-only display of the current theme (picked via the palette).
+    theme_input: Entity<InputState>,
+    /// Selected image/video block (display offset) with its edit toolbar.
+    media_sel: Option<usize>,
+    media_alt: Entity<InputState>,
+    media_src: Entity<InputState>,
+    /// Zed-style `cmd-k` chord: set by KeyChord, consumed by the next key
+    /// (`t` opens the Themes picker, esc cancels).
+    pending_chord: bool,
 }
 
 impl Workspace {
@@ -470,6 +512,7 @@ impl Workspace {
         source: String,
         palette: Palette,
         config: Config,
+        initial: Option<(usize, usize)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -477,6 +520,13 @@ impl Workspace {
 
         let empty_doc = source.trim().is_empty();
         let fonts = FontInputs::new(&config, window, cx);
+        let theme_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(config.theme.clone())
+        });
+        let media_alt =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Alt text".to_string()));
+        let media_src =
+            cx.new(|cx| InputState::new(window, cx).placeholder("image.png".to_string()));
         let doc = crate::tree::Doc::from_gfm(&source);
         // Normalize once: `source` after any edit is `doc.to_gfm()`, so the
         // clean baseline must be in the same form or typing-then-deleting the
@@ -509,7 +559,8 @@ impl Workspace {
             marked: None,
             sticky: crate::display::Marks::default(),
             link_open: false,
-            link_draft: String::new(),
+            link_draft: LineField::new(),
+            palette_scroll: ScrollHandle::new(),
             hits: Vec::new(),
             pending_replace: None,
             pending_find: None,
@@ -536,10 +587,28 @@ impl Workspace {
             block_menu: None,
             loading: false,
             fonts,
+            theme_input,
+            media_sel: None,
+            media_alt,
+            media_src,
+            pending_chord: false,
         };
 
-        if empty_doc || !this.config.editor.is_modal() {
-            this.enter_insert(Caret::End, window, cx);
+        if let Some((line, col)) = initial {
+            // Zed-style `file:line:col`: source offsets map to the nearest
+            // visible position (hidden markup like `> ` has no caret home).
+            let src = source_offset_for_line_col(&this.source, line, col);
+            let d = this.proj().to_display(src);
+            this.caret = d.min(this.proj().display.len());
+            if !this.config.editor.is_modal() {
+                this.enter_insert(Caret::Offset(this.caret), window, cx);
+            } else {
+                this.mode = Mode::Normal;
+                this.refresh(window, cx);
+            }
+        } else if empty_doc || !this.config.editor.is_modal() {
+            // Always open at the very top (caret 0), never the bottom.
+            this.enter_insert(Caret::Start, window, cx);
         } else {
             this.mode = Mode::Normal;
             this.refresh_raw(window, cx);
@@ -556,10 +625,11 @@ impl Workspace {
         source: String,
         palette: Palette,
         config: Config,
+        initial: Option<(usize, usize)>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::new(path, source, palette, config, window, cx))
+        cx.new(|cx| Self::new(path, source, palette, config, initial, window, cx))
     }
 
     fn key_context(&self) -> &'static str {
@@ -1002,8 +1072,30 @@ impl Workspace {
                 }
             }
         }
-        if click_count >= 2 && !shift {
-            let p = self.proj();
+        // Images / videos: single click selects the block and opens the
+        // alt + path toolbar. Clicking anywhere else dismisses it.
+        if click_count == 1 && !shift && !cmd {
+            let hit = {
+                let p = self.proj();
+                p.block_at_display(d).map(|b| {
+                    let media = matches!(&b.extra, BlockExtra::Image { .. })
+                        || matches!(&b.extra, BlockExtra::Html)
+                            && self
+                                .source
+                                .get(b.source.clone())
+                                .is_some_and(|raw| images::parse_video_src(raw).is_some());
+                    (b.display.start, media)
+                })
+            };
+            if let Some((start, true)) = hit {
+                self.select_media(start, window, cx);
+                return;
+            }
+            if self.media_sel.is_some() {
+                self.media_sel = None;
+            }
+        }
+        if click_count >= 2 && !shift {            let p = self.proj();
             let d = d.min(p.display.len());
             let (range, gran) = if click_count >= 3 {
                 (
@@ -1608,6 +1700,12 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if self.pending_chord {
+            self.pending_chord = false;
+            self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+            cx.notify();
+            return;
+        }
         if self.slash_is_open() {
             self.close_slash(window, cx);
             return;
@@ -2017,6 +2115,11 @@ impl Workspace {
     }
 
     fn on_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            // A focused panel input owns undo; never touch the doc behind it.
+            cx.propagate();
+            return;
+        }
         window.prevent_default();
         self.finish_insert_undo();
         let current = self.snapshot();
@@ -2025,6 +2128,10 @@ impl Workspace {
         }
     }
     fn on_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         window.prevent_default();
         let current = self.snapshot();
         if let Some(next) = self.undo.redo(current) {
@@ -2111,6 +2218,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            // Focused panel input handles its own keys; never edit the
+            // markdown behind the panel.
+            cx.propagate();
+            return;
+        }
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
@@ -2178,6 +2291,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
@@ -2256,6 +2373,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
@@ -2293,7 +2414,7 @@ impl Workspace {
         window.prevent_default();
         self.clear_pending();
         self.command = None;
-        self.search = Some((String::new(), backward));
+        self.search = Some((LineField::new(), backward));
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2303,11 +2424,11 @@ impl Workspace {
         cx.notify();
     }
     fn submit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((query, backward)) = self.search.take() else {
+        let Some((field, backward)) = self.search.take() else {
             return;
         };
         self.focus.focus(window, cx);
-        let q = if query.is_empty() {
+        let q = if field.is_empty() {
             match &self.last_search {
                 Some((prev, _)) => prev.clone(),
                 None => {
@@ -2316,7 +2437,7 @@ impl Workspace {
                 }
             }
         } else {
-            query
+            field.as_str().to_string()
         };
         self.last_search = Some((q.clone(), backward));
         self.jump_search(!backward, true, window, cx);
@@ -2582,6 +2703,39 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Reset one font slot (family + size) back to its default.
+    fn reset_font_slot(&mut self, slot: FontSlot, window: &mut Window, cx: &mut Context<Self>) {
+        let def = match slot {
+            FontSlot::Ui => config::default_ui_font(),
+            FontSlot::Markdown => config::default_markdown_font(),
+            FontSlot::Buffer => config::default_buffer_font(),
+        };
+        let (family, size) = match slot {
+            FontSlot::Ui => {
+                self.config.ui_font = def.clone();
+                (&self.fonts.ui_family, &self.fonts.ui_size)
+            }
+            FontSlot::Markdown => {
+                self.config.markdown_font = def.clone();
+                (&self.fonts.markdown_family, &self.fonts.markdown_size)
+            }
+            FontSlot::Buffer => {
+                self.config.buffer_font = def.clone();
+                (&self.fonts.buffer_family, &self.fonts.buffer_size)
+            }
+        };
+        let fam = def.family.clone();
+        family.update(cx, |s, cx| {
+            s.set_value(fam, window, cx);
+        });
+        let sz = def.size.to_string();
+        size.update(cx, |s, cx| {
+            s.set_value(sz, window, cx);
+        });
+        self.persist_config(cx);
+        cx.notify();
+    }
+
     fn apply_font_family(&mut self, slot: FontSlot, family: String, cx: &mut Context<Self>) {
         let family = family.trim().to_string();
         if family.is_empty() {
@@ -2626,6 +2780,29 @@ impl Workspace {
     fn on_open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_palette(window, cx);
     }
+    /// `cmd-k` chord starter (zed-style): the next key decides — `t` opens
+    /// the Themes picker straight away, esc cancels, anything else behaves
+    /// normally. `cmd-shift-p` remains the full command palette.
+    fn on_key_chord(&mut self, _: &KeyChord, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cmd_palette.is_some()
+            || self.command.is_some()
+            || self.search.is_some()
+            || self.link_open
+            || self.view_source
+            || self.settings_open
+        {
+            cx.propagate();
+            return;
+        }
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        self.pending_chord = true;
+        self.status = "cmd-k … (t themes)".into();
+        cx.notify();
+    }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
@@ -2637,6 +2814,11 @@ impl Workspace {
         cx.notify();
     }
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Root, window, cx);
+    }
+    /// Open the palette, optionally straight into a submenu (settings theme
+    /// picker opens Themes directly).
+    fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.cmd_palette.is_some() {
             self.close_palette(window, cx);
             return;
@@ -2655,7 +2837,7 @@ impl Workspace {
         self.search = None;
         self.link_open = false;
         self.settings_open = false;
-        self.cmd_palette = Some(PaletteState::open());
+        self.cmd_palette = Some(PaletteState::open_in(mode));
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2706,7 +2888,7 @@ impl Workspace {
             PaletteAction::ToggleSource => {
                 self.view_source = !self.view_source;
                 if self.view_source {
-                    self.status = "source view — esc/cmd-k to exit".into();
+                    self.status = "source view — esc/cmd-shift-p to exit".into();
                 } else {
                     self.status = if self.dirty { "unsaved" } else { "ready" }.into();
                 }
@@ -2733,7 +2915,9 @@ impl Workspace {
         self.config.editor = editor;
         self.persist_config(cx);
         if editor == EditorKind::Notion {
-            self.enter_insert(Caret::End, window, cx);
+            // Keep the current position instead of jumping to the end.
+            let at = self.caret;
+            self.enter_insert(Caret::Offset(at), window, cx);
         } else if was_notion {
             self.leave_insert(window, cx);
         }
@@ -2743,6 +2927,41 @@ impl Workspace {
         self.config.wrap_motions = wrap;
         self.persist_config(cx);
         cx.notify();
+    }
+    fn set_full_width(&mut self, full: bool, cx: &mut Context<Self>) {
+        self.config.full_width = full;
+        self.persist_config(cx);
+        self.status = if full { "full width".into() } else { "column width".into() };
+        cx.notify();
+    }
+    /// Live theme preview while hovering / moving through the Themes list.
+    /// Applies immediately (and persists, like the settings picker).
+    fn preview_palette_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.palette.name.clone();
+        let action = self
+            .cmd_palette
+            .as_ref()
+            .filter(|s| s.mode == PaletteMode::Themes)
+            .and_then(|s| s.items(self.view_source).get(s.index).copied())
+            .map(|item| item.action);
+        if let Some(PaletteAction::SetTheme(name)) = action {
+            if !current.eq_ignore_ascii_case(name) {
+                self.set_theme(name, window, cx);
+            }
+        }
+    }
+    /// Keep the keyboard-selected palette row in view (up/down + filtering).
+    /// Hover doesn't scroll — the mouse user owns the wheel.
+    fn scroll_palette_to_selected(&self) {
+        let Some(state) = self.cmd_palette.as_ref() else {
+            return;
+        };
+        let n = state.items(self.view_source).len();
+        if n == 0 {
+            return;
+        }
+        self.palette_scroll
+            .scroll_to_item(state.index.min(n.saturating_sub(1)));
     }
     fn on_save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         if self.write_to_disk(cx) {
@@ -2772,7 +2991,7 @@ impl Workspace {
         }
         window.prevent_default();
         self.clear_pending();
-        self.command = Some(String::new());
+        self.command = Some(LineField::new());
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2786,7 +3005,7 @@ impl Workspace {
             return;
         };
         self.focus.focus(window, cx);
-        match mode::parse_ex(&input) {
+        match mode::parse_ex(input.as_str()) {
             ExCommand::Cancel => {}
             ExCommand::Write => {
                 if self.write_to_disk(cx) {
@@ -2815,6 +3034,10 @@ impl Workspace {
                 apply_palette(&palette, cx);
                 self.palette = palette;
                 self.config.theme = name.to_string();
+                let label = name.to_string();
+                self.theme_input.update(cx, |s, cx| {
+                    s.set_value(label, window, cx);
+                });
                 self.persist_config(cx);
                 window.refresh();
                 cx.notify();
@@ -2866,6 +3089,67 @@ impl Workspace {
         self.commit_caret(caret, window, cx);
     }
 
+    /// Clicking an image/video selects it and loads the toolbar inputs.
+    fn select_media(&mut self, display_start: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let found = {
+            let p = self.proj();
+            p.block_at_display(display_start).map(|b| match &b.extra {
+                BlockExtra::Image { alt, src } => Some((alt.clone(), src.clone())),
+                BlockExtra::Html => self
+                    .source
+                    .get(b.source.clone())
+                    .and_then(images::parse_video_src)
+                    .map(|src| (String::new(), src)),
+                _ => None,
+            })
+        };
+        let Some(Some((alt, src))) = found else {
+            return;
+        };
+        self.media_sel = Some(display_start);
+        self.caret = display_start;
+        self.sel = None;
+        self.mouse_dragging = false;
+        self.clamp_caret();
+        self.follow_caret = false;
+        self.media_alt.update(cx, |st, cx| {
+            st.set_value(alt, window, cx);
+        });
+        self.media_src.update(cx, |st, cx| {
+            st.set_value(src, window, cx);
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Apply the toolbar's alt + path to the selected image/video.
+    fn apply_media_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(at) = self.media_sel else {
+            return;
+        };
+        let alt = self.media_alt.read(cx).value().to_string();
+        let src = self.media_src.read(cx).value().trim().to_string();
+        if src.is_empty() {
+            return;
+        }
+        let is_html = self
+            .proj()
+            .block_at_display(at)
+            .is_some_and(|b| matches!(&b.extra, BlockExtra::Html));
+        self.push_doc_undo();
+        if is_html {
+            if let Some(caret) = self.doc.update_html_video_src(at, src) {
+                self.sync_gfm();
+                self.commit_caret(caret, window, cx);
+            }
+        } else {
+            let caret = self.doc.update_image(at, alt, src);
+            self.sync_gfm();
+            self.commit_caret(caret, window, cx);
+        }
+        self.media_sel = None;
+    }
+
     fn try_paste_image(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(clip) = cx.read_from_clipboard() else {
             return false;
@@ -2893,7 +3177,7 @@ impl Workspace {
 
     fn import_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         for path in paths {
-            if !images::is_image_path(path) {
+            if !images::is_media_path(path) {
                 continue;
             }
             match images::place_dropped(&self.path, path) {
@@ -2907,55 +3191,53 @@ impl Workspace {
     }
 }
 
-/// Shared single-line editing for the hand-rolled inputs (palette query,
-/// command bar, search bar, link draft). All are append-at-end buffers with an
-/// implicit end caret.
-/// - backspace: delete one char (false on empty so callers can fall through,
-///   e.g. palette backs out of submenus)
-/// - opt-backspace: delete the previous word
-/// - cmd-backspace: clear the line
-/// - left/right/home/end: consumed no-ops (nowhere to move); up/down are left
-///   to callers (palette selection).
-/// Returns true when the key was consumed.
-fn line_edit_key(buf: &mut String, key: &str, mods: gpui::Modifiers) -> bool {
-    match key {
-        "backspace" => {
-            if mods.platform && !mods.alt && !mods.control {
-                if buf.is_empty() {
-                    return false;
-                }
-                buf.clear();
-                true
-            } else if mods.alt && !mods.platform && !mods.control {
-                if buf.is_empty() {
-                    return false;
-                }
-                while buf.ends_with(' ') {
-                    buf.pop();
-                }
-                while let Some(c) = buf.chars().next_back() {
-                    if c == ' ' {
-                        break;
-                    }
-                    buf.pop();
-                }
-                true
-            } else if !mods.platform && !mods.control && !mods.alt {
-                if buf.is_empty() {
-                    return false;
-                }
-                buf.pop();
-                true
-            } else {
-                false
-            }
-        }
-        "left" | "right" | "home" | "end" => true,
-        _ => false,
-    }
-}
-
 impl Workspace {
+    /// True when a panel/input owns the keyboard: settings is open, or a
+    /// media-toolbar input is focused. Doc-mutating actions must propagate
+    /// so the focused input handles its own keys.
+    fn overlay_input_focused(&self, window: &mut Window, cx: &App) -> bool {
+        if self.settings_open {
+            return true;
+        }
+        [&self.media_alt, &self.media_src].iter().any(|e| {
+            e.read(cx).focus_handle(cx).is_focused(window)
+        })
+    }
+
+    /// Eat non-digit keystrokes when a font-size input is focused (settings).
+    /// Family inputs still take any text; sizes are numeric-only.
+    fn eat_non_digit_in_size(
+        &self,
+        key: &str,
+        mods: gpui::Modifiers,
+        window: &mut Window,
+        cx: &App,
+    ) -> bool {
+        if mods.platform || mods.control || mods.alt || mods.shift {
+            return false;
+        }
+        if key.chars().count() != 1 {
+            return false;
+        }
+        let ch = key.chars().next().unwrap_or('\0');
+        if ch.is_control() || ch.is_ascii_digit() {
+            return false;
+        }
+        let size_focused = [
+            &self.fonts.ui_size,
+            &self.fonts.markdown_size,
+            &self.fonts.buffer_size,
+        ]
+        .iter()
+        .any(|e| e.read(cx).focus_handle(cx).is_focused(window));
+        if size_focused {
+            window.prevent_default();
+            true
+        } else {
+            false
+        }
+    }
+
     fn handle_capture_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -2964,6 +3246,54 @@ impl Workspace {
     ) -> bool {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
+
+        // Zed-style `cmd-k` chord starter at capture level (not just the
+        // action binding): `cmd-k` then `t` opens Themes. Capture runs
+        // before key-context dispatch, so the chord works in every mode.
+        if (key == "k" || key == "K")
+            && (mods.platform || mods.control)
+            && !mods.shift
+            && !mods.alt
+            && !self.pending_chord
+            && self.cmd_palette.is_none()
+            && self.command.is_none()
+            && self.search.is_none()
+            && !self.link_open
+            && !self.view_source
+            && !self.settings_open
+            && !self.overlay_input_focused(window, cx)
+        {
+            window.prevent_default();
+            self.pending_chord = true;
+            self.status = "cmd-k … (t themes)".into();
+            cx.notify();
+            return true;
+        }
+
+        // Zed-style `cmd-k` chord: `t` opens Themes, esc cancels (handled
+        // by LeaveInsert), anything else falls through to normal handling.
+        if self.pending_chord {
+            self.pending_chord = false;
+            let clean = self.command.is_none()
+                && self.search.is_none()
+                && self.cmd_palette.is_none()
+                && !self.link_open
+                && !self.view_source
+                && !self.settings_open;
+            if clean
+                && key == "t"
+                && !mods.control
+                && !mods.platform
+                && !mods.alt
+                && !mods.shift
+            {
+                window.prevent_default();
+                self.open_palette(PaletteMode::Themes, window, cx);
+                return true;
+            }
+            self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+            // Fall through: process this key normally.
+        }
 
         // Let cmd/ctrl-c/x/v reach Copy/Cut/Paste actions (including overlays).
         if matches!(key, "c" | "x" | "v")
@@ -2974,17 +3304,39 @@ impl Workspace {
             return false;
         }
 
+        // Settings font sizes are numeric-only at the key level.
+        if self.settings_open
+            && self.command.is_none()
+            && self.search.is_none()
+            && self.cmd_palette.is_none()
+            && !self.link_open
+            && self.eat_non_digit_in_size(key, mods, window, cx)
+        {
+            return true;
+        }
+
         if self.cmd_palette.is_some() {
             window.prevent_default();
-            if (key == "k") && (mods.platform || mods.control) && !mods.alt {
+            if (key == "p")
+                && (mods.platform || mods.control)
+                && mods.shift
+                && !mods.alt
+            {
                 self.close_palette(window, cx);
                 return true;
             }
-            // Shared single-line editing (opt/cmd-backspace, arrows) first.
+            // Caret-aware single-line editing (opt/cmd-backspace, opt/cmd-arrows).
             if let Some(state) = self.cmd_palette.as_mut() {
-                if line_edit_key(&mut state.query, key, mods) {
-                    state.index = 0;
+                let edited = state.query.delete_key(key, mods);
+                let moved = !edited && state.query.caret_key(key, mods);
+                if edited || moved {
+                    if edited {
+                        state.index = 0;
+                    }
                     cx.notify();
+                    if edited {
+                        self.scroll_palette_to_selected();
+                    }
                     return true;
                 }
             }
@@ -3017,12 +3369,16 @@ impl Workspace {
                     if let Some(state) = self.cmd_palette.as_mut() {
                         state.move_by(-1, len);
                     }
+                    self.preview_palette_theme(window, cx);
+                    self.scroll_palette_to_selected();
                     cx.notify();
                 }
                 "down" => {
                     if let Some(state) = self.cmd_palette.as_mut() {
                         state.move_by(1, len);
                     }
+                    self.preview_palette_theme(window, cx);
+                    self.scroll_palette_to_selected();
                     cx.notify();
                 }
                 "backspace" => {
@@ -3038,18 +3394,20 @@ impl Workspace {
                 }
                 "space" => {
                     if let Some(state) = self.cmd_palette.as_mut() {
-                        state.query.push(' ');
+                        state.query.insert_char(' ');
                         state.index = 0;
                     }
+                    self.scroll_palette_to_selected();
                     cx.notify();
                 }
                 k if k.chars().count() == 1 => {
                     if let Some(ch) = k.chars().next() {
                         if !ch.is_control() {
                             if let Some(state) = self.cmd_palette.as_mut() {
-                                state.query.push(ch);
+                                state.query.insert_char(ch);
                                 state.index = 0;
                             }
+                            self.scroll_palette_to_selected();
                             cx.notify();
                         }
                     }
@@ -3061,7 +3419,7 @@ impl Workspace {
 
         if self.link_open {
             window.prevent_default();
-            if line_edit_key(&mut self.link_draft, key, mods) {
+            if self.link_draft.delete_key(key, mods) || self.link_draft.caret_key(key, mods) {
                 cx.notify();
                 return true;
             }
@@ -3073,17 +3431,17 @@ impl Workspace {
                 }
                 "enter" => self.commit_link(window, cx),
                 "backspace" => {
-                    self.link_draft.pop();
+                    self.link_draft.backspace();
                     cx.notify();
                 }
                 "space" => {
-                    self.link_draft.push(' ');
+                    self.link_draft.insert_char(' ');
                     cx.notify();
                 }
                 k if k.chars().count() == 1 && !mods.control && !mods.platform => {
                     if let Some(ch) = k.chars().next() {
                         if !ch.is_control() {
-                            self.link_draft.push(ch);
+                            self.link_draft.insert_char(ch);
                             cx.notify();
                         }
                     }
@@ -3164,7 +3522,7 @@ impl Workspace {
         if self.command.is_some() {
             window.prevent_default();
             if let Some(buf) = self.command.as_mut() {
-                if line_edit_key(buf, key, mods) {
+                if buf.delete_key(key, mods) || buf.caret_key(key, mods) {
                     cx.notify();
                     return true;
                 }
@@ -3177,13 +3535,13 @@ impl Workspace {
                 "enter" => self.submit_command(window, cx),
                 "backspace" => {
                     if let Some(buf) = self.command.as_mut() {
-                        buf.pop();
+                        buf.backspace();
                     }
                     cx.notify();
                 }
                 "space" => {
                     if let Some(buf) = self.command.as_mut() {
-                        buf.push(' ');
+                        buf.insert_char(' ');
                     }
                     cx.notify();
                 }
@@ -3191,7 +3549,7 @@ impl Workspace {
                     if let Some(ch) = k.chars().next() {
                         if !ch.is_control() {
                             if let Some(buf) = self.command.as_mut() {
-                                buf.push(ch);
+                                buf.insert_char(ch);
                             }
                             cx.notify();
                         }
@@ -3205,7 +3563,7 @@ impl Workspace {
         if self.search.is_some() {
             window.prevent_default();
             if let Some((buf, _)) = self.search.as_mut() {
-                if line_edit_key(buf, key, mods) {
+                if buf.delete_key(key, mods) || buf.caret_key(key, mods) {
                     cx.notify();
                     return true;
                 }
@@ -3218,13 +3576,13 @@ impl Workspace {
                 "enter" => self.submit_search(window, cx),
                 "backspace" => {
                     if let Some((buf, _)) = self.search.as_mut() {
-                        buf.pop();
+                        buf.backspace();
                     }
                     cx.notify();
                 }
                 "space" => {
                     if let Some((buf, _)) = self.search.as_mut() {
-                        buf.push(' ');
+                        buf.insert_char(' ');
                     }
                     cx.notify();
                 }
@@ -3232,7 +3590,7 @@ impl Workspace {
                     if let Some(ch) = k.chars().next() {
                         if !ch.is_control() {
                             if let Some((buf, _)) = self.search.as_mut() {
-                                buf.push(ch);
+                                buf.insert_char(ch);
                             }
                             cx.notify();
                         }
@@ -3466,8 +3824,8 @@ impl Workspace {
         let p = self.palette.clone();
         let pane = self.settings_pane;
         let editor = self.config.editor;
-        let theme_name = self.palette.name.clone();
         let wrap = self.config.wrap_motions;
+        let full_width = self.config.full_width;
 
         let nav_row = |label: &'static str, which: SettingsPane, cx: &mut Context<Self>| {
             let active = pane == which;
@@ -3504,6 +3862,63 @@ impl Workspace {
         let content = match pane {
             SettingsPane::Editor => {
                 let entity = cx.entity();
+                let entity2 = entity.clone();
+                let card = |icon: &'static str,
+                            label: &'static str,
+                            desc: &'static str,
+                            kind: EditorKind,
+                            cx: &mut Context<Self>| {
+                    let selected = editor == kind;
+                    h_flex()
+                        .id(("editor-card", kind as usize))
+                        .w_full()
+                        .p_3()
+                        .gap_3()
+                        .items_center()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(if selected { p.primary } else { p.border })
+                        .when(selected, |el| el.bg(p.background_element.opacity(0.5)))
+                        .hover(|el| el.bg(p.background_element.opacity(0.7)))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.set_editor(kind, window, cx);
+                            }),
+                        )
+                        .child(icon_el(
+                            icon,
+                            if selected { p.primary } else { p.text_muted },
+                        ))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(if selected {
+                                            p.primary
+                                        } else {
+                                            p.markdown_text
+                                        })
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(p.text_muted)
+                                        .child(desc),
+                                ),
+                        )
+                        .when(selected, |el| {
+                            el.child(icon_el("check", p.primary))
+                        })
+                };
                 v_flex()
                     .w_full()
                     .gap_3()
@@ -3522,57 +3937,27 @@ impl Workspace {
                     .child(
                         v_flex()
                             .gap_2()
-                            .child(
-                                Radio::new("editor-helix")
-                                    .label("Helix")
-                                    .checked(editor == EditorKind::Helix)
-                                    .on_click(cx.listener(|this, checked, window, cx| {
-                                        if *checked {
-                                            this.set_editor(EditorKind::Helix, window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .pl_6()
-                                    .text_xs()
-                                    .text_color(p.text_muted)
-                                    .child("x select line · d delete · v select · u undo · U redo"),
-                            )
-                            .child(
-                                Radio::new("editor-vim")
-                                    .label("Vim")
-                                    .checked(editor == EditorKind::Vim)
-                                    .on_click(cx.listener(|this, checked, window, cx| {
-                                        if *checked {
-                                            this.set_editor(EditorKind::Vim, window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .pl_6()
-                                    .text_xs()
-                                    .text_color(p.text_muted)
-                                    .child("x delete char · dd line · v/V visual · u undo · ctrl-r redo"),
-                            )
-                            .child(
-                                Radio::new("editor-notion")
-                                    .label("Notion")
-                                    .checked(editor == EditorKind::Notion)
-                                    .on_click(cx.listener(|this, checked, window, cx| {
-                                        if *checked {
-                                            this.set_editor(EditorKind::Notion, window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .pl_6()
-                                    .text_xs()
-                                    .text_color(p.text_muted)
-                                    .child("Rendered blocks; edit visible text. j/k move between blocks."),
-                            ),
+                            .child(card(
+                                "zap",
+                                "Helix",
+                                "x select line · d delete · v select · u undo · U redo",
+                                EditorKind::Helix,
+                                cx,
+                            ))
+                            .child(card(
+                                "command",
+                                "Vim",
+                                "x delete char · dd line · v/V visual · u undo · ctrl-r redo",
+                                EditorKind::Vim,
+                                cx,
+                            ))
+                            .child(card(
+                                "type",
+                                "Notion",
+                                "Rendered blocks; edit visible text. j/k move between blocks.",
+                                EditorKind::Notion,
+                                cx,
+                            )),
                     )
                     .child(
                         Switch::new("wrap-motions")
@@ -3590,46 +3975,81 @@ impl Workspace {
                             .text_color(p.text_muted)
                             .child("When on, j/k count wrapped visual lines and the surface wraps. Off: logical lines."),
                     )
-                    .into_any_element()
-            }
-            SettingsPane::Theme => {
-                let names = theme::list_theme_names();
-                v_flex()
-                    .w_full()
-                    .gap_3()
                     .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Theme"),
+                        Switch::new("full-width")
+                            .label("Full width")
+                            .checked(full_width)
+                            .on_click(move |checked, _, cx| {
+                                entity2.update(cx, |this, cx| {
+                                    this.set_full_width(*checked, cx);
+                                });
+                            }),
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(p.text_muted)
-                            .child("OpenCode JSON themes. Applied immediately."),
+                            .child("When on, markdown fills the window. Off: centered column."),
                     )
-                    .child(v_flex().gap_1().children(names.into_iter().enumerate().map(
-                        |(i, name)| {
-                            let selected = theme_name.eq_ignore_ascii_case(name);
-                            Radio::new(("theme-opt", i))
-                                .label(name.to_string())
-                                .checked(selected)
-                                .on_click(cx.listener(move |this, checked, window, cx| {
-                                    if *checked {
-                                        this.set_theme(name, window, cx);
-                                    }
-                                }))
-                        },
-                    )))
                     .into_any_element()
             }
+            SettingsPane::Theme => v_flex()
+                .w_full()
+                .gap_3()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Theme"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(p.text_muted)
+                        .child("Pick in the command palette — type to filter, preview as you move."),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.theme_input)
+                                    .cleanable(false)
+                                    .readonly(true),
+                            ),
+                        )
+                        .child(
+                            Button::new("theme-browse")
+                                .xsmall()
+                                .label("Choose…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.settings_open = false;
+                                    this.cmd_palette =
+                                        Some(PaletteState::open_in(PaletteMode::Themes));
+                                    this.focus.focus(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(p.text_muted)
+                        .child("Shortcut: cmd-k then t."),
+                )
+                .into_any_element(),
             SettingsPane::Font => {
                 let row = |label: &'static str,
                            family: &Entity<InputState>,
                            size: &Entity<InputState>,
                            hint: &'static str,
-                           p: &crate::theme::Palette| {
+                           slot: FontSlot,
+                           customized: bool,
+                           p: &crate::theme::Palette,
+                           cx: &mut Context<Self>| {
                     v_flex()
                         .w_full()
                         .min_w_0()
@@ -3651,12 +4071,46 @@ impl Workspace {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .child(Input::new(family).cleanable(true)),
+                                        .relative()
+                                        // cleanable off: the slot-reset icon
+                                        // owns the input's right corner.
+                                        .child(Input::new(family).cleanable(false))
+                                        // Per-field reset on the family input
+                                        // too (same slot reset, tiny icon).
+                                        .when(customized, |el| {
+                                            el.child(reset_btn(
+                                                ("font-reset-fam", slot as usize),
+                                                slot,
+                                                p,
+                                                cx,
+                                            ))
+                                        }),
                                 )
-                                .child(div().w(px(72.)).child(Input::new(size).cleanable(false))),
+                                .child(
+                                    div()
+                                        .w(px(84.))
+                                        .relative()
+                                        .child(Input::new(size).cleanable(false))
+                                        // Per-field reset: tiny circular arrow
+                                        // inside the size input when customized.
+                                        .when(customized, |el| {
+                                            el.child(reset_btn(
+                                                ("font-reset", slot as usize),
+                                                slot,
+                                                p,
+                                                cx,
+                                            ))
+                                        }),
+                                ),
                         )
                 };
                 let p = &self.palette;
+                let ui_custom =
+                    self.config.ui_font != config::default_ui_font();
+                let md_custom =
+                    self.config.markdown_font != config::default_markdown_font();
+                let buf_custom =
+                    self.config.buffer_font != config::default_buffer_font();
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -3671,33 +4125,43 @@ impl Workspace {
                         div()
                             .text_sm()
                             .text_color(p.text_muted)
-                            .child("UI · Markdown · Buffer (code). Family + size (px)."),
+                            .child("UI · Markdown · Buffer (code). Family + size in px (digits only)."),
                     )
                     .child(row(
                         "UI",
                         &self.fonts.ui_family,
                         &self.fonts.ui_size,
                         "Titlebar, footer, settings",
+                        FontSlot::Ui,
+                        ui_custom,
                         p,
+                        cx,
                     ))
                     .child(row(
                         "Markdown",
                         &self.fonts.markdown_family,
                         &self.fonts.markdown_size,
                         "Paragraphs, headings, lists, quotes",
+                        FontSlot::Markdown,
+                        md_custom,
                         p,
+                        cx,
                     ))
                     .child(row(
                         "Buffer",
                         &self.fonts.buffer_family,
                         &self.fonts.buffer_size,
                         "Fenced code blocks",
+                        FontSlot::Buffer,
+                        buf_custom,
                         p,
+                        cx,
                     ))
                     .child(
                         Button::new("fonts-reset")
                             .ghost()
-                            .label("Reset to defaults")
+                            .xsmall()
+                            .label("Reset all to defaults")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.reset_fonts(window, cx);
                             })),
@@ -3771,11 +4235,10 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .px_5()
                             .py_4()
                             .gap_2()
                             .child(
-                                h_flex().w_full().min_w_0().justify_end().child(
+                                h_flex().w_full().min_w_0().px_5().justify_end().child(
                                     Button::new("settings-done")
                                         .ghost()
                                         .xsmall()
@@ -3790,8 +4253,10 @@ impl Workspace {
                                     .id("settings-content")
                                     .flex_1()
                                     .min_w_0()
+                                    .min_h(px(0.))
                                     .w_full()
-                                    .overflow_y_scroll()
+                                    .px_5()
+                                    .overflow_y_scrollbar()
                                     .overflow_x_hidden()
                                     .child(content),
                             ),
@@ -3807,7 +4272,8 @@ impl Workspace {
         let p = self.palette.clone();
         let items = state.items(self.view_source);
         let selected = state.index;
-        let query = state.query.clone();
+        let query = state.query.render();
+        let query_empty = state.query.is_empty();
         let mode = state.mode;
         let title = match mode {
             PaletteMode::Root => "Commands",
@@ -3815,7 +4281,7 @@ impl Workspace {
             PaletteMode::Editors => "Editor",
         };
         let hint = match mode {
-            PaletteMode::Root => "cmd-k",
+            PaletteMode::Root => "cmd-shift-p",
             PaletteMode::Themes | PaletteMode::Editors => "esc back",
         };
 
@@ -3888,14 +4354,12 @@ impl Workspace {
                                     .child(">"),
                             )
                             .child(div().flex_1().text_sm().child(
-                                if query.is_empty() {
+                                if query_empty {
                                     div()
                                         .text_color(p.text_muted.opacity(0.7))
                                         .child("Type a command…")
                                 } else {
-                                    div()
-                                        .text_color(p.markdown_text)
-                                        .child(format!("{query}▌"))
+                                    div().text_color(p.markdown_text).child(query)
                                 },
                             )),
                     )
@@ -3906,6 +4370,7 @@ impl Workspace {
                             .flex_1()
                             .min_h(px(0.))
                             .overflow_y_scroll()
+                            .track_scroll(&self.palette_scroll)
                             .py_1()
                             .children(if items.is_empty() {
                                 vec![div()
@@ -3930,14 +4395,27 @@ impl Workspace {
                                             .cursor_pointer()
                                             .when(active, |el| el.bg(p.background_element))
                                             .hover(|el| el.bg(p.background_element.opacity(0.7)))
-                                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                                                if let Some(state) = this.cmd_palette.as_mut() {
-                                                    if state.index != i {
-                                                        state.index = i;
+                                            .on_mouse_move(cx.listener(
+                                                move |this, _, window, cx| {
+                                                    let changed = this
+                                                        .cmd_palette
+                                                        .as_mut()
+                                                        .map(|state| {
+                                                            if state.index != i {
+                                                                state.index = i;
+                                                                true
+                                                            } else {
+                                                                false
+                                                            }
+                                                        })
+                                                        .unwrap_or(false);
+                                                    if changed {
+                                                        // Live theme preview while hovering Themes.
+                                                        this.preview_palette_theme(window, cx);
                                                         cx.notify();
                                                     }
-                                                }
-                                            }))
+                                                },
+                                            ))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, window, cx| {
@@ -3976,7 +4454,11 @@ impl Workspace {
                                             .into_any_element()
                                     })
                                     .collect()
-                            }),
+                            })
+                            // Scrollbar last: the overlay is an extra tracked
+                            // child, so it must not shift item indices used
+                            // by keyboard scroll-into-view.
+                            .vertical_scrollbar(&self.palette_scroll),
                     ),
             )
             .into_any_element()
@@ -4235,6 +4717,17 @@ impl Workspace {
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Text | BlockExtra::Html => {
+                // HTML `<video src=…>` blocks render as a video placeholder
+                // with the same toolbar as image attachments.
+                if let BlockExtra::Html = &block.extra {
+                    if let Some(src) = self
+                        .source
+                        .get(block.source.clone())
+                        .and_then(images::parse_video_src)
+                    {
+                        return self.render_video_hit("", &src, block.display.start, cx);
+                    }
+                }
                 let mut el = v_flex().relative().w_full().min_w_0().child(body);
                 if slash {
                     // `deferred` paints after later sibling blocks so the menu
@@ -4263,13 +4756,23 @@ impl Workspace {
         display_start: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if images::is_video_src(src) {
+            return self.render_video_hit(alt, src, display_start, cx);
+        }
         let pal = &self.palette;
         let path = images::resolve_beside(&self.path, src);
+        let selected = self.media_sel == Some(display_start);
         v_flex()
             .w_full()
             .min_w_0()
             .gap_1()
             .cursor_pointer()
+            .when(selected, |el| {
+                el.border_1()
+                    .border_color(pal.primary)
+                    .rounded(px(8.))
+                    .p_1()
+            })
             .on_mouse_down(MouseButton::Left, {
                 let view = cx.entity();
                 move |ev: &MouseDownEvent, window, cx| {
@@ -4308,6 +4811,161 @@ impl Workspace {
                         .child(alt.to_string()),
                 )
             })
+            .when(selected, |el| {
+                el.child(self.render_media_toolbar(true, display_start, cx))
+            })
+            .into_any_element()
+    }
+
+    /// GitHub-style video (`![alt](clip.mp4)` or `<video src=…>`): a
+    /// placeholder box with the same click-to-edit toolbar as images.
+    fn render_video_hit(
+        &self,
+        alt: &str,
+        src: &str,
+        display_start: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = &self.palette;
+        let path = images::resolve_beside(&self.path, src);
+        let selected = self.media_sel == Some(display_start);
+        let name = Path::new(src)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(src);
+        let caption = if alt.is_empty() {
+            if path.exists() {
+                name.to_string()
+            } else {
+                format!("missing video: {src}")
+            }
+        } else if path.exists() {
+            format!("{name} · {alt}")
+        } else {
+            format!("missing video: {src}")
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, {
+                let view = cx.entity();
+                move |ev: &MouseDownEvent, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.click_display(
+                            display_start,
+                            ev.modifiers.shift,
+                            ev.modifiers.platform || ev.modifiers.control,
+                            ev.click_count,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_4()
+                    .gap_3()
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(if selected { pal.primary } else { pal.border })
+                    .bg(pal.background_element.opacity(0.5))
+                    .child(icon_el(
+                        "play",
+                        if selected { pal.primary } else { pal.text_muted },
+                    ))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(pal.markdown_text)
+                                    .child("Video"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(pal.text_muted)
+                                    .child(caption),
+                            ),
+                    ),
+            )
+            .when(selected, |el| {
+                el.child(self.render_media_toolbar(false, display_start, cx))
+            })
+            .into_any_element()
+    }
+
+    /// Alt + path toolbar under a selected image/video. Clicks inside stop
+    /// at the panel so they never re-select (which would reset the inputs).
+    fn render_media_toolbar(
+        &self,
+        show_alt: bool,
+        display_start: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = &self.palette;
+        let field = |label: &'static str, input: &Entity<InputState>| {
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.text_muted)
+                        .child(label),
+                )
+                .child(Input::new(input).cleanable(false))
+        };
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .p_3()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.background_panel)
+            .font_family(self.config.ui_font.family.clone())
+            .text_size(self.ui_font_px())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(show_alt, |el| el.child(field("Alt text", &self.media_alt)))
+            .child(field("Path", &self.media_src))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new(("media-done", display_start))
+                            .ghost()
+                            .xsmall()
+                            .label("Done")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.media_sel = None;
+                                this.focus.focus(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(("media-apply", display_start))
+                            .xsmall()
+                            .label("Apply")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_media_edit(window, cx);
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -4842,7 +5500,7 @@ impl Workspace {
                 div()
                     .text_sm()
                     .text_color(p.markdown_text)
-                    .child(format!("{}▌", self.link_draft)),
+                    .child(self.link_draft.render()),
             )
             .into_any_element()
     }
@@ -4864,6 +5522,10 @@ impl Workspace {
         self.insert_newline(true, window, cx);
     }
     fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             cx.propagate();
             return;
@@ -4904,6 +5566,10 @@ impl Workspace {
         }
     }
     fn on_outdent_tab(&mut self, _: &OutdentTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             cx.propagate();
             return;
@@ -4943,15 +5609,31 @@ impl Workspace {
         }
     }
     fn on_toggle_bold(&mut self, _: &ToggleBold, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         self.toggle_mark_action(Mark::Bold, window, cx);
     }
     fn on_toggle_italic(&mut self, _: &ToggleItalic, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         self.toggle_mark_action(Mark::Italic, window, cx);
     }
     fn on_toggle_strike(&mut self, _: &ToggleStrike, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         self.toggle_mark_action(Mark::Strike, window, cx);
     }
     fn on_toggle_code(&mut self, _: &ToggleCode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         self.toggle_mark_action(Mark::Code, window, cx);
     }
     fn on_toggle_underline(
@@ -4960,6 +5642,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         self.toggle_mark_action(Mark::Underline, window, cx);
     }
     fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
@@ -4976,6 +5662,10 @@ impl Workspace {
     }
 
     fn on_cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
@@ -5003,28 +5693,36 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         window.prevent_default();
         if self.link_open {
             if !self.link_draft.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(self.link_draft.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    self.link_draft.as_str().to_string(),
+                ));
             }
             return;
         }
         if let Some(buf) = self.command.as_ref() {
             if !buf.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(buf.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(buf.as_str().to_string()));
             }
             return;
         }
         if let Some((buf, _)) = self.search.as_ref() {
             if !buf.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(buf.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(buf.as_str().to_string()));
             }
             return;
         }
         if let Some(state) = self.cmd_palette.as_ref() {
             if !state.query.is_empty() {
-                cx.write_to_clipboard(ClipboardItem::new_string(state.query.clone()));
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    state.query.as_str().to_string(),
+                ));
             }
             return;
         }
@@ -5057,6 +5755,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.overlay_input_focused(window, cx) {
+            // Let the focused panel input handle paste natively.
+            cx.propagate();
+            return;
+        }
         window.prevent_default();
         if self.try_paste_image(window, cx) {
             return;
@@ -5072,22 +5775,22 @@ impl Workspace {
             return;
         }
         if self.link_open {
-            self.link_draft.push_str(&text.replace('\n', ""));
+            self.link_draft.insert_str(&text.replace('\n', ""));
             cx.notify();
             return;
         }
         if let Some(buf) = self.command.as_mut() {
-            buf.push_str(&text.replace('\n', ""));
+            buf.insert_str(&text.replace('\n', ""));
             cx.notify();
             return;
         }
         if let Some((buf, _)) = self.search.as_mut() {
-            buf.push_str(&text.replace('\n', ""));
+            buf.insert_str(&text.replace('\n', ""));
             cx.notify();
             return;
         }
         if let Some(state) = self.cmd_palette.as_mut() {
-            state.query.push_str(&text.replace('\n', ""));
+            state.query.insert_str(&text.replace('\n', ""));
             state.index = 0;
             cx.notify();
             return;
@@ -5136,6 +5839,10 @@ impl Workspace {
     }
 
     fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay_input_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
@@ -5823,7 +6530,7 @@ impl Workspace {
     }
 
     fn commit_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self.link_draft.clone();
+        let url = self.link_draft.as_str().to_string();
         self.link_open = false;
         self.link_draft.clear();
         let sel = self.sel.clone().unwrap_or(self.caret..self.caret);
@@ -6054,11 +6761,43 @@ impl Render for DragBlock {
 }
 
 fn icon_el(name: &str, color: gpui::Hsla) -> Icon {
+    icon_el_px(name, color, px(16.))
+}
+
+fn icon_el_px(name: &str, color: gpui::Hsla, size: gpui::Pixels) -> Icon {
     Icon::default()
         .path(crate::assets::path(name))
         .text_color(color)
-        .w(px(16.))
-        .h(px(16.))
+        .w(size)
+        .h(size)
+}
+
+/// Tiny slot-reset button overlaying an input's right corner (fonts).
+/// `id` must be unique per input; clicking resets the whole font slot.
+fn reset_btn(
+    id: (&'static str, usize),
+    slot: FontSlot,
+    p: &crate::theme::Palette,
+    cx: &mut gpui::Context<Workspace>,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .absolute()
+        .right(px(6.))
+        .top(px(0.))
+        .bottom(px(0.))
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .child(icon_el_px("rotate-ccw", p.text_muted, px(12.)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.reset_font_slot(slot, window, cx);
+            }),
+        )
+        .into_any_element()
 }
 
 pub fn window_title(path: &Path, dirty: bool) -> String {
@@ -6115,7 +6854,9 @@ pub fn apply_palette(palette: &Palette, cx: &mut App) {
         theme.cyan = palette.info;
         theme.blue = palette.secondary;
         theme.magenta = palette.accent;
-        theme.scrollbar = palette.background;
+        // Thumb-only overlay scrollbars (mac-like): transparent track so no
+        // gutter covers content, thumb in border color.
+        theme.scrollbar = palette.background.opacity(0.0);
         theme.scrollbar_thumb = palette.border;
         theme.focus_ring = false;
         theme.tokens = ThemeTokens::from(theme.colors);
@@ -6375,7 +7116,7 @@ impl Render for Workspace {
         let command = self.command.clone();
         let search = self.search.clone();
         let status = if self.view_source {
-            SharedString::from("source view — esc/cmd-k to exit")
+            SharedString::from("source view — esc/cmd-shift-p to exit")
         } else {
             self.status.clone()
         };
@@ -6436,6 +7177,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_block_backspace))
             .on_action(cx.listener(Self::on_toggle_settings))
             .on_action(cx.listener(Self::on_open_palette))
+            .on_action(cx.listener(Self::on_key_chord))
             .on_action(cx.listener(Self::on_open_command))
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_search_back))
@@ -6557,7 +7299,11 @@ impl Render for Workspace {
                             }
                         }),
                     )
-                    .children(self.render_surface(cx)),
+                    .children(self.render_surface(cx))
+                    // Scrollbar last: the overlay counts as a tracked child,
+                    // so it must not shift block indices used by
+                    // scroll_to_item / bounds_for_item (drag gaps, caret).
+                    .vertical_scrollbar(&self.scroll_handle),
             )
             .child(
                 h_flex()
@@ -6587,7 +7333,7 @@ impl Render for Workspace {
                             )),
                         )
                     })
-                    .when_some(command, |el, cmd| {
+                    .when_some(command, |el, cmd: LineField| {
                         el.child(
                             h_flex()
                                 .flex_1()
@@ -6604,13 +7350,12 @@ impl Render for Workspace {
                                     div()
                                         .text_sm()
                                         .text_color(p.markdown_text)
-                                        .child(format!("{cmd}▌")),
+                                        .child(cmd.render()),
                                 ),
                         )
                     })
-                    .when_some(search, |el, (q, back)| {
-                        let prefix = if back { "?" } else { "/" };
-                        el.child(
+                    .when_some(search, |el, (q, back): (LineField, bool)| {
+                        let prefix = if back { "?" } else { "/" };                        el.child(
                             h_flex()
                                 .flex_1()
                                 .items_center()
@@ -6626,7 +7371,7 @@ impl Render for Workspace {
                                     div()
                                         .text_sm()
                                         .text_color(p.markdown_text)
-                                        .child(format!("{q}▌")),
+                                        .child(q.render()),
                                 ),
                         )
                     })
@@ -6731,33 +7476,42 @@ mod tests {
     #[test]
     fn line_edit_backspace_variants() {
         let plain = mods(false, false, false);
-        let mut s = String::from("abc");
-        assert!(line_edit_key(&mut s, "backspace", plain));
-        assert_eq!(s, "ab");
+        let mut s = LineField::new();
+        s.insert_str("abc");
+        assert!(s.delete_key("backspace", plain));
+        assert_eq!(s.as_str(), "ab");
         // Empty buffer: fall through so callers (palette) can back out.
-        let mut s = String::new();
-        assert!(!line_edit_key(&mut s, "backspace", plain));
+        let mut s = LineField::new();
+        assert!(!s.delete_key("backspace", plain));
 
-        let mut s = String::from("foo bar baz");
-        assert!(line_edit_key(&mut s, "backspace", mods(false, true, false)));
-        assert_eq!(s, "foo bar ");
-        assert!(line_edit_key(&mut s, "backspace", mods(false, true, false)));
-        assert_eq!(s, "foo ");
+        let mut s = LineField::new();
+        s.insert_str("foo bar baz");
+        assert!(s.delete_key("backspace", mods(false, true, false)));
+        assert_eq!(s.as_str(), "foo bar ");
+        assert!(s.delete_key("backspace", mods(false, true, false)));
+        assert_eq!(s.as_str(), "foo ");
 
-        let mut s = String::from("hello world");
-        assert!(line_edit_key(&mut s, "backspace", mods(false, false, true)));
-        assert_eq!(s, "");
+        let mut s = LineField::new();
+        s.insert_str("hello world");
+        assert!(s.delete_key("backspace", mods(false, false, true)));
+        assert_eq!(s.as_str(), "");
     }
 
     #[test]
-    fn line_edit_arrows_consumed() {
+    fn line_edit_caret_moves() {
         let plain = mods(false, false, false);
-        let mut s = String::from("abc");
-        assert!(line_edit_key(&mut s, "left", plain));
-        assert!(line_edit_key(&mut s, "right", mods(false, true, false)));
-        assert!(line_edit_key(&mut s, "home", mods(false, false, true)));
-        assert_eq!(s, "abc");
-        assert!(!line_edit_key(&mut s, "up", plain));
-        assert!(!line_edit_key(&mut s, "x", plain));
+        let mut s = LineField::new();
+        s.insert_str("abc");
+        // Caret starts at the end; arrows move it instead of no-ops.
+        assert!(s.caret_key("left", plain));
+        assert!(s.caret_key("left", plain));
+        s.insert_char('X');
+        assert_eq!(s.as_str(), "aXbc");
+        assert!(s.caret_key("right", mods(false, true, false)));
+        assert_eq!(s.render(), "aXbc▌");
+        assert!(s.caret_key("home", mods(false, false, true)));
+        s.insert_char('Y');
+        assert_eq!(s.as_str(), "YaXbc");
+        assert!(!s.caret_key("up", plain));
     }
 }

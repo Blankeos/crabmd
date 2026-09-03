@@ -1,4 +1,6 @@
-//! Command palette (cmd-k / ctrl-k).
+//! Command palette (cmd-shift-p / ctrl-shift-p).
+
+use gpui::Modifiers;
 
 use crate::config::EditorKind;
 use crate::theme;
@@ -12,7 +14,7 @@ pub enum PaletteMode {
 
 #[derive(Clone, Debug)]
 pub struct PaletteState {
-    pub query: String,
+    pub query: LineField,
     pub index: usize,
     pub mode: PaletteMode,
 }
@@ -20,9 +22,18 @@ pub struct PaletteState {
 impl PaletteState {
     pub fn open() -> Self {
         Self {
-            query: String::new(),
+            query: LineField::new(),
             index: 0,
             mode: PaletteMode::Root,
+        }
+    }
+
+    /// Open straight into a submenu (e.g. Themes from settings).
+    pub fn open_in(mode: PaletteMode) -> Self {
+        Self {
+            query: LineField::new(),
+            index: 0,
+            mode,
         }
     }
 
@@ -42,7 +53,255 @@ impl PaletteState {
     }
 
     pub fn items(&self, view_source: bool) -> Vec<PaletteItem> {
-        filter_items(&items_for(self.mode, view_source), &self.query)
+        filter_items(&items_for(self.mode, view_source), self.query.as_str())
+    }
+}
+
+/// Single-line buffer with a real caret (not append-at-end).
+///
+/// Shared by the palette query, `:` command bar, `/`+`cmd-f` search bars and
+/// the link draft so opt/cmd-backspace and opt/cmd-arrows edit where the
+/// caret is instead of always at the end.
+#[derive(Clone, Debug, Default)]
+pub struct LineField {
+    text: String,
+    caret: usize,
+}
+
+impl LineField {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.caret = 0;
+    }
+
+    fn clamp_caret(&mut self) {
+        if self.caret > self.text.len() {
+            self.caret = self.text.len();
+        }
+        while !self.text.is_char_boundary(self.caret) && self.caret > 0 {
+            self.caret -= 1;
+        }
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.clamp_caret();
+        self.text.insert(self.caret, ch);
+        self.caret += ch.len_utf8();
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        self.clamp_caret();
+        self.text.insert_str(self.caret, s);
+        self.caret += s.len();
+    }
+
+    /// Plain backspace. False when empty so callers can fall through
+    /// (e.g. palette backs out of submenus).
+    pub fn backspace(&mut self) -> bool {
+        self.clamp_caret();
+        if self.caret == 0 {
+            return false;
+        }
+        let prev = self.text[..self.caret]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.text.drain(prev..self.caret);
+        self.caret = prev;
+        true
+    }
+
+    /// Opt-backspace: delete the word before the caret.
+    pub fn delete_word_back(&mut self) -> bool {
+        self.clamp_caret();
+        if self.caret == 0 {
+            return false;
+        }
+        let bytes = self.text.as_bytes();
+        let mut start = self.caret;
+        while start > 0 && bytes[start - 1] == b' ' {
+            start -= 1;
+        }
+        while start > 0 && bytes[start - 1] != b' ' {
+            let prev = self.text[..start]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            start = prev;
+        }
+        if start == self.caret {
+            return false;
+        }
+        self.text.drain(start..self.caret);
+        self.caret = start;
+        true
+    }
+
+    /// Cmd-backspace: delete everything before the caret (whole line when
+    /// the caret is at the end).
+    pub fn clear_back(&mut self) -> bool {
+        self.clamp_caret();
+        if self.caret == 0 {
+            return false;
+        }
+        self.text.drain(..self.caret);
+        self.caret = 0;
+        true
+    }
+
+    pub fn move_left(&mut self) {
+        self.clamp_caret();
+        if self.caret > 0 {
+            self.caret = self.text[..self.caret]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        self.clamp_caret();
+        if self.caret < self.text.len() {
+            self.caret = self.text[self.caret..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.caret + i)
+                .unwrap_or(self.text.len());
+        }
+    }
+
+    fn word_left_from(&self, mut ix: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        while ix > 0 && bytes[ix - 1] == b' ' {
+            ix -= 1;
+        }
+        while ix > 0 && bytes[ix - 1] != b' ' {
+            ix -= 1;
+        }
+        while !self.text.is_char_boundary(ix) && ix > 0 {
+            ix -= 1;
+        }
+        ix
+    }
+
+    fn word_right_from(&self, mut ix: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        let len = self.text.len();
+        while ix < len && bytes[ix] == b' ' {
+            ix += 1;
+        }
+        while ix < len && bytes[ix] != b' ' {
+            ix += 1;
+        }
+        while !self.text.is_char_boundary(ix) && ix < len {
+            ix += 1;
+        }
+        ix
+    }
+
+    pub fn move_word_left(&mut self) {
+        self.clamp_caret();
+        self.caret = self.word_left_from(self.caret);
+    }
+
+    pub fn move_word_right(&mut self) {
+        self.clamp_caret();
+        self.caret = self.word_right_from(self.caret);
+    }
+
+    pub fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.caret = self.text.len();
+    }
+
+    /// Arrows / home / end with optional opt (word) / cmd (line) motion.
+    /// Always consumed: there is nowhere else for them to go.
+    pub fn caret_key(&mut self, key: &str, mods: Modifiers) -> bool {
+        let word = mods.alt || (mods.control && !mods.platform);
+        match key {
+            "left" if word => {
+                self.move_word_left();
+                true
+            }
+            "right" if word => {
+                self.move_word_right();
+                true
+            }
+            "left" if mods.platform => {
+                self.home();
+                true
+            }
+            "right" if mods.platform => {
+                self.end();
+                true
+            }
+            "left" => {
+                self.move_left();
+                true
+            }
+            "right" => {
+                self.move_right();
+                true
+            }
+            "home" => {
+                self.home();
+                true
+            }
+            "end" => {
+                self.end();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Backspace family (plain / opt-word / cmd-line). False when nothing
+    /// was deleted so callers can fall through.
+    pub fn delete_key(&mut self, key: &str, mods: Modifiers) -> bool {
+        if key != "backspace" {
+            return false;
+        }
+        if mods.platform && !mods.alt && !mods.control {
+            if self.is_empty() {
+                return false;
+            }
+            self.clear_back();
+            // Cmd-backspace at line start clears nothing but still consumes.
+            true
+        } else if mods.alt && !mods.platform && !mods.control {
+            self.delete_word_back()
+        } else if !mods.platform && !mods.control && !mods.alt {
+            self.backspace()
+        } else {
+            false
+        }
+    }
+
+    /// Render with a visible caret (`▌`) at the caret, not the end.
+    pub fn render(&self) -> String {
+        let mut caret = self.caret.min(self.text.len());
+        while !self.text.is_char_boundary(caret) && caret > 0 {
+            caret -= 1;
+        }
+        format!("{}▌{}", &self.text[..caret], &self.text[caret..])
     }
 }
 

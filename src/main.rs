@@ -77,7 +77,11 @@ fn run() -> Result<()> {
     ensure_file(&path)?;
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    launch(path, source, palette, config);
+    let initial = match (args.line, args.col) {
+        (Some(line), col) => Some((line, col.unwrap_or(1))),
+        (None, _) => None,
+    };
+    launch(path, source, palette, config, initial);
     Ok(())
 }
 
@@ -125,7 +129,7 @@ fn ensure_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn launch(path: PathBuf, source: String, palette: Palette, config: Config) {
+fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initial: Option<(usize, usize)>) {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .run(move |cx| {
@@ -152,7 +156,7 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config) {
             cx.spawn(async move |cx| {
                 cx.open_window(window_options, |window, cx| {
                     window.activate_window();
-                    let view = Workspace::view(path, source, palette, config, window, cx);
+                    let view = Workspace::view(path, source, palette, config, initial, window, cx);
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
                 .expect("failed to open window");
@@ -168,6 +172,10 @@ struct Args {
     theme_from_cli: bool,
     wait: bool,
     path: Option<PathBuf>,
+    /// 1-based source line from `file.md:line[:col]` (zed-style).
+    line: Option<usize>,
+    /// 1-based source column from `file.md:line:col`.
+    col: Option<usize>,
 }
 
 impl Args {
@@ -178,6 +186,8 @@ impl Args {
         let mut theme_from_cli = false;
         let mut wait = false;
         let mut path = None;
+        let mut line = None;
+        let mut col = None;
         let mut iter = std::env::args().skip(1).peekable();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -201,7 +211,10 @@ impl Args {
                     if path.is_some() {
                         anyhow::bail!("unexpected extra argument `{arg}`");
                     }
-                    path = Some(PathBuf::from(arg));
+                    let (file, l, c) = split_file_position(&arg);
+                    path = Some(PathBuf::from(file));
+                    line = l;
+                    col = c;
                 }
             }
         }
@@ -212,7 +225,41 @@ impl Args {
             theme_from_cli,
             wait,
             path,
+            line,
+            col,
         })
+    }
+}
+
+/// Split zed-style `file.md:line:col` (or `file.md:line`) into its parts.
+/// Trailing `:digits` suffixes are treated as line/column; anything else is
+/// kept verbatim as the file path (so `a:b.md:4` -> `a:b.md` line 4, while
+/// `notes.md:abc` stays a plain path).
+fn split_file_position(arg: &str) -> (String, Option<usize>, Option<usize>) {
+    let mut rest = arg;
+    let mut nums: Vec<usize> = Vec::new();
+    for _ in 0..2 {
+        let Some(ix) = rest.rfind(':') else {
+            break;
+        };
+        let tail = &rest[ix + 1..];
+        if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        let Ok(n) = tail.parse::<usize>() else {
+            break;
+        };
+        nums.push(n);
+        rest = &rest[..ix];
+    }
+    if rest.is_empty() {
+        return (arg.to_string(), None, None);
+    }
+    match nums.len() {
+        // Pushed col first, then line.
+        2 => (rest.to_string(), Some(nums[1].max(1)), Some(nums[0].max(1))),
+        1 => (rest.to_string(), Some(nums[0].max(1)), None),
+        _ => (arg.to_string(), None, None),
     }
 }
 
@@ -221,6 +268,7 @@ crabmd — a fast native markdown writer
 
 Usage:
   crabmd <file.md>
+  crabmd <file.md>:<line>[:<col>]   (zed-style jump; hidden markup picks nearest)
   crabmd --theme <name> <file.md>
   crabmd -w <file.md>
   crabmd --list-themes
@@ -233,12 +281,12 @@ Flags:
   -h, --help     Show this help
 
 Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
-  opencode, opencode-light, catppuccin, catppuccin-light,
-  tokyonight, tokyonight-light, github, github-light
+  see --list-themes (all crabcode themes + grokday/groknight included)
 
 Keys (Helix / Vim normal — one buffer):
   cmd/ctrl-s    save (explicit write; no autosave)
-  cmd-k         command palette (theme, editor, full width, source)
+  cmd-shift-p   command palette (theme, editor, full width, source)
+  cmd-k t       theme picker (zed-style chord)
   cmd-,         settings
   cmd-f         find
   :w / :write   write from the command-line; :wq writes and quits
@@ -253,9 +301,39 @@ Keys (Helix / Vim normal — one buffer):
   x             Helix: select line (repeat extends). Vim: delete character
   u / U         undo / redo (Helix); Vim redo is ctrl-r
   escape        normal (collapse visual)
-  drop/paste    image files beside the markdown file
+  drop/paste    image + video files beside the markdown file
 ";
 
 fn print_help() {
     println!("{HELP}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_file_position;
+
+    #[test]
+    fn zed_style_positions() {
+        assert_eq!(
+            split_file_position("notes.md:10:3"),
+            ("notes.md".to_string(), Some(10), Some(3))
+        );
+        assert_eq!(
+            split_file_position("notes.md:10"),
+            ("notes.md".to_string(), Some(10), None)
+        );
+        assert_eq!(
+            split_file_position("notes.md"),
+            ("notes.md".to_string(), None, None)
+        );
+        // Colons inside the path survive; only trailing numbers split off.
+        assert_eq!(
+            split_file_position("a:b.md:4"),
+            ("a:b.md".to_string(), Some(4), None)
+        );
+        assert_eq!(
+            split_file_position("notes.md:abc"),
+            ("notes.md:abc".to_string(), None, None)
+        );
+    }
 }
