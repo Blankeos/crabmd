@@ -72,7 +72,11 @@ if [ -f "npm/package.json" ]; then
 fi
 
 echo "🦋 Updating Cargo.lock..."
-cargo generate-lockfile
+# NOTE: `cargo generate-lockfile` re-resolves EVERYTHING to latest,
+# including floating git-main deps (broke the build on v0.0.1 when
+# gpui-component git jumped 0.5.2 -> 0.6.0). Plain `cargo check` only
+# updates the version entry and keeps existing pins.
+cargo check --locked 2>/dev/null || cargo check
 
 echo "🦋 Regenerating CHANGELOG.md..."
 git cliff --offline --tag "v${NEW}" -o CHANGELOG.md

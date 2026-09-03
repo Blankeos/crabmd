@@ -11,13 +11,13 @@ readme = "README.md"
 keywords = ["markdown", "editor", "gpui", "wysiwyg"]
 categories = ["text-editors", "command-line-utilities"]
 include = [
-    "/Cargo.toml",
-    "/Cargo.lock",
-    "/src/**/*.rs",
-    "/README.md",
-    "/LICENSE",
-    "/assets/**",
-    "/themes/**/*.json",
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/**/*.rs",
+    "README.md",
+    "LICENSE",
+    "assets/**",
+    "themes/**/*.json",
 ]
 
 [[bin]]
