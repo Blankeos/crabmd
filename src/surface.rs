@@ -376,18 +376,15 @@ impl Element for CodePillLayer {
                 .unwrap_or(px(16.));
         // GFM-like pill: height hugs the glyphs (font size + a whisper of
         // vertical padding) instead of filling the full line height, then
-        // centered on the line. Horizontal padding is adaptive on purpose:
-        // the pill is a background overlay — it can't push neighbors away
-        // like GitHub's in-flow `<code>` padding, so the pad budget comes
-        // out of the existing gap instead:
-        // - block/line edge: full 3px wash (margin is free there)
-        // - facing a space: 1px hair, leaving the word gap visible
-        // - kissing punctuation/letters: 0, no overhang onto ink
-        // - wrapped line end: 1px (the row is full; avoids viewport clip)
+        // centered on the line. Horizontal padding is in-flow now — the
+        // projection wraps code in real code-marked spaces (see `emit_code`
+        // in display.rs), so neighbors keep their word gap (margin) *and*
+        // the wash gets inner padding, GitHub-style. The overlay below only
+        // adds a 1px hair so rounded corners don't clip glyph ink.
         // 6px radius.
-        let full_pad_x = px(3.);
+        let full_pad_x = px(1.);
         let tight_pad_x = px(1.);
-        let zero_pad_x = px(0.);
+        let zero_pad_x = px(1.);
         let pad_y = px(3.);
         let radius = px(6.);
         let pill_h = self.font_size + pad_y * 2.;
