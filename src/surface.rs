@@ -305,6 +305,8 @@ pub struct CodePillLayer {
     pub layout: TextLayout,
     pub ranges: Vec<Range<usize>>,
     pub color: Hsla,
+    pub font_size: Pixels,
+    pub text: gpui::SharedString,
 }
 
 impl IntoElement for CodePillLayer {
@@ -316,7 +318,7 @@ impl IntoElement for CodePillLayer {
 
 impl Element for CodePillLayer {
     type RequestLayoutState = ();
-    type PrepaintState = Vec<gpui::PaintQuad>;
+    type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -349,48 +351,6 @@ impl Element for CodePillLayer {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        let Some(len) = layout_len(&self.layout) else {
-            return Vec::new();
-        };
-        let line_h =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
-                .unwrap_or(px(16.));
-        // GFM-like pill: ~.4em horizontal / ~.2em vertical padding, 6px radius.
-        let pad_x = px(5.);
-        let pad_y = px(2.);
-        let radius = px(6.);
-        let mut quads = Vec::new();
-        for range in &self.ranges {
-            if range.start >= range.end || range.end > len {
-                continue;
-            }
-            let Some(start) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.layout.position_for_index(range.start)
-            }))
-            .ok()
-            .flatten() else {
-                continue;
-            };
-            let end = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.layout.position_for_index(range.end.min(len))
-            }))
-            .ok()
-            .flatten()
-            .unwrap_or(start);
-            // Same visual line — single padded pill. Wrapped code is rare;
-            // fall back to one pill spanning the start line width.
-            let (x0, x1, y) = if (start.y - end.y).abs() < px(0.5) {
-                (start.x.min(end.x), start.x.max(end.x), start.y)
-            } else {
-                (start.x, start.x + px(48.), start.y)
-            };
-            let bounds = Bounds::new(
-                Point::new(x0 - pad_x, y - pad_y),
-                size((x1 - x0) + pad_x * 2., line_h + pad_y * 2.),
-            );
-            quads.push(fill(bounds, self.color).corner_radii(Corners::all(radius)));
-        }
-        quads
     }
 
     fn paint(
@@ -399,12 +359,287 @@ impl Element for CodePillLayer {
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        quads: &mut Self::PrepaintState,
+        _: &mut Self::PrepaintState,
         window: &mut Window,
         _cx: &mut App,
     ) {
-        for quad in quads.drain(..) {
-            window.paint_quad(quad);
+        // Geometry is computed here — not in prepaint — because this layer
+        // prepaints *before* its sibling `StyledText`, and `position_for_index`
+        // panics until that sibling's prepaint stores its bounds. By paint
+        // time every prepaint has run, so positions are final for this frame.
+        // NOTE: positions are already window coordinates, no origin offset.
+        let Some(len) = layout_len(&self.layout) else {
+            return;
+        };
+        let line_h =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
+                .unwrap_or(px(16.));
+        // GFM-like pill: height hugs the glyphs (font size + a whisper of
+        // vertical padding) instead of filling the full line height, then
+        // centered on the line. Horizontal padding is adaptive on purpose:
+        // the pill is a background overlay — it can't push neighbors away
+        // like GitHub's in-flow `<code>` padding, so the pad budget comes
+        // out of the existing gap instead:
+        // - block/line edge: full 3px wash (margin is free there)
+        // - facing a space: 1px hair, leaving the word gap visible
+        // - kissing punctuation/letters: 0, no overhang onto ink
+        // - wrapped line end: 1px (the row is full; avoids viewport clip)
+        // 6px radius.
+        let full_pad_x = px(3.);
+        let tight_pad_x = px(1.);
+        let zero_pad_x = px(0.);
+        let pad_y = px(3.);
+        let radius = px(6.);
+        let pill_h = self.font_size + pad_y * 2.;
+        let y_off = (line_h - pill_h).max(px(0.)) / 2.;
+        for range in &self.ranges {
+            if range.start >= range.end || range.end > len {
+                continue;
+            }
+            let t = self.text.as_ref();
+            let tlen = t.len();
+            let r_end = range.end.min(len).min(tlen);
+            let r_start = range.start.min(r_end);
+            if r_start >= r_end
+                || !t.is_char_boundary(r_start)
+                || (r_end < tlen && !t.is_char_boundary(r_end))
+            {
+                continue;
+            }
+            let pos = |ix: usize| -> Option<Point<Pixels>> {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.layout.position_for_index(ix.min(len))
+                }))
+                .ok()
+                .flatten()
+            };
+            let Some(start) = pos(r_start) else {
+                continue;
+            };
+            let end = pos(r_end).unwrap_or(start);
+            let left_prev = t.get(..r_start).and_then(|s| s.chars().next_back());
+            let pad_l_first = match left_prev {
+                None => full_pad_x, // block start
+                Some('\n') | Some('\r') => full_pad_x, // line start
+                Some(c) if c.is_whitespace() => tight_pad_x, // keep word gap
+                _ => zero_pad_x,     // kiss ink: no overhang
+            };
+            let right_next = t.get(r_end..).and_then(|s| s.chars().next());
+            let pad_r_last = match right_next {
+                None => full_pad_x, // block end
+                Some('\n') | Some('\r') => full_pad_x, // line end
+                Some(c) if c.is_whitespace() => tight_pad_x, // keep word gap
+                _ => zero_pad_x,     // kiss ink: no overhang
+            };
+            let paint_seg = |x0: Pixels,
+                             x1: Pixels,
+                             y: Pixels,
+                             pad_l: Pixels,
+                             pad_r: Pixels,
+                             corners: Corners<Pixels>,
+                             window: &mut Window| {
+                if x1 - x0 < px(0.5) {
+                    return;
+                }
+                let bounds = Bounds::new(
+                    Point::new(x0 - pad_l, y + y_off),
+                    size((x1 - x0) + pad_l + pad_r, pill_h),
+                );
+                window.paint_quad(fill(bounds, self.color).corner_radii(corners));
+            };
+            let all_round = Corners::all(radius);
+            let zero = px(0.);
+            // Wrapped fragments read as one broken pill: outer edges round,
+            // interior (continuation) edges square — GitHub slice style.
+            let left_round = Corners {
+                top_left: radius,
+                bottom_left: radius,
+                top_right: zero,
+                bottom_right: zero,
+            };
+            let right_round = Corners {
+                top_left: zero,
+                bottom_left: zero,
+                top_right: radius,
+                bottom_right: radius,
+            };
+            let square = Corners::all(zero);
+            // Fast path: whole range on one visual line.
+            if (start.y - end.y).abs() < px(0.5)
+                && t.get(r_start..r_end).is_some_and(|s| !s.contains('\n'))
+            {
+                paint_seg(
+                    start.x.min(end.x),
+                    start.x.max(end.x),
+                    start.y,
+                    pad_l_first,
+                    pad_r_last,
+                    all_round,
+                    window,
+                );
+                continue;
+            }
+            // Slow path: soft-wrapped (or hard-broken block) code. Walk the
+            // caret positions of every char boundary, grouping by visual
+            // line so each wrapped row gets its own pill. Hard lines are
+            // fast-pathed first so big fenced blocks stay at 2 queries
+            // per line; only soft-wrapped rows pay per-glyph.
+            let slice = t.get(r_start..r_end).unwrap_or("");
+            let mut hard: Vec<(usize, usize)> = Vec::new();
+            if slice.contains('\n') {
+                let mut off = r_start;
+                for part in slice.split_inclusive('\n') {
+                    let part_end = off + part.len();
+                    let mut seg_end = part_end;
+                    if part.ends_with('\n') {
+                        seg_end -= 1;
+                        if part.ends_with("\r\n") {
+                            seg_end -= 1;
+                        }
+                    }
+                    if seg_end > off {
+                        hard.push((off, seg_end.min(r_end)));
+                    }
+                    off = part_end;
+                }
+            } else {
+                hard.push((r_start, r_end));
+            }
+            // Per hard segment, per visual line — (y, x0, x1) in y order.
+            // Glyphs (not carets) are grouped by the row of their
+            // *trailing* caret, which GPUI reports on the glyph's own
+            // row. The leading caret of a soft-wrapped row's first glyph
+            // instead reports at the previous row's end (wrap-boundary
+            // affinity) — using it as the row start is what used to clip
+            // that glyph (e.g. the `n` in `a↵ntonio`). The fix: a glyph
+            // whose carets straddle rows opens the new row one mono
+            // advance left of its trailing caret. Wrap-collapsed spaces
+            // (the break point) are trimmed off the previous row's end.
+            let mut frags: Vec<(Pixels, Pixels, Pixels)> = Vec::new();
+            for (s0, s1) in hard {
+                // Boundaries s0..=s1 (s1 inclusive), then pair into glyphs.
+                let mut bnd: Vec<usize> = Vec::new();
+                let mut j = s0;
+                loop {
+                    bnd.push(j);
+                    if j >= s1 {
+                        break;
+                    }
+                    match t.get(j..s1).and_then(|s| s.chars().next()) {
+                        Some(c) => j += c.len_utf8(),
+                        None => j += 1,
+                    }
+                }
+                if bnd.len() < 2 {
+                    continue;
+                }
+                let mut pts: Vec<Option<Point<Pixels>>> = Vec::with_capacity(bnd.len());
+                for b in &bnd {
+                    pts.push(pos(*b));
+                }
+                // Mono advance: median same-row caret step, else ~0.6em.
+                let mut steps: Vec<f32> = Vec::new();
+                for w in pts.windows(2) {
+                    if let [Some(a), Some(b)] = w {
+                        if (a.y - b.y).abs() < px(0.5) {
+                            let dx: f32 = (b.x - a.x).into();
+                            let cap: f32 = self.font_size.into();
+                            if dx > 0.5 && dx <= cap * 3.0 {
+                                steps.push(dx);
+                            }
+                        }
+                    }
+                }
+                steps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median_step: f32 = if steps.is_empty() {
+                    self.font_size.into()
+                } else {
+                    steps[steps.len() / 2]
+                };
+                let em: f32 = self.font_size.into();
+                let advance = px(median_step.clamp(em * 0.4, em * 3.0));
+                // Rows in y order; each glyph joins its trailing caret's row.
+                let mut rows: Vec<(Pixels, Pixels, Pixels)> = Vec::new();
+                for (i, w) in bnd.windows(2).enumerate() {
+                    let (a, b) = (w[0], w[1]);
+                    let (Some(pa), Some(pb)) = (pts[i], pts[i + 1]) else {
+                        continue;
+                    };
+                    let ch = t.get(a..b).and_then(|s| s.chars().next());
+                    if (pa.y - pb.y).abs() < px(0.5) {
+                        // Whole glyph on one row.
+                        // Wrap-collapsed break space: don't stretch the row.
+                        let next_starts_row = pts
+                            .get(i + 2)
+                            .and_then(|np| *np)
+                            .is_some_and(|np| (np.y - pb.y).abs() >= px(0.5));
+                        let collapsed = ch.is_some_and(|c| c.is_whitespace()) && next_starts_row;
+                        let row = row_for(&mut rows, pb.y);
+                        row.1 = row.1.min(pa.x.min(pb.x));
+                        row.2 = row.2.max(pa.x.min(pb.x));
+                        if !collapsed {
+                            row.2 = row.2.max(pa.x.max(pb.x));
+                        }
+                    } else {
+                        // Straddles rows: first glyph of a soft-wrapped row.
+                        // Its extent runs one advance left of its trailing
+                        // caret (the line start the affinity hides).
+                        let row = row_for(&mut rows, pb.y);
+                        row.1 = row.1.min(pb.x - advance);
+                        row.2 = row.2.max(pb.x);
+                    }
+                }
+                for (y, x0, x1) in rows {
+                    if x1 > x0 {
+                        frags.push((y, x0, x1));
+                    }
+                }
+            }
+            if frags.is_empty() {
+                continue;
+            }
+            // Drop zero-width wrap artifacts (a boundary belonging to both
+            // rows carries no glyphs) *before* assigning edge styles, so
+            // first/last corners land on real fragments.
+            let mut kept: Vec<(Pixels, Pixels, Pixels)> = frags
+                .iter()
+                .filter(|(_, x0, x1)| *x1 - *x0 >= px(1.))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                // Lone sub-pixel fragment still deserves its pill.
+                if let Some(widest) = frags
+                    .iter()
+                    .max_by(|(_, a0, a1), (_, b0, b1)| {
+                        (*a1 - *a0)
+                            .partial_cmp(&(*b1 - *b0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .cloned()
+                {
+                    kept.push(widest);
+                }
+            }
+            let m = kept.len();
+            for (i, (y, x0, x1)) in kept.iter().enumerate() {
+                let first = i == 0;
+                let last = i + 1 == m;
+                // Interior edges sit at row ends: line-start side takes the
+                // full wash (margin is free), line-end side stays tight
+                // (the row is full; avoids viewport overflow).
+                let pad_l = if first { pad_l_first } else { full_pad_x };
+                let pad_r = if last { pad_r_last } else { tight_pad_x };
+                let corners = if first && last {
+                    all_round
+                } else if first {
+                    left_round
+                } else if last {
+                    right_round
+                } else {
+                    square
+                };
+                paint_seg(*x0, *x1, *y, pad_l, pad_r, corners, window);
+            }
         }
     }
 }
@@ -419,6 +654,7 @@ pub fn edit_text<V: EntityInputHandler>(
     caret_local: Option<usize>,
     block_caret: bool,
     wrap: bool,
+    fit_content: bool,
     ime: bool,
     p: &Palette,
     placeholder: Option<&str>,
@@ -527,15 +763,28 @@ pub fn edit_text<V: EntityInputHandler>(
         layout: layout.clone(),
     });
     let color = p.primary;
-    // Tint toward text so the pill reads on any theme, even when
-    // `background_element` is near-identical to the editor background.
-    let pill_color = p.background_element.blend(p.markdown_text.opacity(0.12));
+    // GitHub-like pill: neutral wash behind the mono text. Dark needs a
+    // stronger lift to read on near-black; light needs only a whisper.
+    let wash_opacity = match p.appearance {
+        crate::theme::Appearance::Dark => 0.20,
+        crate::theme::Appearance::Light => 0.09,
+    };
+    let pill_color = p
+        .background_element
+        .blend(p.markdown_text.opacity(wash_opacity));
     let click_empty = empty;
     div()
         .id(("edit", display_start))
         .relative()
-        .w_full()
-        .min_w_0()
+        .when(!fit_content, |el| el.w_full().min_w_0())
+        .when(fit_content, |el| {
+            el.flex_none()
+                .w_auto()
+                .min_w_full()
+                // Trailing clearance so the last columns scroll past the
+                // floating lang/copy pill instead of hiding under it.
+                .pr(px(112.))
+        })
         .when_some(font_family, |el, fam| el.font_family(fam))
         .when_some(font_px, |el, sz| el.text_size(sz))
         .when(heading, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
@@ -546,6 +795,8 @@ pub fn edit_text<V: EntityInputHandler>(
                 layout: layout.clone(),
                 ranges: code_ranges,
                 color: pill_color,
+                font_size: font_px.unwrap_or(px(14.)),
+                text: shown.clone(),
             })
         })
         .child(styled)
@@ -608,6 +859,23 @@ fn layout_bounds(layout: &TextLayout) -> Option<Bounds<Pixels>> {
 
 fn layout_len(layout: &TextLayout) -> Option<usize> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.len())).ok()
+}
+
+/// Find (or open) the pill fragment for visual row `y`. Rows arrive in
+/// ascending y, so this is usually the tail — linear scan as fallback.
+fn row_for(
+    rows: &mut Vec<(Pixels, Pixels, Pixels)>,
+    y: Pixels,
+) -> &mut (Pixels, Pixels, Pixels) {
+    if let Some(i) = rows
+        .iter()
+        .position(|(gy, _, _)| (*gy - y).abs() < px(0.5))
+    {
+        return &mut rows[i];
+    }
+    rows.push((y, px(f32::MAX), px(f32::MIN)));
+    let n = rows.len();
+    &mut rows[n - 1]
 }
 
 pub fn index_for_click(layout: &TextLayout, position: Point<Pixels>) -> usize {
@@ -700,8 +968,7 @@ pub fn caret_screen_y(hits: &[Hit], display: usize) -> Option<(Pixels, Pixels)> 
     fallback.and_then(|hit| caret_y(hit, display))
 }
 
-fn caret_y(hit: &Hit, display: usize) -> Option<(Pixels, Pixels)> {
-    let len = layout_len(&hit.layout)?;
+fn caret_y(hit: &Hit, display: usize) -> Option<(Pixels, Pixels)> {    let len = layout_len(&hit.layout)?;
     let local = display.saturating_sub(hit.display_start).min(len);
     let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hit.layout.position_for_index(local)
@@ -711,6 +978,33 @@ fn caret_y(hit: &Hit, display: usize) -> Option<(Pixels, Pixels)> {
     let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.line_height()))
         .unwrap_or(px(16.));
     Some((pos.y, h))
+}
+
+/// Window-space X of the caret, after text layouts have been prepainted into
+/// `hits`. Used to reveal the caret inside horizontal code scrollers.
+pub fn caret_screen_x(hits: &[Hit], display: usize) -> Option<Pixels> {
+    let mut fallback: Option<&Hit> = None;
+    for hit in hits {
+        if display < hit.display_start {
+            break;
+        }
+        fallback = Some(hit);
+        if display <= hit.display_start + hit.doc_len {
+            return caret_x(hit, display);
+        }
+    }
+    fallback.and_then(|hit| caret_x(hit, display))
+}
+
+fn caret_x(hit: &Hit, display: usize) -> Option<Pixels> {
+    let len = layout_len(&hit.layout)?;
+    let local = display.saturating_sub(hit.display_start).min(len);
+    let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hit.layout.position_for_index(local)
+    }))
+    .ok()
+    .flatten()?;
+    Some(pos.x)
 }
 
 #[cfg(test)]

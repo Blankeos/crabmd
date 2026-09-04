@@ -21,6 +21,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
+    scroll::ScrollableMask,
     switch::Switch,
     v_flex, Icon, Sizable as _, Theme, ThemeMode, ThemeTokens,
 };
@@ -525,7 +526,6 @@ pub struct Workspace {
     /// Preferred screen X for vertical caret motion (sticky column). Cleared
     /// on horizontal moves / clicks.
     goal_x: Option<Pixels>,
-    titlebar_moving: bool,
     mouse_anchor: Option<usize>,
     /// Initial word/line unit from a multi-click, used while dragging.
     mouse_unit: Option<Range<usize>>,
@@ -541,6 +541,12 @@ pub struct Workspace {
     /// Copy-button flash per code block, keyed by block display start
     /// with the click time. Shows a check ~1.2s, then reverts to copy.
     code_copied: std::collections::HashMap<usize, std::time::Instant>,
+    /// Horizontal scroll state per fenced code block, keyed by block
+    /// display start. Persisted across frames so wheel/drag/caret nudges
+    /// don't reset on every keystroke.
+    code_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// Keys touched this frame (prune stale `code_scroll` entries).
+    code_scroll_seen: Vec<usize>,
     loading: bool,
     fonts: FontInputs,
     /// Read-only display of the current theme (picked via the palette).
@@ -643,7 +649,6 @@ impl Workspace {
             follow_caret: true,
             surface_h: px(0.),
             goal_x: None,
-            titlebar_moving: false,
             mouse_anchor: None,
             mouse_unit: None,
             mouse_dragging: false,
@@ -654,6 +659,8 @@ impl Workspace {
             block_drag_gap: None,
             block_menu: None,
             code_copied: std::collections::HashMap::new(),
+            code_scroll: std::collections::HashMap::new(),
+            code_scroll_seen: Vec::new(),
             loading: false,
             fonts,
             theme_input,
@@ -971,6 +978,83 @@ impl Workspace {
         }
         if changed {
             self.scroll_handle.set_offset(offset);
+            cx.notify();
+        }
+        // Horizontal reveal for fenced code blocks, which own an x-scroller.
+        // Arrow-key caret motion sets `follow_caret`, so walking past either
+        // edge pulls the viewport along (right edge keeps clearance for the
+        // floating lang/copy pill).
+        let p = self.proj();
+        let in_code = p.blocks.iter().find(|b| {
+            matches!(b.extra, BlockExtra::Code { .. })
+                && d >= b.display.start
+                && d <= b.display.end
+        });
+        if let Some(b) = in_code {
+            let key = b.display.start;
+            if let Some(handle) = self.code_scroll.get(&key).cloned() {
+                let viewport = handle.bounds();
+                if viewport.size.width > px(0.) {
+                    if let Some(caret_x) = surface::caret_screen_x(&self.hits, d) {
+                        let mut offset = handle.offset();
+                        let left_pad = px(4.);
+                        let right_pad = px(112.);
+                        let mut hx = false;
+                        if caret_x > viewport.right() - right_pad {
+                            offset.x -= caret_x - (viewport.right() - right_pad);
+                            hx = true;
+                        } else if caret_x < viewport.left() + left_pad {
+                            offset.x += viewport.left() + left_pad - caret_x;
+                            hx = true;
+                        }
+                        if hx {
+                            handle.set_offset(offset);
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nudge a code block's x-scroller while drag-selecting past its edges.
+    /// Fires on mouse-move over the block's scroll viewport; stationary holds
+    /// don't repeat (no timer) — moving further re-fires.
+    fn autoscroll_code_x(
+        &mut self,
+        key: usize,
+        range: Range<usize>,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mouse_dragging {
+            return;
+        }
+        let d = self.sel.as_ref().map(|s| s.end).unwrap_or(self.caret);
+        if d < range.start || d > range.end {
+            return;
+        }
+        let Some(handle) = self.code_scroll.get(&key).cloned() else {
+            return;
+        };
+        let viewport = handle.bounds();
+        if viewport.size.width <= px(0.) {
+            return;
+        }
+        let offset = handle.offset();
+        let max_x = handle.max_offset().x.max(px(0.));
+        let margin = px(32.);
+        let step = px(32.);
+        let mut nx = offset.x;
+        if x > viewport.right() - margin {
+            nx = (offset.x - step).max(-max_x);
+        } else if x < viewport.left() + margin {
+            nx = (offset.x + step).min(px(0.));
+        } else {
+            return;
+        }
+        if nx != offset.x {
+            handle.set_offset(gpui::Point { x: nx, y: offset.y });
             cx.notify();
         }
     }
@@ -3031,6 +3115,23 @@ impl Workspace {
     fn open_themes_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_palette(PaletteMode::Themes, window, cx);
     }
+    /// `cmd-k cmd-t` races the Workspace `cmd-t` → NewTab binding (keymap
+    /// dispatch runs before the editor capture handler), so `WorkspaceShell`
+    /// asks the active tab first: consume a pending `cmd-k` chord and open
+    /// Themes instead of a new tab. Returns true when consumed.
+    pub(crate) fn consume_chord_for_new_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.pending_chord {
+            return false;
+        }
+        self.pending_chord = false;
+        window.prevent_default();
+        self.open_themes_picker(window, cx);
+        true
+    }
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
@@ -4250,75 +4351,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let p = self.palette.clone();
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("untitled")
-            .to_string();
-        let dirty = self.dirty;
-        let inset = if cfg!(target_os = "macos") {
-            px(80.)
-        } else {
-            px(12.)
-        };
-        h_flex()
-            .id("titlebar")
-            .w_full()
-            .h(px(36.))
-            .pl(inset)
-            .pr_3()
-            .items_center()
-            .font_family(self.config.ui_font.family.clone())
-            .text_size(self.ui_font_px())
-            .bg(p.background_panel)
-            .border_b_1()
-            .border_color(p.border)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.titlebar_moving = true;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.titlebar_moving = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, _, window, _cx| {
-                if this.titlebar_moving {
-                    this.titlebar_moving = false;
-                    window.start_window_move();
-                }
-            }))
-            .on_click(|ev, window, _| {
-                if ev.click_count() == 2 {
-                    window.titlebar_double_click();
-                }
-            })
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(p.markdown_text)
-                            .child(file_name),
-                    )
-                    .when(dirty, |el| {
-                        el.child(div().w(px(7.)).h(px(7.)).rounded_full().bg(p.primary))
-                    }),
-            )
-            .into_any_element()
-    }
-
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette.clone();
         let pane = self.settings_pane;
@@ -4571,6 +4603,8 @@ impl Workspace {
                         )
                         .child(
                             Button::new("theme-browse")
+                                .small()
+                                .h_8()
                                 .label("Choose…")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.settings_open = false;
@@ -4786,7 +4820,7 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .py_4()
+                            .pt_4()
                             .gap_2()
                             .child(
                                 h_flex().w_full().min_w_0().px_5().justify_end().child(
@@ -4807,6 +4841,7 @@ impl Workspace {
                                     .min_h(px(0.))
                                     .w_full()
                                     .px_5()
+                                    .pb_4()
                                     .overflow_y_scrollbar()
                                     .overflow_x_hidden()
                                     .child(content),
@@ -5009,6 +5044,7 @@ impl Workspace {
         heading_level: Option<u8>,
         placeholder: Option<&str>,
         wrap: bool,
+        fit_content: bool,
         syntax_lang: Option<&str>,
         _mono: bool,
         cx: &mut Context<Self>,
@@ -5113,6 +5149,7 @@ impl Workspace {
             local_caret,
             block_caret,
             wrap,
+            fit_content,
             ime,
             &pal,
             placeholder,
@@ -5184,6 +5221,7 @@ impl Workspace {
             heading_level,
             placeholder,
             wrap && !matches!(block.kind, BlockKind::Code | BlockKind::Html),
+            is_code,
             syntax_lang,
             is_code,
             cx,
@@ -5238,6 +5276,14 @@ impl Workspace {
                 let caret = self.caret;
                 let family = self.config.buffer_font.family.clone();
                 let mermaid = lang.eq_ignore_ascii_case("mermaid");
+                let code_key = block.display.start;
+                let code_range = block.display.clone();
+                let handle = self
+                    .code_scroll
+                    .entry(code_key)
+                    .or_insert_with(ScrollHandle::new)
+                    .clone();
+                self.code_scroll_seen.push(code_key);
                 v_flex()
                     .relative()
                     .w_full()
@@ -5254,12 +5300,37 @@ impl Workspace {
                     // translucent pill so code shows through.
                     .when(mermaid, |el| el.child(self.render_mermaid(&text, cx)))
                     .child(
-                        div()
-                            .id(("code-scroll", block.display.start))
-                            .w_full()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .child(body),
+                        // `overflow_x_scroll` only scrolls when the container
+                        // is a flex container: the default `Display::Block`
+                        // child fills the parent width instead of overflowing.
+                        // `.flex()` (not just `.flex_row()`, which only sets
+                        // direction) plus `flex_none()` on the inner lets it
+                        // take its natural unwrapped width. Same pattern as
+                        // Zed's markdown code blocks.
+                        // The `ScrollableMask` sibling owns wheel input in the
+                        // capture phase: horizontal-dominant gestures scroll
+                        // here AND stop propagation, so the page never moves
+                        // vertically mid-swipe. Vertical-dominant gestures
+                        // pass through to the page untouched.
+                        div().w_full().relative()
+                            .child(
+                                div()
+                                    .id(("code-scroll", code_key))
+                                    .flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_x_scroll()
+                                    .restrict_scroll_to_axis()
+                                    .track_scroll(&handle)
+                                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                                        this.autoscroll_code_x(code_key, code_range.clone(), ev.position.x, cx);
+                                    }))
+                                    .child(div().flex_none().child(body)),
+                            )
+                            .child(
+                                ScrollableMask::new(gpui::Axis::Horizontal, &handle)
+                                    .id(("code-scroll-mask", code_key)),
+                            ),
                     )
                     .child(
                         div()
@@ -7017,6 +7088,7 @@ impl Workspace {
                     None,
                     None,
                     wrap,
+                    false,
                     None,
                     false,
                     cx,
@@ -7126,12 +7198,12 @@ impl Workspace {
                         let saved_sel = if table_sel.is_some_and(|t| t.is_multi()) {
                             let s = self.sel.take();
                             let edit = self.render_edit(
-                                disp, &text, header, None, None, wrap, None, false, cx,
+                                disp, &text, header, None, None, wrap, false, None, false, cx,
                             );
                             self.sel = s;
                             edit
                         } else {
-                            self.render_edit(disp, &text, header, None, None, wrap, None, false, cx)
+                            self.render_edit(disp, &text, header, None, None, wrap, false, None, false, cx)
                         };
                         let edit = saved_sel;
                         let show_tools = tools_at == Some((r, c));
@@ -8324,6 +8396,7 @@ impl Workspace {
             false,
             src_wrap,
             false,
+            false,
             &pal,
             Some(""),
             family,
@@ -8358,6 +8431,7 @@ impl Workspace {
             self.block_menu = None;
         }
         self.hits.clear();
+        self.code_scroll_seen.clear();
         let full_width = self.config.full_width;
         let p = self.proj();
         let us = wysiwyg::units(&p);
@@ -8493,6 +8567,8 @@ impl Workspace {
                     .into_any_element(),
             );
         }
+        let seen = std::mem::take(&mut self.code_scroll_seen);
+        self.code_scroll.retain(|k, _| seen.contains(k));
         kids
     }
 
@@ -8755,6 +8831,7 @@ impl Workspace {
             None,
             None,
             wrap,
+            false,
             None,
             false,
             cx,
@@ -9938,7 +10015,6 @@ impl Render for Workspace {
             .font_family(self.config.markdown_font.family.clone())
             .text_size(self.markdown_font_px())
             .text_color(p.markdown_text)
-            .child(self.render_titlebar(cx))
             .child(
                 // Positioned wrapper owns the layout slot; the scrollbar
                 // overlay is a sibling of the tracked scroll div (same as

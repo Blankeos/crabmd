@@ -267,6 +267,14 @@ impl WorkspaceShell {
     }
 
     fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        // `cmd-k cmd-t` must open Themes, not a new tab. `cmd-t` keymap
+        // dispatch beats the editor capture handler, so consume a pending
+        // `cmd-k` chord on the active tab first.
+        if let Some(tab) = self.tabs.get(self.active).cloned() {
+            if tab.update(cx, |ws, cx| ws.consume_chord_for_new_tab(window, cx)) {
+                return;
+            }
+        }
         self.new_tab(window, cx);
     }
 
@@ -299,7 +307,7 @@ impl WorkspaceShell {
             .pl(inset)
             .pr_2()
             .gap_1()
-            .items_center()
+            .items_stretch()
             .flex_shrink_0()
             .overflow_hidden()
             .font_family(self.config.ui_font.family.clone())
@@ -338,11 +346,10 @@ impl WorkspaceShell {
                 let active = ix == self.active;
                 h_flex()
                     .id(("tab", ix))
-                    .px_2()
-                    .py_1()
+                    .h_full()
+                    .px_3()
                     .gap_1()
                     .items_center()
-                    .rounded(px(6.))
                     .cursor_pointer()
                     .when(active, |el| el.bg(p.background_element))
                     .hover(|el| el.bg(p.background_element.opacity(0.6)))
@@ -384,9 +391,11 @@ impl WorkspaceShell {
             .child(
                 div()
                     .id("new-tab")
+                    .h_full()
                     .px_2()
-                    .py_1()
-                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .cursor_pointer()
                     .text_xs()
                     .text_color(p.text_muted)
