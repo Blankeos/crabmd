@@ -5,15 +5,19 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     actions, canvas, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb,
-    AnyElement,
+    svg,
+    AnyElement, Animation, AnimationExt as _, ElementId,
     App, AppContext as _, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DragMoveEvent, Empty, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
     SharedUri, StatefulInteractiveElement as _, Styled, UTF16Selection, Window,
+    Transformation,
+    ease_in_out, radians,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -6631,9 +6635,33 @@ impl Workspace {
         let pal = self.palette.clone();
         let block = p.blocks[ix].clone();
         let collapsed = self.is_details_collapsed(&block);
-        let chev = if collapsed { "▸" } else { "▾" };
         let view = cx.entity();
         let src_start = block.source.start;
+        // Notion-style: one chevron-down glyph, rotated -90° when collapsed.
+        // The animation id folds in `collapsed` so every toggle remounts and
+        // replays the rotation (one-shot `with_animation` runs on mount).
+        let (from, to) = if collapsed {
+            (0.0, -std::f32::consts::FRAC_PI_2)
+        } else {
+            (-std::f32::consts::FRAC_PI_2, 0.0)
+        };
+        let chev = svg()
+            .path(crate::assets::path("chevron-down"))
+            .size(px(10.))
+            .text_color(pal.text_muted)
+            .with_transformation(Transformation::rotate(radians(to)))
+            .with_animation(
+                ElementId::NamedInteger(
+                    "details-chev".into(),
+                    ((src_start as u64) << 1) | collapsed as u64,
+                ),
+                Animation::new(Duration::from_millis(180)).with_easing(ease_in_out),
+                move |el, delta| {
+                    el.with_transformation(Transformation::rotate(radians(
+                        from + (to - from) * delta,
+                    )))
+                },
+            );
         let mut el = h_flex()
             .w_full()
             .min_w_0()
