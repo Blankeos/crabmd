@@ -1,6 +1,7 @@
 mod assets;
 mod config;
 mod coords;
+mod daemon;
 mod display;
 mod document;
 mod editor;
@@ -24,8 +25,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    point, px, size, App, AppContext as _, Styled as _, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Entity, Global,
+    QuitMode, Styled as _, TitlebarOptions, WeakEntity, WindowBounds, WindowOptions,
 };
 use gpui_component::{ActiveTheme as _, Root};
 
@@ -53,15 +54,24 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
-    // Detach before any file I/O / theme load so the shell returns immediately.
     // Require a path first so a missing arg fails in the foreground.
-    if args.path.is_none() {
-        anyhow::bail!("missing file path\n\n{HELP}");
-    }
-    // Reuse behaviors (-e/-a/-r) need the single-instance daemon (next step);
-    // until then every CLI call owns its window.
-    let _ = args.behavior;
+    let raw_path = args
+        .path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing file path\n\n{HELP}"))?;
     if !args.wait {
+        // Fast path: a live daemon opens a tab (~ms) and we exit. No file
+        // I/O here so the shell returns immediately. Otherwise spawn the
+        // daemon (detached child) which owns the socket from here on.
+        let abs = absolutize(&raw_path);
+        if daemon::try_forward(
+            &abs.to_string_lossy(),
+            args.line,
+            args.col,
+            args.behavior.as_str(),
+        ) {
+            return Ok(());
+        }
         detach_and_reexec()?;
         return Ok(());
     }
@@ -140,6 +150,9 @@ fn ensure_file(path: &std::path::Path) -> Result<()> {
 fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initial: Option<(usize, usize)>) {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
+        // Stay alive with zero windows (daemon) so the next `crabmd file`
+        // forwards over the socket instead of cold-booting. cmd-q quits.
+        .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_component::init(cx);
             bind_keys(cx);
@@ -154,8 +167,88 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initi
             crate::assets::apply_dock_icon();
             crate::editor::apply_palette(&palette, cx);
 
+            cx.set_global(ShellRegistry { shells: Vec::new() });
+            // Single-instance socket. `--wait` skips listening (blocking
+            // one-shot); a lost race just opens without registering.
+            let ipc_rx = daemon::start_listener();
             open_editor_window(path, source, palette, config, initial, cx);
+            if let Some(rx) = ipc_rx {
+                cx.spawn(async move |cx| {
+                    loop {
+                        while let Ok(req) = rx.try_recv() {
+                            let _ = cx.update(|cx| handle_open(cx, req));
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(50))
+                            .await;
+                    }
+                })
+                .detach();
+            }
+            // cmd-q cleanup; a crash leaves a stale file, which the next
+            // launch detects (connect fails) and replaces.
+            let _quit_sub = cx.on_app_quit(|_| async { daemon::cleanup() });
+            std::mem::forget(_quit_sub);
         });
+}
+
+/// Live shells + their windows for single-instance routing.
+pub(crate) struct ShellRegistry {
+    pub(crate) shells: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)>,
+}
+
+impl Global for ShellRegistry {}
+
+/// Route one forwarded `crabmd <file:line:col>` into this process.
+fn handle_open(cx: &mut App, req: daemon::OpenRequest) {
+    let mut path = PathBuf::from(&req.path);
+    path = std::fs::canonicalize(&path).unwrap_or(path);
+    if ensure_file(&path).is_err() {
+        return;
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let initial = match (req.line, req.col) {
+        (Some(line), col) => Some((line, col.unwrap_or(1))),
+        (None, _) => None,
+    };
+    let live: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)> =
+        cx.update_global::<ShellRegistry, _>(|reg, _| {
+            reg.shells.retain(|(w, _)| w.upgrade().is_some());
+            reg.shells.clone()
+        });
+    let target: Option<(Entity<WorkspaceShell>, AnyWindowHandle)> = cx
+        .active_window()
+        .and_then(|a| {
+            live.iter()
+                .find(|(_, h)| h.window_id() == a.window_id())
+        })
+        .or_else(|| live.first())
+        .and_then(|(w, h)| w.upgrade().map(|s| (s, *h)));
+    match target {
+        Some((shell, handle)) if req.behavior != "new" => {
+            let _ = handle.update(cx, |_, window, cx| {
+                shell.update(cx, |s, cx| {
+                    s.open_tab(path, source, initial, window, cx);
+                });
+                window.activate_window();
+            });
+            cx.activate(true);
+        }
+        // `-n`, or no live window: new window, same process (no re-exec).
+        _ => {
+            let config = config::load();
+            let palette = match theme::load_named(&config.theme) {
+                Ok(p) => p,
+                Err(_) => match theme::load_named(theme::DEFAULT_THEME) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                },
+            };
+            open_editor_window(path, source, palette, config, initial, cx);
+        }
+    }
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {
@@ -211,16 +304,26 @@ struct Args {
     col: Option<usize>,
 }
 
-/// Zed-style open behavior. Today every CLI call owns its window, so all
-/// variants open here; `-e`/`-a`/`-r` gain their reuse meaning with the
-/// single-instance daemon (next step).
+/// Zed-style open behavior. The default reuses the running window (fast
+/// tab); `-n` forces a new window in the same process.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum OpenBehavior {
-    #[default]
     New,
+    #[default]
     Existing,
     Add,
     Reuse,
+}
+
+impl OpenBehavior {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Existing => "existing",
+            Self::Add => "add",
+            Self::Reuse => "reuse",
+        }
+    }
 }
 
 impl Args {
@@ -282,6 +385,18 @@ impl Args {
     }
 }
 
+/// Make `path` absolute without touching the filesystem (the daemon does
+/// `ensure_file` + read, so the fast CLI path stays pure).
+fn absolutize(path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 /// Split zed-style `file.md:line:col` (or `file.md:line`) into its parts.
 /// Trailing `:digits` suffixes are treated as line/column; anything else is
 /// kept verbatim as the file path (so `a:b.md:4` -> `a:b.md` line 4, while
@@ -326,13 +441,17 @@ Usage:
 
 If <file.md> does not exist, an empty markdown file is created.
 
+Single instance (zed-style): the first call owns the process (one dock
+icon); later calls forward over a socket and exit in ~ms. Default opens a
+tab in the running window; -n opens a new window in the same process.
+
 Flags:
   -w, --wait     Block the terminal until the window closes (default: detach)
   -t, --theme    Theme name (see --list-themes)
-  -n, --new      New window (default; every CLI call owns its window for now)
-  -e, --existing Open in the existing window as a tab (needs daemon; opens new for now)
-  -a, --add      Add as a tab to the focused window (needs daemon; opens new for now)
-  -r, --reuse    Reuse the existing window (needs daemon; opens new for now)
+  -n, --new      New window in the running process
+  -e, --existing Open a tab in the existing window (default)
+  -a, --add      Same as -e (tab in the focused window)
+  -r, --reuse    Same as -e (reuses the window, no new process)
   -h, --help     Show this help
 
 Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
@@ -343,6 +462,8 @@ Keys (Helix / Vim normal — tabbed buffers):
   cmd-t         new tab (untitled)
   cmd-w         close tab (prompts when dirty)
   cmd-shift-n   new window
+  cmd-shift-w   close window (prompts when any tab is dirty)
+  cmd-q         quit the app (prompts per window, removes the socket)
   cmd/ctrl-s    save (explicit write; no autosave)
   cmd-shift-p   command palette (theme, editor, full width, source)
   cmd-k t       theme picker (zed-style chord; cmd may stay held for t)

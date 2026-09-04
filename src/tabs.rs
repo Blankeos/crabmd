@@ -6,10 +6,10 @@
 use std::path::PathBuf;
 
 use gpui::{
-    actions, div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _, Context,
-    Entity, Focusable as _, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, ParentElement as _, PromptLevel, Render, StatefulInteractiveElement as _,
-    Styled as _, Window,
+    actions, div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext as _,
+    BorrowAppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, ParentElement as _, PromptLevel, Render,
+    StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{h_flex, v_flex};
 
@@ -17,7 +17,10 @@ use crate::config::Config;
 use crate::editor::Workspace;
 use crate::theme::Palette;
 
-actions!(crabmd, [NextTab, PrevTab, CloseTab, NewTab, NewWindow]);
+actions!(
+    crabmd,
+    [NextTab, PrevTab, CloseTab, NewTab, NewWindow, CloseWindow]
+);
 
 pub fn bind_tab_keys(cx: &mut App) {
     cx.bind_keys([
@@ -28,6 +31,8 @@ pub fn bind_tab_keys(cx: &mut App) {
         KeyBinding::new("cmd-t", NewTab, Some("Workspace")),
         KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
         KeyBinding::new("cmd-shift-n", NewWindow, Some("Workspace")),
+        KeyBinding::new("cmd-shift-w", CloseWindow, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-w", CloseWindow, Some("Workspace")),
     ]);
 }
 
@@ -65,8 +70,13 @@ impl WorkspaceShell {
             config,
             titlebar_moving: false,
         });
-        // Shell-level guard: with several tabs, per-workspace hooks alone may
-        // only cover the last tab, so confirm here across all dirty tabs.
+        // Register for single-instance routing (`crabmd -r file` finds us).
+        cx.update_global::<crate::ShellRegistry, _>(|reg, _| {
+            reg.shells
+                .push((shell.downgrade(), window.window_handle()));
+        });
+        // Single close guard per window (covers all tabs). Workspaces no
+        // longer register their own hook, so exactly one prompt fires.
         let closer = shell.clone();
         window.on_window_should_close(cx, move |window, cx| {
             closer.update(cx, |this, cx| this.request_window_close(window, cx))
@@ -264,6 +274,17 @@ impl WorkspaceShell {
         self.new_window(cx);
     }
 
+    /// cmd-shift-w: close the current OS window. The should-close guard
+    /// prompts first when any tab is dirty.
+    fn on_close_window(
+        &mut self,
+        _: &CloseWindow,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.remove_window();
+    }
+
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.palette.clone();
         let inset = if cfg!(target_os = "macos") {
@@ -396,6 +417,7 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_new_window))
+            .on_action(cx.listener(Self::on_close_window))
             .child(self.render_tab_bar(cx))
             .child(active)
     }

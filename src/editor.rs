@@ -538,6 +538,9 @@ pub struct Workspace {
     block_dragging: Option<usize>,
     block_drag_gap: Option<usize>,
     block_menu: Option<usize>,
+    /// Copy-button flash per code block, keyed by block display start
+    /// with the click time. Shows a check ~1.2s, then reverts to copy.
+    code_copied: std::collections::HashMap<usize, std::time::Instant>,
     loading: bool,
     fonts: FontInputs,
     /// Read-only display of the current theme (picked via the palette).
@@ -650,6 +653,7 @@ impl Workspace {
             block_dragging: None,
             block_drag_gap: None,
             block_menu: None,
+            code_copied: std::collections::HashMap::new(),
             loading: false,
             fonts,
             theme_input,
@@ -683,10 +687,8 @@ impl Workspace {
             this.mode = Mode::Normal;
             this.refresh_raw(window, cx);
         }
-        let entity = cx.entity();
-        window.on_window_should_close(cx, move |window, cx| {
-            entity.update(cx, |this, cx| this.request_quit(window, cx))
-        });
+        // Window-close guard lives on the tab shell (one prompt for all
+        // tabs); no per-workspace hook here.
         this
     }
 
@@ -818,40 +820,6 @@ impl Workspace {
     fn refresh_dirty(&mut self) {
         self.dirty = self.source != self.clean_source;
         self.status = if self.dirty { "unsaved" } else { "ready" }.into();
-    }
-
-    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.dirty {
-            return true;
-        }
-        let prompt = window.prompt(
-            PromptLevel::Warning,
-            "Unsaved changes",
-            Some("Save before quitting?"),
-            &["Save", "Don't Save", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(answer) = prompt.await else {
-                return;
-            };
-            this.update_in(cx, |this, window, cx| match answer {
-                0 => {
-                    if this.write_to_disk(cx) {
-                        this.sync_title(window);
-                        cx.quit();
-                    }
-                }
-                1 => {
-                    this.dirty = false;
-                    cx.quit();
-                }
-                _ => {}
-            })
-            .ok();
-        })
-        .detach();
-        false
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -5271,19 +5239,52 @@ impl Workspace {
                 let family = self.config.buffer_font.family.clone();
                 let mermaid = lang.eq_ignore_ascii_case("mermaid");
                 v_flex()
+                    .relative()
                     .w_full()
                     .min_w_0()
                     .rounded(px(6.))
                     .bg(pal.background_element)
                     .px_3()
                     .py_2()
-                    .gap_1()
                     .font_family(family)
                     .text_size(self.buffer_font_px())
                     .text_color(pal.markdown_code_block)
-                    .child(self.render_lang_chip(lang, caret, cx))
+                    // Floating picker: painted last so it stays
+                    // clickable above the scroll body, with a
+                    // translucent pill so code shows through.
                     .when(mermaid, |el| el.child(self.render_mermaid(&text, cx)))
-                    .child(body)
+                    .child(
+                        div()
+                            .id(("code-scroll", block.display.start))
+                            .w_full()
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .child(body),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .right(px(6.))
+                            .rounded(px(4.))
+                            .bg(pal.background.opacity(0.65))
+                            // Swallow clicks so they hit the buttons
+                            // instead of focusing the code below.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.render_lang_chip(lang, caret, cx))
+                                    .child(self.render_copy_btn(
+                                        block.display.start,
+                                        text.clone(),
+                                        cx,
+                                    )),
+                            ),
+                    )
                     .into_any_element()
             }
             BlockExtra::Rule => div()
@@ -6929,6 +6930,49 @@ impl Workspace {
                     menu
                 }
             })
+            .into_any_element()
+    }
+
+    /// GitHub-style copy button for a code block. Copies the block body,
+    /// flashes a check ~1.2s, then reverts to the copy icon.
+    fn render_copy_btn(&self, key: usize, code: String, cx: &mut Context<Self>) -> AnyElement {
+        use std::time::{Duration, Instant};
+        let pal = self.palette.clone();
+        let copied = self
+            .code_copied
+            .get(&key)
+            .map(|t| t.elapsed() < Duration::from_millis(1500))
+            .unwrap_or(false);
+        Button::new(("copy", key))
+            .ghost()
+            .xsmall()
+            .icon(icon_el(
+                if copied { "check" } else { "copy" },
+                if copied { pal.success } else { pal.text_muted },
+            ))
+            .tooltip(if copied { "Copied!" } else { "Copy code" })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                let stamp = Instant::now();
+                this.code_copied.insert(key, stamp);
+                cx.notify();
+                // Revert the flash unless a newer click superseded it.
+                let view = cx.entity();
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(1200))
+                        .await;
+                    let _ = cx.update(|cx| {
+                        view.update(cx, |this, cx| {
+                            if this.code_copied.get(&key) == Some(&stamp) {
+                                this.code_copied.remove(&key);
+                                cx.notify();
+                            }
+                        })
+                    });
+                })
+                .detach();
+            }))
             .into_any_element()
     }
 
@@ -9450,7 +9494,10 @@ pub fn apply_palette(palette: &Palette, cx: &mut App) {
         theme.foreground = palette.markdown_text;
         theme.primary = palette.primary;
         theme.primary_foreground = palette.background;
-        theme.accent = palette.accent;
+        // Softened menu/hover tint: full-strength `accent` (often a
+        // loud pink) overwhelms popover rows, so wash it down.
+        // Foreground stays body text for readability.
+        theme.accent = palette.accent.opacity(0.28);
         theme.accent_foreground = palette.markdown_text;
         theme.secondary = palette.background_element;
         theme.secondary_foreground = palette.markdown_text;
@@ -9841,10 +9888,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_auto_indent))
             .on_action(cx.listener(Self::on_change_op))
             .on_action(cx.listener(Self::on_match_object))
-            .on_action(cx.listener(|this, _: &QuitApp, window, cx| {
-                if this.request_quit(window, cx) {
-                    cx.quit();
-                }
+            .on_action(cx.listener(|_, _: &QuitApp, _, cx| {
+                // Quit the whole app (all windows). Each window's shell
+                // close-guard prompts first when tabs are dirty.
+                cx.quit();
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 if this.handle_capture_key(ev, window, cx) {

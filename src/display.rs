@@ -1113,10 +1113,48 @@ fn project_inlines(
     let mut skip_alert_label = matches!(r.kind, BlockKind::Alert(_));
     let mut skip_alert_break = false;
     let mut after_item = false;
+    let container_breaks = matches!(r.kind, BlockKind::Alert(_) | BlockKind::Quote);
+    let block_d0 = display.len();
+    let mut pending_para_break = false;
 
     for (event, range) in parser {
         let abs = r.range.start + range.start..r.range.start + range.end;
         match event {
+            Event::Start(Tag::Paragraph) => {
+                if pending_para_break {
+                    pending_para_break = false;
+                    if skip_alert_break {
+                        skip_alert_break = false;
+                    } else if display.len() > block_d0 && !display.ends_with("\n\n") {
+                        // Paragraph gap inside quote/alert: blank line between
+                        // blocks, matching GitHub (each blank-line chunk is its
+                        // own <p>). Map it to the inter-paragraph source gap.
+                        if display.ends_with('\n') {
+                            let d0 = display.len();
+                            display.push('\n');
+                            segments.push(Segment {
+                                display: d0..display.len(),
+                                source: abs.start..abs.start,
+                                marks: Marks::default(),
+                            });
+                        } else {
+                            let d0 = display.len();
+                            display.push_str("\n\n");
+                            segments.push(Segment {
+                                display: d0..display.len(),
+                                source: abs.start..abs.start,
+                                marks: Marks::default(),
+                            });
+                        }
+                    }
+                }
+                skip_alert_label = false;
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if container_breaks {
+                    pending_para_break = true;
+                }
+            }
             Event::Start(Tag::List(_)) => {
                 saw_list = true;
                 if let Some(open) = stack.last_mut() {
@@ -1708,6 +1746,17 @@ mod tests {
         assert_eq!(p.display, "something ");
         let p = project("1. something ");
         assert_eq!(p.display, "something ");
+    }
+
+    #[test]
+    fn alert_preserves_paragraph_breaks() {
+        let src = "> [!IMPORTANT]\n> para one\n>\n> para two\n>\n> para three";
+        let p = project(src);
+        let body = &p.display[p.blocks[0].display.clone()];
+        assert!(
+            body.contains("para one\n\npara two\n\npara three"),
+            "body={body:?}"
+        );
     }
 
     #[test]
