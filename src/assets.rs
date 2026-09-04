@@ -36,6 +36,38 @@ pub fn path(name: &str) -> String {
 
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
 
+/// Bundled text fonts (OFL): IBM Plex Sans (UI/prose) + JetBrains Mono
+/// (code). Registered via `cx.text_system().add_fonts` at startup so the
+/// defaults work without a system install — user `font_family` overrides in
+/// `config.toml` still resolve from system fonts as before.
+pub fn load_bundled_fonts(cx: &gpui::App) {
+    let fonts = [
+        // IBM Plex Sans (fontsource latin subset)
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-MediumItalic.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf")[..],
+        &include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-BoldItalic.ttf")[..],
+        // JetBrains Mono (official static TTFs)
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Italic.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Medium.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-MediumItalic.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-SemiBold.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-SemiBoldItalic.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf")[..],
+        &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf")[..],
+    ];
+    let fonts: Vec<Cow<'static, [u8]>> =
+        fonts.into_iter().map(|b| Cow::Borrowed(b)).collect();
+    if let Err(err) = cx.text_system().add_fonts(fonts) {
+        eprintln!("crabmd: bundled fonts failed to load: {err:#}");
+    }
+}
+
 /// X11/Wayland window icon (GPUI `WindowOptions.icon` is documented X11-only).
 pub fn window_icon() -> Option<Arc<image::RgbaImage>> {
     let img = image::load_from_memory(APP_ICON_PNG).ok()?;

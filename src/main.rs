@@ -155,6 +155,7 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initi
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             gpui_component::init(cx);
+            crate::assets::load_bundled_fonts(cx);
             bind_keys(cx);
             bind_tab_keys(cx);
             // Remote `http(s)` images (`img(SharedUri)`) download through
