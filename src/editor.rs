@@ -544,8 +544,12 @@ pub struct Workspace {
     theme_input: Entity<InputState>,
     /// Selected image/video block (display offset) with its edit toolbar.
     media_sel: Option<usize>,
-    /// Collapsed `<details>` blocks, keyed by open-row source start.
+    /// Collapsed `<details open>` blocks, keyed by open-row source start.
+    /// `<details>` without `open` is collapsed by default (GFM) — those use
+    /// `expanded_html` when the user opens them in this session.
     collapsed_html: std::collections::HashSet<usize>,
+    /// Session-expanded `<details>` (no `open` attr), keyed by source start.
+    expanded_html: std::collections::HashSet<usize>,
     media_alt: Entity<InputState>,
     media_src: Entity<InputState>,
     /// Zed-style `cmd-k` chord: armed by `cmd-k` at capture level, consumed
@@ -651,6 +655,7 @@ impl Workspace {
             theme_input,
             media_sel: None,
             collapsed_html: std::collections::HashSet::new(),
+            expanded_html: std::collections::HashSet::new(),
             media_alt,
             media_src,
             pending_chord: false,
@@ -1087,7 +1092,36 @@ impl Workspace {
             return;
         }
         let prev_caret = self.caret;
+        // Closed `<details>`: Enter (or shift-enter) must land on the block
+        // *below* the disclosure, not inside the hidden body where the caret
+        // disappears. Offset 0 keeps the normal above-insert.
+        let on_closed_details = {
+            let p = self.proj();
+            match p.block_at_display(self.caret) {
+                Some(b)
+                    if matches!(b.extra, BlockExtra::Details { .. })
+                        && self.is_details_collapsed(b)
+                        && self.caret > b.display.start =>
+                {
+                    true
+                }
+                _ => false,
+            }
+        };
         self.push_doc_undo();
+        if on_closed_details {
+            if let Some(c) = self.doc.enter_closed_details(self.caret) {
+                self.caret = c;
+                self.sync_gfm();
+                self.caret = self.caret.min(self.proj().display.len());
+                self.sel = None;
+                self.mark_dirty();
+                self.try_auto_link_preceding_url(prev_caret);
+                self.refresh(window, cx);
+                self.sync_title(window);
+                return;
+            }
+        }
         self.caret = self.doc.enter(self.caret, hard);
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
@@ -1458,6 +1492,17 @@ impl Workspace {
         self.caret = self.doc.apply_slash(self.caret, item.template);
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
+        // Fresh `<details>` starts expanded in-session so the user can fill
+        // the summary/body; the file stays without `open` (collapsed on reload
+        // per GFM) unless they add `open` in source view.
+        if item.template.contains("<details") {
+            let p = self.proj();
+            if let Some(b) = p.block_at_display(self.caret) {
+                if matches!(b.extra, BlockExtra::Details { .. }) {
+                    self.expanded_html.insert(b.source.start);
+                }
+            }
+        }
         self.slash_index = 0;
         self.last_slash_query.clear();
         self.mark_dirty();
@@ -3392,6 +3437,52 @@ impl Workspace {
         window.set_window_title(&window_title(&self.path, self.dirty));
     }
 
+    /// Tab-shell accessors (multi-buffer UI in `crate::tabs`).
+    pub fn file_path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn tab_title(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
+        self.write_to_disk(cx)
+    }
+
+    pub fn sync_title_now(&self, window: &mut Window) {
+        self.sync_title(window);
+    }
+
+    /// Zed-style jump for an already-open tab.
+    pub fn jump_to(
+        &mut self,
+        line: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let src = source_offset_for_line_col(&self.source, line, col);
+        let d = self.proj().to_display(src);
+        self.caret = d.min(self.proj().display.len());
+        self.sel = None;
+        if !self.config.editor.is_modal() {
+            self.enter_insert(Caret::Offset(self.caret), window, cx);
+        } else {
+            self.mode = Mode::Normal;
+            self.refresh(window, cx);
+        }
+        self.sync_title(window);
+    }
+
     fn toggle_task(
         &mut self,
         block_ix: usize,
@@ -5095,7 +5186,11 @@ impl Workspace {
             d >= block.display.start && d <= block.display.end
         };
         // Only show the empty-block hint on the focused row (less noisy).
-        let placeholder = if empty && caret_here {
+        // `<details>` gets a "Summary" hint so `/details` inserts an empty
+        // summary the user can fill in (no baked-in "Summary" text).
+        let placeholder = if empty && matches!(block.extra, BlockExtra::Details { .. }) {
+            Some("Summary")
+        } else if empty && caret_here {
             Some("Type to write, or / for blocks")
         } else {
             None
@@ -5111,7 +5206,7 @@ impl Workspace {
         };
         let is_code = matches!(block.kind, BlockKind::Code);
         let syntax_lang = match &block.extra {
-            BlockExtra::Code { lang } if !lang.is_empty() => Some(lang.as_str()),
+            BlockExtra::Code { lang, .. } if !lang.is_empty() => Some(lang.as_str()),
             _ => None,
         };
         let body = self.render_edit(
@@ -5171,7 +5266,7 @@ impl Workspace {
                 .px_3()
                 .child(body)
                 .into_any_element(),
-            BlockExtra::Code { lang } => {
+            BlockExtra::Code { lang, .. } => {
                 let caret = self.caret;
                 let family = self.config.buffer_font.family.clone();
                 let mermaid = lang.eq_ignore_ascii_case("mermaid");
@@ -6449,8 +6544,10 @@ impl Workspace {
     }
 
     /// `<details>` open row: chevron + editable summary, Notion-style.
-    /// No card — just a paragraph-like toggle row. Clicking the chevron
-    /// collapses the body blocks through `</details>`; clicking the text edits.
+    /// No card — just a paragraph-like toggle row. GFM is collapsed by
+    /// default; `<details open>` starts expanded. Clicking the chevron
+    /// toggles; clicking the text edits. `stop_propagation` keeps the
+    /// chevron click from selecting the summary (checkbox-bug parity).
     fn render_details_row(
         &mut self,
         ix: usize,
@@ -6461,7 +6558,7 @@ impl Workspace {
         let p = self.proj();
         let pal = self.palette.clone();
         let block = p.blocks[ix].clone();
-        let collapsed = self.collapsed_html.contains(&block.source.start);
+        let collapsed = self.is_details_collapsed(&block);
         let chev = if collapsed { "▸" } else { "▾" };
         let view = cx.entity();
         let src_start = block.source.start;
@@ -6483,7 +6580,8 @@ impl Workspace {
                     .rounded(px(4.))
                     .hover(|el| el.bg(pal.background_element))
                     .child(chev)
-                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
                         view.update(cx, |this, cx| {
                             this.toggle_details(src_start, cx);
                         });
@@ -6496,14 +6594,40 @@ impl Workspace {
         el.into_any_element()
     }
 
+    /// GFM default: `<details>` collapsed unless it has `open` or the user
+    /// expanded it this session; `<details open>` expanded unless collapsed.
+    fn is_details_collapsed(&self, block: &crate::display::ProjBlock) -> bool {
+        let open = matches!(&block.extra, BlockExtra::Details { open: true, .. });
+        if open {
+            self.collapsed_html.contains(&block.source.start)
+        } else {
+            !self.expanded_html.contains(&block.source.start)
+        }
+    }
+
     /// Collapse/expand a `<details>` block. Collapsing pulls the caret out
     /// of the now-hidden body onto the summary row.
     fn toggle_details(&mut self, src_start: usize, cx: &mut Context<Self>) {
-        if self.collapsed_html.remove(&src_start) {
+        let open = self
+            .proj()
+            .blocks
+            .iter()
+            .find(|b| b.source.start == src_start)
+            .map(|b| matches!(&b.extra, BlockExtra::Details { open: true, .. }))
+            .unwrap_or(false);
+        if open {
+            if self.collapsed_html.remove(&src_start) {
+                cx.notify();
+                return;
+            }
+            self.collapsed_html.insert(src_start);
+        } else if self.expanded_html.remove(&src_start) {
+            // Was expanded → collapse; pull caret onto the summary row.
+        } else {
+            self.expanded_html.insert(src_start);
             cx.notify();
             return;
         }
-        self.collapsed_html.insert(src_start);
         let p = self.proj();
         if let Some(ix) = p.blocks.iter().position(|b| b.source.start == src_start) {
             if let Some((_, end_ix)) = crate::display::details_block_range(&p, ix) {
@@ -8195,25 +8319,44 @@ impl Workspace {
         let us = wysiwyg::units(&p);
         let n = us.len();
         // Body ranges of collapsed `<details>` blocks — those rows render empty.
+        // All `<details>` ranges (for body indent); collapsed state comes
+        // from `is_details_collapsed` (GFM closed-by-default).
+        let all_details: Vec<(usize, usize)> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.extra, BlockExtra::Details { .. }))
+            .filter_map(|(ix, _)| crate::display::details_block_range(&p, ix))
+            .collect();
         let hidden: Vec<(usize, usize)> = p
             .blocks
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                matches!(b.extra, BlockExtra::Details { .. })
-                    && self.collapsed_html.contains(&b.source.start)
+                matches!(b.extra, BlockExtra::Details { .. }) && self.is_details_collapsed(b)
             })
             .filter_map(|(ix, _)| crate::display::details_block_range(&p, ix))
             .collect();
         let mut kids = Vec::new();
+        // Which rows are hidden (collapsed `<details>` bodies + `</details>`
+        // chrome). Precomputed so the loop can skip the last-visible-row
+        // margin and keep hidden rows at true zero height.
+        let gone: Vec<bool> = us
+            .iter()
+            .copied()
+            .map(|unit| {
+                matches!(p.blocks[unit.block].extra, BlockExtra::DetailsClose)
+                    || hidden
+                        .iter()
+                        .any(|(a, b)| unit.block > *a && unit.block <= *b)
+            })
+            .collect();
+        let last_visible = gone.iter().rposition(|g| !g);
         for (ui, unit) in us.iter().copied().enumerate() {
             let view = cx.entity();
             let group = SharedString::from(format!("row-{ui}"));
             let dragging = self.block_dragging == Some(ui);
-            let row_gone = matches!(p.blocks[unit.block].extra, BlockExtra::DetailsClose)
-                || hidden
-                    .iter()
-                    .any(|(a, b)| unit.block > *a && unit.block <= *b);
+            let row_gone = gone[ui];
             let content: AnyElement = if row_gone {
                 div().into_any_element()
             } else if let Some(item_ix) = unit.item {
@@ -8225,18 +8368,41 @@ impl Workspace {
             let start = disp.start;
             let end = disp.end;
             let list_item = unit.item;
+            // Anything inside `<details>…</details>` renders slightly indented
+            // (Notion-style nesting). Depth-counted so nested disclosures
+            // indent further. The open row itself stays flush.
+            let details_depth = all_details
+                .iter()
+                .filter(|(a, b)| unit.block > *a && unit.block < *b)
+                .count();
+            // Split-out nested fences keep their source fence indent as extra
+            // row padding so code under lists/details looks nested.
+            let code_indent = match &p.blocks[unit.block].extra {
+                BlockExtra::Code { indent, .. } => (*indent).min(8) as f32 * 3.0,
+                _ => 0.0,
+            };
+            let nest_extra = details_depth as f32 * 16.0 + code_indent;
             kids.push(
                 div()
                     .id(("row", ui))
                     .group(group.clone())
                     .relative()
+                    // Never compress rows to fit: they must overflow so the
+                    // scrollbar thumb reflects real content (same as slash).
+                    .flex_shrink_0()
                     .when(!full_width, |el| el.w(px(COLUMN_PX)).mx_auto())
                     .when(full_width, |el| el.w_full())
                     .max_w_full()
                     .min_w_0()
                     .px_8()
-                    .when(list_item.is_some(), |el| el.py_1())
+                    .when(nest_extra > 0.0 && !row_gone, |el| el.pl(px(32.0 + nest_extra)))
+                    .when(list_item.is_some() && !row_gone, |el| el.py_1())
                     .when(list_item.is_none() && !row_gone, |el| el.py_2())
+                    // Inter-row spacing lives here (not parent `gap_1`) so
+                    // hidden rows collapse to true zero height: a closed
+                    // `<details>` measures exactly one row. Skipped on the
+                    // last visible row (gap never trails).
+                    .when(!row_gone && Some(ui) != last_visible, |el| el.mb_1())
                     .when(dragging, |el| el.opacity(0.45))
                     .on_mouse_down(MouseButton::Left, {
                         let view = view.clone();
@@ -9727,9 +9893,24 @@ impl Render for Workspace {
             .text_color(p.markdown_text)
             .child(self.render_titlebar(cx))
             .child(
+                // Positioned wrapper owns the layout slot; the scrollbar
+                // overlay is a sibling of the tracked scroll div (same as
+                // gpui-component's `Scrollable`), so its layout bounds equal
+                // the viewport. As a child of the scroll div it would scroll
+                // with the content: thumb pinned at top, drag not following.
+                // Column flex + flex_1 child (not percentage heights) so the
+                // scroll div gets a definite viewport height and overflows.
                 v_flex()
                     .flex_1()
                     .w_full()
+                    .min_h_0()
+                    .min_w_0()
+                    .relative()
+                    .child(
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
                     .min_w_0()
                     .on_children_prepainted({
                         let view = cx.entity();
@@ -9751,7 +9932,9 @@ impl Render for Workspace {
                     .overflow_x_hidden()
                     .track_scroll(&self.scroll_handle)
                     .pt_10()
-                    .gap_1()
+                    // No `gap_1` here: inter-row spacing is per-row `mb_1`
+                    // (skipped on hidden rows) so collapsed `<details>` bodies
+                    // contribute zero height instead of one gap per hidden row.
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -9767,10 +9950,10 @@ impl Render for Workspace {
                             }
                         }),
                     )
-                    .children(self.render_surface(cx))
-                    // Scrollbar last: the overlay counts as a tracked child,
-                    // so it must not shift block indices used by
-                    // scroll_to_item / bounds_for_item (drag gaps, caret).
+                    .children(self.render_surface(cx)),
+                    )
+                    // Sibling overlay: never a tracked child, so block
+                    // indices for scroll_to_item / bounds_for_item stay clean.
                     .vertical_scrollbar(&self.scroll_handle),
             )
             .child(

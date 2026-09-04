@@ -153,7 +153,7 @@ pub const ITEMS: &[SlashItem] = &[
         keys: &["details", "disclosure", "collapsible", "summary"],
         label: "Details (collapsible)",
         hint: "<details>",
-        template: "<details>\n<summary>Summary</summary>\n\n\n</details>",
+        template: "<details>\n<summary></summary>\n\n\n</details>",
         kind: BlockKind::Html,
         icon: "list",
     },

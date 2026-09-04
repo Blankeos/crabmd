@@ -13,6 +13,7 @@ mod palette;
 mod slash;
 mod surface;
 mod syntax;
+mod tabs;
 mod theme;
 mod tree;
 mod undo;
@@ -23,12 +24,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    point, px, size, AppContext as _, Styled as _, TitlebarOptions, WindowBounds, WindowOptions,
+    point, px, size, App, AppContext as _, Styled as _, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::{ActiveTheme as _, Root};
 
 use crate::config::Config;
-use crate::editor::{bind_keys, Workspace};
+use crate::editor::bind_keys;
+use crate::tabs::{bind_tab_keys, WorkspaceShell};
 use crate::theme::Palette;
 
 fn main() {
@@ -55,6 +58,9 @@ fn run() -> Result<()> {
     if args.path.is_none() {
         anyhow::bail!("missing file path\n\n{HELP}");
     }
+    // Reuse behaviors (-e/-a/-r) need the single-instance daemon (next step);
+    // until then every CLI call owns its window.
+    let _ = args.behavior;
     if !args.wait {
         detach_and_reexec()?;
         return Ok(());
@@ -137,6 +143,7 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initi
         .run(move |cx| {
             gpui_component::init(cx);
             bind_keys(cx);
+            bind_tab_keys(cx);
             // Remote `http(s)` images (`img(SharedUri)`) download through
             // this client — without it GPUI uses a null client and every
             // remote photo silently never loads (same setup as GPUI's own
@@ -147,31 +154,47 @@ fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initi
             crate::assets::apply_dock_icon();
             crate::editor::apply_palette(&palette, cx);
 
-            let window_options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(880.), px(1000.)), cx)),
-                window_min_size: Some(size(px(520.), px(380.))),
-                titlebar: Some(TitlebarOptions {
-                    title: None,
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(9.0), px(9.0))),
-                }),
-                app_owns_titlebar_drag: true,
-                app_id: Some("ai.blankeos.crabmd".into()),
-                icon: crate::assets::window_icon(),
-                ..Default::default()
-            };
-
-            cx.activate(true);
-            cx.spawn(async move |cx| {
-                cx.open_window(window_options, |window, cx| {
-                    window.activate_window();
-                    let view = Workspace::view(path, source, palette, config, initial, window, cx);
-                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-                })
-                .expect("failed to open window");
-            })
-            .detach();
+            open_editor_window(path, source, palette, config, initial, cx);
         });
+}
+
+fn window_options(cx: &mut App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(880.), px(1000.)), cx)),
+        window_min_size: Some(size(px(520.), px(380.))),
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(9.0), px(9.0))),
+        }),
+        app_owns_titlebar_drag: true,
+        app_id: Some("ai.blankeos.crabmd".into()),
+        icon: crate::assets::window_icon(),
+        ..Default::default()
+    }
+}
+
+/// Open one OS window hosting a tab shell. Used by CLI launch, cmd-shift-n,
+/// and (next) the single-instance daemon's `-n` path.
+pub(crate) fn open_editor_window(
+    path: PathBuf,
+    source: String,
+    palette: Palette,
+    config: Config,
+    initial: Option<(usize, usize)>,
+    cx: &mut App,
+) {
+    let window_options = window_options(cx);
+    cx.activate(true);
+    cx.spawn(async move |cx| {
+        cx.open_window(window_options, |window, cx| {
+            window.activate_window();
+            let shell = WorkspaceShell::view(path, source, palette, config, initial, window, cx);
+            cx.new(|cx| Root::new(shell, window, cx).bg(cx.theme().background))
+        })
+        .expect("failed to open window");
+    })
+    .detach();
 }
 
 struct Args {
@@ -180,11 +203,24 @@ struct Args {
     theme: String,
     theme_from_cli: bool,
     wait: bool,
+    behavior: OpenBehavior,
     path: Option<PathBuf>,
     /// 1-based source line from `file.md:line[:col]` (zed-style).
     line: Option<usize>,
     /// 1-based source column from `file.md:line:col`.
     col: Option<usize>,
+}
+
+/// Zed-style open behavior. Today every CLI call owns its window, so all
+/// variants open here; `-e`/`-a`/`-r` gain their reuse meaning with the
+/// single-instance daemon (next step).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum OpenBehavior {
+    #[default]
+    New,
+    Existing,
+    Add,
+    Reuse,
 }
 
 impl Args {
@@ -194,6 +230,7 @@ impl Args {
         let mut theme = theme::DEFAULT_THEME.to_string();
         let mut theme_from_cli = false;
         let mut wait = false;
+        let mut behavior = OpenBehavior::New;
         let mut path = None;
         let mut line = None;
         let mut col = None;
@@ -203,6 +240,10 @@ impl Args {
                 "-h" | "--help" => help = true,
                 "--list-themes" => list_themes = true,
                 "-w" | "--wait" => wait = true,
+                "-n" | "--new" => behavior = OpenBehavior::New,
+                "-e" | "--existing" => behavior = OpenBehavior::Existing,
+                "-a" | "--add" => behavior = OpenBehavior::Add,
+                "-r" | "--reuse" => behavior = OpenBehavior::Reuse,
                 "--theme" | "-t" => {
                     theme = iter
                         .next()
@@ -233,6 +274,7 @@ impl Args {
             theme,
             theme_from_cli,
             wait,
+            behavior,
             path,
             line,
             col,
@@ -287,12 +329,20 @@ If <file.md> does not exist, an empty markdown file is created.
 Flags:
   -w, --wait     Block the terminal until the window closes (default: detach)
   -t, --theme    Theme name (see --list-themes)
+  -n, --new      New window (default; every CLI call owns its window for now)
+  -e, --existing Open in the existing window as a tab (needs daemon; opens new for now)
+  -a, --add      Add as a tab to the focused window (needs daemon; opens new for now)
+  -r, --reuse    Reuse the existing window (needs daemon; opens new for now)
   -h, --help     Show this help
 
 Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
   see --list-themes (all crabcode themes + grokday/groknight included)
 
-Keys (Helix / Vim normal — one buffer):
+Keys (Helix / Vim normal — tabbed buffers):
+  cmd-alt-left/right  prev / next tab (ctrl-alt- works too)
+  cmd-t         new tab (untitled)
+  cmd-w         close tab (prompts when dirty)
+  cmd-shift-n   new window
   cmd/ctrl-s    save (explicit write; no autosave)
   cmd-shift-p   command palette (theme, editor, full width, source)
   cmd-k t       theme picker (zed-style chord; cmd may stay held for t)

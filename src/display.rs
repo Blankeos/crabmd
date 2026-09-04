@@ -141,6 +141,10 @@ pub enum BlockExtra {
     },
     Code {
         lang: String,
+        /// Leading spaces of the fence in source (0 for top-level).
+        /// Split-out nested code keeps its visual nesting; the tree
+        /// round-trips it so the file preserves the indent.
+        indent: usize,
     },
     Quote,
     Alert(AlertKind),
@@ -159,7 +163,9 @@ pub enum BlockExtra {
     /// edits map back into the inner text.
     HtmlHeading(u8),
     /// `<details>` open tag: renders as a disclosure row showing `summary`.
-    Details { summary: String },
+    /// `open` mirrors the GFM `<details open>` attribute (open by default).
+    /// Without it the section is collapsed by default.
+    Details { summary: String, open: bool },
     /// `</details>` close tag: renders as zero-height chrome.
     DetailsClose,
 }
@@ -633,13 +639,31 @@ fn project_html_block(
         return Some(BlockExtra::HtmlHeading(level));
     }
     // `<details …>` open tag: disclosure row showing the `<summary>`.
+    // GFM: `<details open>` renders expanded by default, otherwise collapsed.
+    // An empty `<summary></summary>` projects as empty text so the editor
+    // can show a "Summary" placeholder instead of baked-in content.
     if lower.starts_with("<details") && lower.as_bytes().get(8).is_some_and(|b| matches!(b, b'>' | b' ' | b'\t' | b'\n')) {
-        let summary = html_summary_text(t, &lower).unwrap_or_else(|| "Details".to_string());
+        let summary = html_summary_text(t, &lower).unwrap_or_default();
         let range = html_summary_range(t, &lower)
             .map(|(s, e)| r.range.start + lead + s..r.range.start + lead + e);
-        let abs = range.unwrap_or_else(|| r.range.clone());
-        emit_plain(display, segments, abs, &summary, Marks::default());
-        return Some(BlockExtra::Details { summary });
+        // Empty summary: emit nothing (placeholder shows); editing maps
+        // into the `<summary>…</summary>` inner range when present.
+        if summary.is_empty() {
+            if let Some(rg) = range {
+                // Zero-width anchor inside the summary tags so the caret
+                // lands there and typing fills the summary.
+                let pos = rg.start.min(src.len());
+                segments.push(Segment {
+                    display: display.len()..display.len(),
+                    source: pos..pos,
+                    marks: Marks::default(),
+                });
+            }
+        } else {
+            let abs = range.unwrap_or_else(|| r.range.clone());
+            emit_plain(display, segments, abs, &summary, Marks::default());
+        }
+        return Some(BlockExtra::Details { summary, open: html_details_open(t, &lower) });
     }
     // `</details>` close tag: zero-height chrome.
     if lower.starts_with("</details") {
@@ -672,6 +696,18 @@ fn html_summary_text(t: &str, lower: &str) -> Option<String> {
     let raw = t.get(s..e)?;
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     (!collapsed.is_empty()).then(|| collapsed)
+}
+
+/// `true` when the `<details …>` open tag carries a standalone `open`
+/// attribute (`<details open>`, `<details open="">`, `<details open="open">`).
+/// Mirrors GitHub's "open by default" switch.
+fn html_details_open(_t: &str, lower: &str) -> bool {
+    let after = "<details".len();
+    let Some(gt_rel) = lower[after..].find('>') else {
+        return false;
+    };
+    let attrs = &lower[after..after + gt_rel];
+    attrs.split(|c: char| c.is_whitespace() || c == '/' || c == '=' || c == '"' || c == '\'').any(|tok| tok == "open")
 }
 
 /// Block index range owned by the `<details>` open row at `ix`
@@ -707,10 +743,26 @@ fn html_summary_range(t: &str, lower: &str) -> Option<(usize, usize)> {
     Some((gt + 1, close))
 }
 
+/// Leading indent (spaces/tabs, tabs count as 2) of the fence line.
+/// Split-out nested code keeps its visual nesting; top-level is 0.
+fn code_fence_indent(src: &str, range_start: usize, slice: &str) -> usize {
+    let first_line = slice.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mut n = first_line.len() - first_line.trim_start_matches([' ', '\t']).len();
+    // `slice` may start mid-line (split out of a list); include the column
+    // offset of the range start for the true visual indent.
+    if range_start > 0 {
+        let line_start = src[..range_start.min(src.len())].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let prefix = src.get(line_start..range_start.min(src.len())).unwrap_or("");
+        if !prefix.contains('\n') {
+            n += prefix.chars().filter(|c| *c == ' ').count() + prefix.chars().filter(|c| *c == '\t').count() * 2;
+        }
+    }
+    n.min(12)
+}
+
 /// Strip the common leading indent (spaces/tabs) shared by all non-empty
 /// lines. Split-out list code arrives indented; top-level code has none.
-fn dedent_code(body: &str) -> String {
-    if !body.contains('\n') {
+fn dedent_code(body: &str) -> String {    if !body.contains('\n') {
         return body.trim_start_matches([' ', '\t']).to_string();
     }
     let indent = body
@@ -765,11 +817,13 @@ fn project_block(
             let (lang, body) = notion::strip_fence(slice);
             let abs = body_abs_range(slice, &body, r.range.start);
             // Fences split out of list items carry the list indent
-            // ("  ```sh\n  code\n  ```"). Dedent for display; the tree
-            // stores the dedented text so the file normalizes on edit.
+            // ("  ```sh\n  code\n  ```"). Dedent for display but remember
+            // the fence indent so the block renders nested and the file
+            // preserves it on edit.
+            let indent = code_fence_indent(src, r.range.start, slice);
             let body = dedent_code(&body);
             emit_plain(display, segments, abs, &body, Marks::default());
-            BlockExtra::Code { lang }
+            BlockExtra::Code { lang, indent }
         }
         BlockKind::Table => project_table(src, r, display, segments, links),
         BlockKind::List { ordered } => {
@@ -1505,7 +1559,7 @@ mod tests {
         let p = project(src);
         assert_eq!(p.display, "fn main() {}");
         match &p.blocks[0].extra {
-            BlockExtra::Code { lang } => assert_eq!(lang, "rust"),
+            BlockExtra::Code { lang, .. } => assert_eq!(lang, "rust"),
             other => panic!("{other:?}"),
         }
     }
@@ -1719,7 +1773,7 @@ mod tests {
         let code = p.blocks.iter().find(|b| matches!(b.extra, BlockExtra::Code { .. }));
         assert!(code.is_some(), "no code block: {:?}", p.blocks.iter().map(|b| &b.extra).collect::<Vec<_>>());
         match &code.unwrap().extra {
-            BlockExtra::Code { lang } => assert_eq!(lang, "sh"),
+            BlockExtra::Code { lang, .. } => assert_eq!(lang, "sh"),
             other => panic!("{other:?}"),
         }
         assert_eq!(p.display.lines().next().unwrap_or(""), "Install Brew");
@@ -1734,7 +1788,7 @@ mod tests {
         let p = project(src);
         assert!(matches!(p.blocks[0].extra, BlockExtra::Code { .. }));
         match &p.blocks[0].extra {
-            BlockExtra::Code { lang } => assert_eq!(lang, ""),
+            BlockExtra::Code { lang, .. } => assert_eq!(lang, ""),
             other => panic!("{other:?}"),
         }
         assert_eq!(p.display.trim_end(), "/bin/bash hi");
