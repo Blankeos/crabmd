@@ -544,6 +544,8 @@ pub struct Workspace {
     theme_input: Entity<InputState>,
     /// Selected image/video block (display offset) with its edit toolbar.
     media_sel: Option<usize>,
+    /// Collapsed `<details>` blocks, keyed by open-row source start.
+    collapsed_html: std::collections::HashSet<usize>,
     media_alt: Entity<InputState>,
     media_src: Entity<InputState>,
     /// Zed-style `cmd-k` chord: armed by `cmd-k` at capture level, consumed
@@ -648,6 +650,7 @@ impl Workspace {
             fonts,
             theme_input,
             media_sel: None,
+            collapsed_html: std::collections::HashSet::new(),
             media_alt,
             media_src,
             pending_chord: false,
@@ -5097,10 +5100,14 @@ impl Workspace {
         } else {
             None
         };
-        let heading = matches!(block.kind, BlockKind::Heading(_));
+        let heading = matches!(block.kind, BlockKind::Heading(_))
+            || matches!(block.extra, BlockExtra::HtmlHeading(_));
         let heading_level = match block.kind {
             BlockKind::Heading(l) => Some(l),
-            _ => None,
+            _ => match block.extra {
+                BlockExtra::HtmlHeading(l) => Some(l),
+                _ => None,
+            },
         };
         let is_code = matches!(block.kind, BlockKind::Code);
         let syntax_lang = match &block.extra {
@@ -5118,7 +5125,12 @@ impl Workspace {
             is_code,
             cx,
         );
+        let modal_open = self.cmd_palette.is_some()
+            || self.settings_open
+            || self.command.is_some()
+            || self.search.is_some();
         let slash = self.slash_is_open()
+            && !modal_open
             && p.block_at_display(self.caret)
                 .map(|b| b.source == block.source)
                 .unwrap_or(false);
@@ -5205,7 +5217,7 @@ impl Workspace {
             BlockExtra::Image { alt, src } => {
                 self.render_image_hit(alt, src, block.display.start, caret_here, cx)
             }
-            BlockExtra::Heading(level) => {
+            BlockExtra::Heading(level) | BlockExtra::HtmlHeading(level) => {
                 let mut el = v_flex()
                     .relative()
                     .w_full()
@@ -5217,6 +5229,8 @@ impl Workspace {
                 }
                 el.into_any_element()
             }
+            BlockExtra::Details { .. } => self.render_details_row(ix, body, slash, cx),
+            BlockExtra::DetailsClose => div().into_any_element(),
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Text | BlockExtra::Html => {
@@ -6434,6 +6448,75 @@ impl Workspace {
         }
     }
 
+    /// `<details>` open row: chevron + editable summary, Notion-style.
+    /// No card — just a paragraph-like toggle row. Clicking the chevron
+    /// collapses the body blocks through `</details>`; clicking the text edits.
+    fn render_details_row(
+        &mut self,
+        ix: usize,
+        body: AnyElement,
+        slash: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = self.proj();
+        let pal = self.palette.clone();
+        let block = p.blocks[ix].clone();
+        let collapsed = self.collapsed_html.contains(&block.source.start);
+        let chev = if collapsed { "▸" } else { "▾" };
+        let view = cx.entity();
+        let src_start = block.source.start;
+        let mut el = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_start()
+            .gap_1()
+            .child(
+                div()
+                    .w(px(20.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(pal.text_muted)
+                    .cursor_pointer()
+                    .rounded(px(4.))
+                    .hover(|el| el.bg(pal.background_element))
+                    .child(chev)
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.toggle_details(src_start, cx);
+                        });
+                    }),
+            )
+            .child(div().flex_1().min_w_0().child(body));
+        if slash {
+            el = el.child(self.render_slash_popover(cx));
+        }
+        el.into_any_element()
+    }
+
+    /// Collapse/expand a `<details>` block. Collapsing pulls the caret out
+    /// of the now-hidden body onto the summary row.
+    fn toggle_details(&mut self, src_start: usize, cx: &mut Context<Self>) {
+        if self.collapsed_html.remove(&src_start) {
+            cx.notify();
+            return;
+        }
+        self.collapsed_html.insert(src_start);
+        let p = self.proj();
+        if let Some(ix) = p.blocks.iter().position(|b| b.source.start == src_start) {
+            if let Some((_, end_ix)) = crate::display::details_block_range(&p, ix) {
+                let end_d = p.blocks[end_ix].display.end;
+                if self.caret > p.blocks[ix].display.end && self.caret <= end_d {
+                    self.caret = p.blocks[ix].display.end;
+                    self.sel = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Generic HTML blocks (`<iframe>`, `<details>`, raw `<div>`…): a small
     /// card with the tag name, a one-line source preview, and a draggable
     /// handle. GPUI has no HTML renderer (awesome-gpui lists no webview /
@@ -6825,7 +6908,11 @@ impl Workspace {
             .block_at_display(caret)
             .is_some_and(|b| b.source == p.blocks[ix].source)
             || table_sel.is_some_and(|t| t.block_ix == ix);
-        let tools_at = if in_table && !dragging {
+        let modal_open = self.cmd_palette.is_some()
+            || self.settings_open
+            || self.command.is_some()
+            || self.search.is_some();
+        let tools_at = if in_table && !dragging && !modal_open {
             p.table_cell_at(caret)
                 .filter(|(b, _)| b.source == p.blocks[ix].source)
                 .map(|(_, c)| (c.row, c.col))
@@ -7166,6 +7253,16 @@ impl Workspace {
     }
 
     fn selection_bubble_for_block(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Never float the selection bubble above a modal overlay (palette,
+        // settings, : command, search): the backdrop occludes the doc and
+        // the modal's deferred pass already paints above the document.
+        if self.cmd_palette.is_some()
+            || self.settings_open
+            || self.command.is_some()
+            || self.search.is_some()
+        {
+            return None;
+        }
         let p = self.proj();
         let this = p.blocks.get(ix)?;
         // Tables own their floating toolbar (marks + grid controls).
@@ -8097,11 +8194,33 @@ impl Workspace {
         let p = self.proj();
         let us = wysiwyg::units(&p);
         let n = us.len();
+        // Body ranges of collapsed `<details>` blocks — those rows render empty.
+        let hidden: Vec<(usize, usize)> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                matches!(b.extra, BlockExtra::Details { .. })
+                    && self.collapsed_html.contains(&b.source.start)
+            })
+            .filter_map(|(ix, _)| crate::display::details_block_range(&p, ix))
+            .collect();
         let mut kids = Vec::new();
         for (ui, unit) in us.iter().copied().enumerate() {
             let view = cx.entity();
             let group = SharedString::from(format!("row-{ui}"));
             let dragging = self.block_dragging == Some(ui);
+            let row_gone = matches!(p.blocks[unit.block].extra, BlockExtra::DetailsClose)
+                || hidden
+                    .iter()
+                    .any(|(a, b)| unit.block > *a && unit.block <= *b);
+            let content: AnyElement = if row_gone {
+                div().into_any_element()
+            } else if let Some(item_ix) = unit.item {
+                self.render_list_item_row(unit.block, item_ix, cx)
+            } else {
+                self.render_block(unit.block, cx)
+            };
             let disp = wysiwyg::unit_display(&p, unit);
             let start = disp.start;
             let end = disp.end;
@@ -8117,7 +8236,7 @@ impl Workspace {
                     .min_w_0()
                     .px_8()
                     .when(list_item.is_some(), |el| el.py_1())
-                    .when(list_item.is_none(), |el| el.py_2())
+                    .when(list_item.is_none() && !row_gone, |el| el.py_2())
                     .when(dragging, |el| el.opacity(0.45))
                     .on_mouse_down(MouseButton::Left, {
                         let view = view.clone();
@@ -8146,11 +8265,7 @@ impl Workspace {
                     .on_drop(cx.listener(|this, drag: &DragBlock, window, cx| {
                         this.drop_block_at(drag.ix, window, cx);
                     }))
-                    .child(if let Some(item_ix) = list_item {
-                        self.render_list_item_row(unit.block, item_ix, cx)
-                    } else {
-                        self.render_block(unit.block, cx)
-                    })
+                    .child(content)
                     .child(self.render_drop_edge(ui, n, cx))
                     .child(self.render_block_handle(ui, group, list_item.is_some(), cx))
                     .children(self.render_handle_menu(ui, list_item.is_some(), cx))
@@ -9913,8 +10028,16 @@ impl Render for Workspace {
                             })),
                     ),
             )
-            .when(settings_open, |el| el.child(self.render_settings(cx)))
-            .when(palette_open, |el| el.child(self.render_palette(cx)))
+            // Modal overlays must paint above in-document `deferred` popovers
+            // (selection bubble priority 2, slash menu priority 1): a plain
+            // absolute child loses to any deferred element, so defer the
+            // modals with a higher priority.
+            .when(settings_open, |el| {
+                el.child(deferred(self.render_settings(cx)).with_priority(100))
+            })
+            .when(palette_open, |el| {
+                el.child(deferred(self.render_palette(cx)).with_priority(100))
+            })
     }
 }
 

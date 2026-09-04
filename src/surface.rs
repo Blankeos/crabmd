@@ -355,9 +355,10 @@ impl Element for CodePillLayer {
         let line_h =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.layout.line_height()))
                 .unwrap_or(px(16.));
-        let pad_x = px(4.);
-        let pad_y = px(1.5);
-        let radius = px(4.);
+        // GFM-like pill: ~.4em horizontal / ~.2em vertical padding, 6px radius.
+        let pad_x = px(5.);
+        let pad_y = px(2.);
+        let radius = px(6.);
         let mut quads = Vec::new();
         for range in &self.ranges {
             if range.start >= range.end || range.end > len {
@@ -526,7 +527,9 @@ pub fn edit_text<V: EntityInputHandler>(
         layout: layout.clone(),
     });
     let color = p.primary;
-    let pill_color = p.background_element;
+    // Tint toward text so the pill reads on any theme, even when
+    // `background_element` is near-identical to the editor background.
+    let pill_color = p.background_element.blend(p.markdown_text.opacity(0.12));
     let click_empty = empty;
     div()
         .id(("edit", display_start))

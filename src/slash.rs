@@ -150,6 +150,14 @@ pub const ITEMS: &[SlashItem] = &[
         icon: "minus",
     },
     SlashItem {
+        keys: &["details", "disclosure", "collapsible", "summary"],
+        label: "Details (collapsible)",
+        hint: "<details>",
+        template: "<details>\n<summary>Summary</summary>\n\n\n</details>",
+        kind: BlockKind::Html,
+        icon: "list",
+    },
+    SlashItem {
         keys: &["alert", "note"],
         label: "Alert: Note",
         hint: "[!NOTE]",

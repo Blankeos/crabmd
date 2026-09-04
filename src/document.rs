@@ -119,6 +119,57 @@ impl PaintRange {
 
 /// Parse GFM into paint ranges that cover `0..src.len()`.
 /// Unparsed gaps (blank lines, leftovers) are [`BlockKind::Raw`].
+///
+/// Fenced/indented `CodeBlock` spans nested inside `start..end` (a List block),
+/// as absolute byte ranges. Used to split nested code out of lists so it
+/// renders as a real code block with a language chip.
+fn nested_code_spans(src: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let start = start.min(src.len());
+    let end = end.min(src.len()).max(start);
+    let slice = src.get(start..end).unwrap_or("");
+    if !slice.contains("```") && !slice.contains("~~~") {
+        // Quick path: indented code without fences is rare inside task lists;
+        // still scan below since pulldown handles it, but fences cover README.
+        // Fall through to the parser scan only when plausible.
+        let mut probe = true;
+        for line in slice.lines() {
+            if line.starts_with("    ") && !line.trim().is_empty() {
+                probe = true;
+                break;
+            }
+            probe = false;
+        }
+        if !probe {
+            return Vec::new();
+        }
+    }
+    let mut spans = Vec::new();
+    let parser = Parser::new_ext(slice, gfm_options()).into_offset_iter();
+    for (event, range) in parser {
+        if let Event::Start(Tag::CodeBlock(_)) = event {
+            let cs = (start + range.start).min(src.len());
+            let ce = (start + range.end).min(src.len()).max(cs);
+            // Skip whitespace-only spans; keep real fences.
+            if src.get(cs..ce).is_some_and(|s| !s.trim().is_empty()) {
+                spans.push((cs, ce));
+            }
+        }
+    }
+    spans.sort();
+    // Merge overlaps (Start/End report the same span twice sometimes).
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (cs, ce) in spans {
+        if let Some(last) = merged.last_mut() {
+            if cs <= last.1 {
+                last.1 = last.1.max(ce);
+                continue;
+            }
+        }
+        merged.push((cs, ce));
+    }
+    merged
+}
+
 pub fn parse_ranges(src: &str) -> Vec<PaintRange> {
     if src.is_empty() {
         return vec![PaintRange {
@@ -188,6 +239,35 @@ pub fn parse_ranges(src: &str) -> Vec<PaintRange> {
             }
         }
     }
+
+    // Fenced/indented code nested in a list item (e.g. an indented ``` block
+    // under a bullet) must stay a real code block — with its language chip —
+    // instead of collapsing into the bullet's inline text. Split those spans
+    // out of the List range so they project as standalone Code blocks.
+    let mut expanded: Vec<(usize, usize, BlockKind)> = Vec::with_capacity(covered.len() * 2);
+    for (start, end, kind) in covered {
+        if matches!(kind, BlockKind::List { .. }) {
+            let spans = nested_code_spans(src, start, end);
+            if spans.is_empty() {
+                expanded.push((start, end, kind));
+            } else {
+                let mut pos = start;
+                for (cs, ce) in spans {
+                    if cs > pos {
+                        expanded.push((pos, cs, kind));
+                    }
+                    expanded.push((cs, ce, BlockKind::Code));
+                    pos = ce;
+                }
+                if pos < end {
+                    expanded.push((pos, end, kind));
+                }
+            }
+        } else {
+            expanded.push((start, end, kind));
+        }
+    }
+    let covered = expanded;
 
     let mut ranges = Vec::new();
     let mut cursor = 0usize;

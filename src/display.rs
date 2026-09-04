@@ -155,6 +155,13 @@ pub enum BlockExtra {
         src: String,
     },
     Html,
+    /// Single-line `<h1>…</h1>` … `<h6>…</h6>`: renders as a heading,
+    /// edits map back into the inner text.
+    HtmlHeading(u8),
+    /// `<details>` open tag: renders as a disclosure row showing `summary`.
+    Details { summary: String },
+    /// `</details>` close tag: renders as zero-height chrome.
+    DetailsClose,
 }
 
 impl BlockExtra {
@@ -595,6 +602,141 @@ fn quote_body_point(slice: &str, abs_start: usize, skip_alert_label: bool) -> us
     (abs_start + offset + quote_prefix_len(line)).min(abs_start + slice.len())
 }
 
+/// Semantic HTML: single-line `<h1>`–`<h6>` render as headings,
+/// `<details>` opens a disclosure row, `</details>` is invisible chrome.
+/// Returns None for anything else (generic HTML card).
+fn project_html_block(
+    src: &str,
+    r: &PaintRange,
+    display: &mut String,
+    segments: &mut Vec<Segment>,
+) -> Option<BlockExtra> {
+    let slice = r.slice(src);
+    let lead = slice.len() - slice.trim_start().len();
+    let t = slice[lead..].trim_end();
+    if !t.starts_with('<') {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    // `<h1>text</h1>` (attributes allowed on the open tag).
+    if let Some(level) = html_heading_level(&lower) {
+        let gt = t.find('>')?;
+        let close = format!("</h{level}>");
+        if !lower.ends_with(&close) {
+            return None;
+        }
+        let inner = t[gt + 1..t.len() - close.len()].trim();
+        let start = r.range.start + lead + gt + 1 + (t[gt + 1..].len() - t[gt + 1..].trim_start().len());
+        let end = start + inner.len();
+        emit_plain(display, segments, start..end.min(src.len()), inner, Marks::default());
+        restore_trailing_spaces(src, r.range.clone(), display, segments);
+        return Some(BlockExtra::HtmlHeading(level));
+    }
+    // `<details …>` open tag: disclosure row showing the `<summary>`.
+    if lower.starts_with("<details") && lower.as_bytes().get(8).is_some_and(|b| matches!(b, b'>' | b' ' | b'\t' | b'\n')) {
+        let summary = html_summary_text(t, &lower).unwrap_or_else(|| "Details".to_string());
+        let range = html_summary_range(t, &lower)
+            .map(|(s, e)| r.range.start + lead + s..r.range.start + lead + e);
+        let abs = range.unwrap_or_else(|| r.range.clone());
+        emit_plain(display, segments, abs, &summary, Marks::default());
+        return Some(BlockExtra::Details { summary });
+    }
+    // `</details>` close tag: zero-height chrome.
+    if lower.starts_with("</details") {
+        let rest = lower["</details".len()..].trim();
+        if rest.is_empty() || rest == ">" || rest.starts_with('>') {
+            return Some(BlockExtra::DetailsClose);
+        }
+    }
+    None
+}
+
+/// `<h1` … `<h6` (open-tag prefix) → level. `None` for anything else.
+fn html_heading_level(lower_trimmed: &str) -> Option<u8> {
+    let b = lower_trimmed.as_bytes();
+    if b.len() < 4 || b[0] != b'<' || b[1] != b'h' {
+        return None;
+    }
+    if !(b'1'..=b'6').contains(&b[2]) {
+        return None;
+    }
+    match b[3] {
+        b'>' | b' ' | b'\t' | b'\n' => Some(b[2] - b'0'),
+        _ => None,
+    }
+}
+
+/// Inner text of the first `<summary>…</summary>`, whitespace-collapsed.
+fn html_summary_text(t: &str, lower: &str) -> Option<String> {
+    let (s, e) = html_summary_range(t, lower)?;
+    let raw = t.get(s..e)?;
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then(|| collapsed)
+}
+
+/// Block index range owned by the `<details>` open row at `ix`
+/// (`open..=close`, depth-counted for nesting). None when not a Details row
+/// or when never closed.
+pub fn details_block_range(p: &Projection, ix: usize) -> Option<(usize, usize)> {
+    if !matches!(p.blocks.get(ix)?.extra, BlockExtra::Details { .. }) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (j, b) in p.blocks.iter().enumerate().skip(ix) {
+        match &b.extra {
+            BlockExtra::Details { .. } => depth += 1,
+            BlockExtra::DetailsClose => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((ix, j));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Byte range of the summary inner text within `t` (`lower` mirrors `t`).
+fn html_summary_range(t: &str, lower: &str) -> Option<(usize, usize)> {
+    let open = lower.find("<summary")?;
+    let after = open + "<summary".len();
+    // Skip attributes on `<summary …>`.
+    let gt = lower[after..].find('>')? + after;
+    let close = lower[gt..].find("</summary>")? + gt;
+    Some((gt + 1, close))
+}
+
+/// Strip the common leading indent (spaces/tabs) shared by all non-empty
+/// lines. Split-out list code arrives indented; top-level code has none.
+fn dedent_code(body: &str) -> String {
+    if !body.contains('\n') {
+        return body.trim_start_matches([' ', '\t']).to_string();
+    }
+    let indent = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start_matches([' ', '\t']).len())
+        .min()
+        .unwrap_or(0);
+    if indent == 0 {
+        return body.to_string();
+    }
+    body.lines()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                l.char_indices()
+                    .nth(indent)
+                    .map(|(i, _)| l[i..].to_string())
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn project_block(
     src: &str,
     r: &PaintRange,
@@ -612,12 +754,20 @@ fn project_block(
     match r.kind {
         BlockKind::Rule => BlockExtra::Rule,
         BlockKind::Html | BlockKind::Raw => {
-            emit_plain(display, segments, r.range.clone(), slice, Marks::default());
-            BlockExtra::Html
+            if let Some(extra) = project_html_block(src, r, display, segments) {
+                extra
+            } else {
+                emit_plain(display, segments, r.range.clone(), slice, Marks::default());
+                BlockExtra::Html
+            }
         }
         BlockKind::Code => {
             let (lang, body) = notion::strip_fence(slice);
             let abs = body_abs_range(slice, &body, r.range.start);
+            // Fences split out of list items carry the list indent
+            // ("  ```sh\n  code\n  ```"). Dedent for display; the tree
+            // stores the dedented text so the file normalizes on edit.
+            let body = dedent_code(&body);
             emit_plain(display, segments, abs, &body, Marks::default());
             BlockExtra::Code { lang }
         }
@@ -990,6 +1140,22 @@ fn project_inlines(
                 marks.link = Some(id);
             }
             Event::End(TagEnd::Link) => marks.link = None,
+            Event::Start(Tag::CodeBlock(_)) => {
+                // Fenced code nested in a list item (e.g. an indented ``` block
+                // under a bullet) still belongs to the List block — mark it as
+                // code so it renders mono + pill instead of plain text.
+                marks.code = true;
+                if !display.is_empty() && !display.ends_with('\n') {
+                    let d0 = display.len();
+                    display.push('\n');
+                    segments.push(Segment {
+                        display: d0..display.len(),
+                        source: abs.start..abs.start,
+                        marks: Marks::default(),
+                    });
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => marks.code = false,
             Event::Start(Tag::Heading { .. }) => {
                 skip_alert_label = false;
             }
@@ -1122,7 +1288,7 @@ fn project_table(
     r: &PaintRange,
     display: &mut String,
     segments: &mut Vec<Segment>,
-    _links: &mut Vec<String>,
+    links: &mut Vec<String>,
 ) -> BlockExtra {
     let slice = r.slice(src);
     let mut cells = Vec::new();
@@ -1132,6 +1298,7 @@ fn project_table(
     let mut header = true;
     let mut cell_d0 = 0usize;
     let mut cell_src = 0..0;
+    let mut marks = Marks::default();
     let parser = Parser::new_ext(slice, gfm_options()).into_offset_iter();
 
     for (event, range) in parser {
@@ -1166,12 +1333,40 @@ fn project_table(
                 }
                 cell_d0 = display.len();
                 cell_src = abs;
+                marks = Marks::default();
+            }
+            Event::Start(Tag::Strong) => marks.bold = true,
+            Event::End(TagEnd::Strong) => marks.bold = false,
+            Event::Start(Tag::Emphasis) => marks.italic = true,
+            Event::End(TagEnd::Emphasis) => marks.italic = false,
+            Event::Start(Tag::Strikethrough) => marks.strike = true,
+            Event::End(TagEnd::Strikethrough) => marks.strike = false,
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let id = links.len() as u32;
+                links.push(dest_url.to_string());
+                marks.link = Some(id);
+            }
+            Event::End(TagEnd::Link) => marks.link = None,
+            Event::Code(t) => {
+                let text = flatten_table_cell_text(t.as_ref());
+                if !text.trim().is_empty() || !t.is_empty() {
+                    emit_plain(
+                        display,
+                        segments,
+                        abs,
+                        text.as_ref(),
+                        Marks {
+                            code: true,
+                            ..marks
+                        },
+                    );
+                }
             }
             Event::Text(t) => {
                 let text = &slice[range.start.min(slice.len())..range.end.min(slice.len())];
                 let text = flatten_table_cell_text(text);
                 if !text.trim().is_empty() || !t.is_empty() {
-                    emit_plain(display, segments, abs, text.as_ref(), Marks::default());
+                    emit_plain(display, segments, abs, text.as_ref(), marks);
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -1493,6 +1688,82 @@ mod tests {
         assert_eq!(p.display, "Hello there   #");
         let p = project("# Hello there#");
         assert_eq!(p.display, "Hello there#");
+    }
+
+    #[test]
+    fn table_cell_links_keep_marks() {
+        let src = "| Font | Desc |\n| --- | --- |\n| [Zed](https://x.com) | plain |";
+        let p = project(src);
+        assert_eq!(p.links, vec!["https://x.com".to_string()]);
+        let d = p.display.find("Zed").unwrap();
+        assert_eq!(p.link_at(d).map(|(_, u)| u), Some("https://x.com"));
+        assert!(p.marks_at(d, Affinity::Inside).link.is_some());
+    }
+
+    #[test]
+    fn table_cell_code_and_bold_keep_marks() {
+        let src = "| A |\n| --- |\n| `~/x` and **B** |";
+        let p = project(src);
+        let d = p.display.find("~/x").unwrap();
+        assert!(p.marks_at(d, Affinity::Inside).code, "{:?}", p.display);
+        let b = p.display.find('B').unwrap();
+        assert!(p.marks_at(b, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn nested_fence_in_list_splits_to_code_block() {
+        let src = "- Install [Brew](https://brew.sh/)\n\n  ```sh\n  /bin/bash hi\n  ```\n";
+        let p = project(src);
+        // Bullet stays a list, fence becomes its own Code block with language.
+        assert!(matches!(p.blocks[0].extra, BlockExtra::List { .. }), "{:?}", p.blocks[0].extra);
+        let code = p.blocks.iter().find(|b| matches!(b.extra, BlockExtra::Code { .. }));
+        assert!(code.is_some(), "no code block: {:?}", p.blocks.iter().map(|b| &b.extra).collect::<Vec<_>>());
+        match &code.unwrap().extra {
+            BlockExtra::Code { lang } => assert_eq!(lang, "sh"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(p.display.lines().next().unwrap_or(""), "Install Brew");
+        assert!(p.display.contains("/bin/bash hi"));
+        // No merge of bullet text and code on one line.
+        assert!(!p.display.contains(")brew") && !p.display.contains(")/bin"));
+    }
+
+    #[test]
+    fn plain_fence_stays_code_block() {
+        let src = "```\n/bin/bash hi\n```\n";
+        let p = project(src);
+        assert!(matches!(p.blocks[0].extra, BlockExtra::Code { .. }));
+        match &p.blocks[0].extra {
+            BlockExtra::Code { lang } => assert_eq!(lang, ""),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(p.display.trim_end(), "/bin/bash hi");
+    }
+
+    #[test]
+    fn html_heading_renders_as_heading() {
+        let p = project("<h1>🐟 Carlo's Dotfiles</h1>\n");
+        assert_eq!(p.display, "🐟 Carlo's Dotfiles");
+        assert!(matches!(p.blocks[0].extra, BlockExtra::HtmlHeading(1)));
+        // Caret maps inside the tags, so typing preserves them.
+        let s = p.to_source(0, Affinity::Inside);
+        assert_eq!("<h1>🐟 Carlo's Dotfiles</h1>"[s..].chars().next(), Some('🐟'));
+        let p = project("<h2>Table of Contents</h2>\n");
+        assert_eq!(p.display, "Table of Contents");
+        assert!(matches!(p.blocks[0].extra, BlockExtra::HtmlHeading(2)));
+    }
+
+    #[test]
+    fn details_open_close_project() {
+        let src = "<details>\n  <summary>\n    ⭐️ MacOS Improvements\n  </summary>\n\n- [x] Better drag\n\n</details>\n";
+        let p = project(src);
+        assert!(matches!(p.blocks[0].extra, BlockExtra::Details { .. }));
+        assert_eq!(p.display.lines().next().unwrap_or(""), "⭐️ MacOS Improvements");
+        let last = p.blocks.last().unwrap();
+        assert!(matches!(last.extra, BlockExtra::DetailsClose));
+        assert_eq!(last.display.start, last.display.end);
+        let (a, b) = details_block_range(&p, 0).unwrap();
+        assert_eq!((a, b), (0, p.blocks.len() - 1));
     }
 }
 

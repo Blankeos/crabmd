@@ -91,6 +91,17 @@ pub enum NodeKind {
     Html {
         raw: String,
     },
+    /// `<h1>…</h1>` … `<h6>…</h6>` — renders as a heading, round-trips tags.
+    HtmlHeading {
+        level: u8,
+        inlines: Vec<Inline>,
+    },
+    /// `<details>` open row — summary inlines, editable.
+    Details {
+        inlines: Vec<Inline>,
+    },
+    /// `</details>` close — zero-height chrome, preserved on save.
+    DetailsClose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +303,10 @@ impl Doc {
             }
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => {
                 let len = inlines_len(inlines);
@@ -302,6 +317,7 @@ impl Doc {
             NodeKind::Table { .. }
             | NodeKind::Rule
             | NodeKind::Image { .. }
+            | NodeKind::DetailsClose
             | NodeKind::Html { .. } => self.nodes[start.node].kind.clone(),
         };
         Some(Node {
@@ -488,6 +504,8 @@ impl Doc {
         match &mut self.nodes[loc.node].kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => *inlines = left,
             _ => return,
@@ -543,6 +561,8 @@ impl Doc {
         let right = match incoming.kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines,
             _ => return,
@@ -550,6 +570,8 @@ impl Doc {
         match &mut self.nodes[keep].kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines.extend(right),
             NodeKind::List { items, .. } => {
@@ -571,6 +593,8 @@ impl Doc {
             Some(NodeKind::Html { raw }) => raw.len(),
             Some(NodeKind::Paragraph { inlines })
             | Some(NodeKind::Heading { inlines, .. })
+            | Some(NodeKind::HtmlHeading { inlines, .. })
+            | Some(NodeKind::Details { inlines })
             | Some(NodeKind::Quote { inlines })
             | Some(NodeKind::Alert { inlines, .. }) => inlines_len(inlines),
             _ => 0,
@@ -909,6 +933,8 @@ impl Doc {
             None => match &self.nodes[next.block].kind {
                 NodeKind::Paragraph { inlines }
                 | NodeKind::Heading { inlines, .. }
+                | NodeKind::HtmlHeading { inlines, .. }
+                | NodeKind::Details { inlines }
                 | NodeKind::Quote { inlines }
                 | NodeKind::Alert { inlines, .. } => inlines_text(inlines),
                 NodeKind::Code { text, .. } => text.clone(),
@@ -952,6 +978,8 @@ impl Doc {
                     self.nodes[next.block].kind,
                     NodeKind::Paragraph { .. }
                         | NodeKind::Heading { .. }
+                        | NodeKind::HtmlHeading { .. }
+                        | NodeKind::Details { .. }
                         | NodeKind::Quote { .. }
                         | NodeKind::Alert { .. }
                         | NodeKind::Code { .. }
@@ -1094,7 +1122,7 @@ impl Doc {
         // and keeps the heading text (does not demote the body to a paragraph).
         // Caret stays on the heading (`|Table`), not on the new empty line.
         if loc.offset == 0 {
-            if matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. }) {
+            if matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. } | NodeKind::Details { .. }) {
                 let ni = loc.node;
                 self.nodes.insert(
                     ni,
@@ -1110,7 +1138,9 @@ impl Doc {
         let (left, right) = split_inlines(&inlines, loc.offset);
         let empty_right = inlines_len(&right) == 0;
         match &mut self.nodes[loc.node].kind {
-            NodeKind::Heading { inlines, .. } => *inlines = left,
+            NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines } => *inlines = left,
             NodeKind::Quote { inlines } | NodeKind::Alert { inlines, .. } => {
                 if empty_right && loc.offset == inlines_len(inlines) {
                     // exit quote/alert
@@ -1133,7 +1163,11 @@ impl Doc {
         let ni = loc.node;
         if matches!(
             self.nodes[ni].kind,
-            NodeKind::Heading { .. } | NodeKind::Quote { .. } | NodeKind::Alert { .. }
+            NodeKind::Heading { .. }
+            | NodeKind::HtmlHeading { .. }
+            | NodeKind::Details { .. }
+            | NodeKind::Quote { .. }
+            | NodeKind::Alert { .. }
         ) && empty_right
         {
             if matches!(
@@ -1226,6 +1260,8 @@ impl Doc {
         match &self.nodes[loc.node].kind {
             NodeKind::List { .. } => return Some(self.backspace_list(loc)),
             NodeKind::Heading { .. }
+            | NodeKind::HtmlHeading { .. }
+            | NodeKind::Details { .. }
             | NodeKind::Quote { .. }
             | NodeKind::Alert { .. }
             | NodeKind::Code { .. } => {
@@ -1237,7 +1273,7 @@ impl Doc {
                         &self.nodes[loc.node - 1].kind,
                         NodeKind::Paragraph { inlines } if inlines_len(inlines) == 0
                     );
-                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. }) {
+                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. } | NodeKind::Details { .. }) {
                         let heading = loc.node;
                         self.nodes.remove(loc.node - 1);
                         return Some(self.caret_after(heading - 1, None, None, 0));
@@ -1246,6 +1282,8 @@ impl Doc {
                 }
                 let inlines = match &self.nodes[loc.node].kind {
                     NodeKind::Heading { inlines, .. }
+                    | NodeKind::HtmlHeading { inlines, .. }
+                    | NodeKind::Details { inlines }
                     | NodeKind::Quote { inlines }
                     | NodeKind::Alert { inlines, .. } => inlines.clone(),
                     NodeKind::Code { text, .. } => vec![Inline {
@@ -1272,7 +1310,7 @@ impl Doc {
                 }
                 return Some(self.merge_nodes(loc.node - 1, loc.node));
             }
-            NodeKind::Rule | NodeKind::Image { .. } | NodeKind::Html { .. } => {
+            NodeKind::Rule | NodeKind::Image { .. } | NodeKind::Html { .. } | NodeKind::DetailsClose => {
                 if loc.node == 0 {
                     self.nodes[0].kind = NodeKind::Paragraph { inlines: vec![] };
                     return Some(0);
@@ -2025,6 +2063,8 @@ impl Doc {
             }
             match &mut self.nodes[node].kind {
                 NodeKind::Heading { inlines, .. }
+                | NodeKind::HtmlHeading { inlines, .. }
+                | NodeKind::Details { inlines }
                 | NodeKind::Quote { inlines }
                 | NodeKind::Alert { inlines, .. }
                 | NodeKind::Paragraph { inlines } => {
@@ -2067,6 +2107,8 @@ impl Doc {
         let inlines = match (&mut self.nodes[node].kind, item) {
             (NodeKind::Paragraph { inlines }, None)
             | (NodeKind::Heading { inlines, .. }, None)
+            | (NodeKind::HtmlHeading { inlines, .. }, None)
+            | (NodeKind::Details { inlines }, None)
             | (NodeKind::Quote { inlines }, None)
             | (NodeKind::Alert { inlines, .. }, None) => inlines,
             (NodeKind::List { items, .. }, Some(i)) => match items.get_mut(i) {
@@ -2172,6 +2214,8 @@ impl Doc {
         match &self.nodes.get(loc.node).map(|n| &n.kind) {
             Some(NodeKind::Paragraph { inlines })
             | Some(NodeKind::Heading { inlines, .. })
+            | Some(NodeKind::HtmlHeading { inlines, .. })
+            | Some(NodeKind::Details { inlines })
             | Some(NodeKind::Quote { inlines })
             | Some(NodeKind::Alert { inlines, .. }) => inlines,
             Some(NodeKind::List { items, .. }) => items
@@ -2198,6 +2242,8 @@ impl Doc {
             self.nodes[loc.node].kind,
             NodeKind::Paragraph { .. }
                 | NodeKind::Heading { .. }
+                | NodeKind::HtmlHeading { .. }
+                | NodeKind::Details { .. }
                 | NodeKind::Quote { .. }
                 | NodeKind::Alert { .. }
                 | NodeKind::List { .. }
@@ -2209,6 +2255,8 @@ impl Doc {
         match &mut self.nodes[loc.node].kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines,
             NodeKind::List { items, .. } => {
@@ -2288,6 +2336,8 @@ impl Doc {
             }
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines_len(inlines),
             _ => 0,
@@ -2316,6 +2366,8 @@ impl Doc {
         let right = match &self.nodes[drop].kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines.clone(),
             NodeKind::Code { text, .. } => vec![Inline {
@@ -2327,6 +2379,8 @@ impl Doc {
         match &mut self.nodes[keep].kind {
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines.extend(right),
             NodeKind::Code { text, .. } => text.push_str(&inlines_text(&right)),
@@ -2358,6 +2412,11 @@ fn slice_kind_keep(kind: &NodeKind, inlines: Vec<Inline>, full: bool) -> NodeKin
             level: *level,
             inlines,
         },
+        NodeKind::HtmlHeading { level, .. } => NodeKind::HtmlHeading {
+            level: *level,
+            inlines,
+        },
+        NodeKind::Details { .. } => NodeKind::Details { inlines },
         NodeKind::Quote { .. } => NodeKind::Quote { inlines },
         NodeKind::Alert { kind, .. } => NodeKind::Alert {
             kind: *kind,
@@ -2382,6 +2441,8 @@ fn remap_node_links(node: &mut Node, dest: &mut Vec<String>, src: &[String]) {
     match &mut node.kind {
         NodeKind::Paragraph { inlines }
         | NodeKind::Heading { inlines, .. }
+        | NodeKind::HtmlHeading { inlines, .. }
+        | NodeKind::Details { inlines }
         | NodeKind::Quote { inlines }
         | NodeKind::Alert { inlines, .. } => remap_inlines_links(inlines, dest, src),
         NodeKind::List { items, .. } => {
@@ -2407,6 +2468,10 @@ fn node_is_empty(n: &Node) -> bool {
     match &n.kind {
         NodeKind::Paragraph { inlines }
         | NodeKind::Heading { inlines, .. }
+        | NodeKind::HtmlHeading { inlines, .. }
+        | NodeKind::Details { inlines }
+        | NodeKind::HtmlHeading { inlines, .. }
+        | NodeKind::Details { inlines }
         | NodeKind::Quote { inlines }
         | NodeKind::Alert { inlines, .. } => inlines_len(inlines) == 0,
         NodeKind::List { items, .. } => {
@@ -2414,6 +2479,7 @@ fn node_is_empty(n: &Node) -> bool {
         }
         NodeKind::Code { text, .. } => text.is_empty(),
         NodeKind::Html { raw } => raw.is_empty(),
+        NodeKind::DetailsClose => false,
         NodeKind::Table { headers, rows } => {
             headers.iter().all(|c| inlines_len(c) == 0) && rows.is_empty()
         }
@@ -2427,8 +2493,13 @@ fn nodes_plain_text(nodes: &[Node]) -> String {
         .map(|n| match &n.kind {
             NodeKind::Code { text, .. } => text.clone(),
             NodeKind::Html { raw } => raw.clone(),
+            NodeKind::DetailsClose => "</details>".to_string(),
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
+            | NodeKind::HtmlHeading { inlines, .. }
+            | NodeKind::Details { inlines }
             | NodeKind::Quote { inlines }
             | NodeKind::Alert { inlines, .. } => inlines_text(inlines),
             NodeKind::List { items, .. } => items
@@ -2478,6 +2549,10 @@ fn node_content_len(n: &Node) -> usize {
         NodeKind::Html { raw } => raw.len(),
         NodeKind::Paragraph { inlines }
         | NodeKind::Heading { inlines, .. }
+        | NodeKind::HtmlHeading { inlines, .. }
+        | NodeKind::Details { inlines }
+        | NodeKind::HtmlHeading { inlines, .. }
+        | NodeKind::Details { inlines }
         | NodeKind::Quote { inlines }
         | NodeKind::Alert { inlines, .. } => inlines_len(inlines),
         _ => 0,
@@ -2553,6 +2628,14 @@ fn node_from_proj(p: &Projection, b: &ProjBlock, src: &str) -> Node {
         BlockExtra::Html => NodeKind::Html {
             raw: src.get(b.source.clone()).unwrap_or("").to_string(),
         },
+        BlockExtra::HtmlHeading(level) => NodeKind::HtmlHeading {
+            level: *level,
+            inlines: inlines_in(p, b.display.clone()),
+        },
+        BlockExtra::Details { .. } => NodeKind::Details {
+            inlines: inlines_in(p, b.display.clone()),
+        },
+        BlockExtra::DetailsClose => NodeKind::DetailsClose,
         BlockExtra::Text => NodeKind::Paragraph {
             inlines: inlines_in(p, b.display.clone()),
         },
@@ -2935,6 +3018,13 @@ fn node_to_gfm(n: &Node, links: &[String]) -> String {
         NodeKind::Rule => "---".into(),
         NodeKind::Image { alt, src } => format!("![{alt}]({src})"),
         NodeKind::Html { raw } => raw.clone(),
+        NodeKind::HtmlHeading { level, inlines } => {
+            format!("<h{level}>{}</h{level}>", inlines_to_gfm(inlines, links))
+        }
+        NodeKind::Details { inlines } => {
+            format!("<details>\n<summary>{}</summary>", inlines_to_gfm(inlines, links))
+        }
+        NodeKind::DetailsClose => "</details>".into(),
     }
 }
 
@@ -3098,6 +3188,26 @@ fn emit_node(
         NodeKind::Heading { level, inlines } => {
             emit_inlines(inlines, display, segments, links);
             (BlockExtra::Heading(*level), BlockKind::Heading(*level))
+        }
+        NodeKind::HtmlHeading { level, inlines } => {
+            emit_inlines(inlines, display, segments, links);
+            (BlockExtra::HtmlHeading(*level), BlockKind::Heading(*level))
+        }
+        NodeKind::Details { inlines } => {
+            emit_inlines(inlines, display, segments, links);
+            let summary = inlines_text(inlines);
+            (BlockExtra::Details { summary }, BlockKind::Html)
+        }
+        NodeKind::DetailsClose => {
+            let d0 = display.len();
+            if display.len() == d0 {
+                segments.push(Segment {
+                    display: d0..d0,
+                    source: d0..d0,
+                    marks: Marks::default(),
+                });
+            }
+            (BlockExtra::DetailsClose, BlockKind::Html)
         }
         NodeKind::Quote { inlines } => {
             emit_inlines(inlines, display, segments, links);
