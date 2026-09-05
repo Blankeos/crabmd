@@ -1345,6 +1345,15 @@ impl Doc {
         if loc.offset > 0 {
             return None;
         }
+        // Inside a disclosure, backspace ejects the block after `</details>`
+        // (same as shift-tab) instead of merging into the previous body node.
+        // Lists keep their own item behavior.
+        let is_list = matches!(self.nodes.get(loc.node).map(|n| &n.kind), Some(NodeKind::List { .. }));
+        if !is_list {
+            if let Some(nix) = self.eject_from_details(loc.node) {
+                return Some(self.caret_after(nix, self.last_item(nix), None, 0));
+            }
+        }
         match &self.nodes[loc.node].kind {
             NodeKind::List { .. } => return Some(self.backspace_list(loc)),
             NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. } | NodeKind::Code { .. } => {
@@ -2106,6 +2115,27 @@ impl Doc {
 
     pub fn tab(&mut self, caret: usize, outdent: bool) -> Option<usize> {
         let loc = self.loc(caret);
+        // `<details>` bodies behave like list nesting: shift-tab ejects the
+        // block after the matching `</details>`; tab on the block directly
+        // after a `</details>` adopts it as the last body block. This covers
+        // the Tab key and Helix/Vim `>`/`<` (both route through `doc.tab`).
+        if outdent {
+            // Nested list items outdent within the list first; only
+            // top-level blocks eject out of the disclosure.
+            let mut list_nested = false;
+            if let NodeKind::List { items, .. } = &self.nodes[loc.node].kind {
+                if let Some(ix) = loc.item {
+                    list_nested = items.get(ix).is_some_and(|it| it.indent > 0);
+                }
+            }
+            if !list_nested {
+                if let Some(nix) = self.eject_from_details(loc.node) {
+                    return Some(self.caret_after(nix, self.last_item(nix), None, loc.offset));
+                }
+            }
+        } else if self.adopt_into_details(loc.node) {
+            return Some(self.caret_after(loc.node - 1, self.last_item(loc.node - 1), None, loc.offset));
+        }
         let ix = loc.item?;
         if self.tab_item_at(loc.node, ix, outdent) {
             Some(self.caret_after(loc.node, Some(ix), None, loc.offset))
@@ -2542,6 +2572,111 @@ impl Doc {
             t = self.above_details_close(t);
         }
         if t > o { t } else { o }
+    }
+
+    /// Innermost `<details>` opener enclosing `node` (strictly inside
+    /// `open..=close`). None when `node` is itself a Details/DetailsClose
+    /// or sits outside any disclosure. Nesting-aware via depth counting.
+    fn enclosing_details_opener(&self, node: usize) -> Option<usize> {
+        if node >= self.nodes.len() {
+            return None;
+        }
+        if matches!(
+            self.nodes[node].kind,
+            NodeKind::Details { .. } | NodeKind::DetailsClose
+        ) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (j, n) in self.nodes.iter().enumerate().take(node).rev() {
+            match &n.kind {
+                NodeKind::DetailsClose => depth += 1,
+                NodeKind::Details { .. } => {
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Matching `</details>` close for the opener at `opener_ix`
+    /// (depth-counted for nesting). None when never closed.
+    fn details_close_after(&self, opener_ix: usize) -> Option<usize> {
+        if !matches!(self.nodes.get(opener_ix)?.kind, NodeKind::Details { .. }) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (j, n) in self.nodes.iter().enumerate().skip(opener_ix) {
+            match &n.kind {
+                NodeKind::Details { .. } => depth += 1,
+                NodeKind::DetailsClose => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Shift-tab / backspace inside a disclosure: move `node` after the
+    /// matching `</details>` (eject one level). Returns the new index.
+    fn eject_from_details(&mut self, node: usize) -> Option<usize> {
+        let o = self.enclosing_details_opener(node)?;
+        let c = self.details_close_after(o)?;
+        if node <= o || node >= c {
+            return None;
+        }
+        let kind = self.nodes.remove(node);
+        // Removal shifts the close down by one (`node < c` always holds).
+        let at = c.min(self.nodes.len());
+        self.nodes.insert(at, kind);
+        Some(at)
+    }
+
+    /// Tab on the block directly after a `</details>`: adopt it as the last
+    /// body block (move before the close). True when a move happened; the
+    /// node lands at `node - 1`.
+    fn adopt_into_details(&mut self, node: usize) -> bool {
+        if node == 0 || node >= self.nodes.len() {
+            return false;
+        }
+        if !matches!(self.nodes[node - 1].kind, NodeKind::DetailsClose) {
+            return false;
+        }
+        if matches!(self.nodes[node].kind, NodeKind::DetailsClose) {
+            return false;
+        }
+        // The close must belong to a real opener; otherwise leave it alone.
+        let close_ix = node - 1;
+        let mut depth = 0usize;
+        let mut opener = None;
+        for (j, n) in self.nodes.iter().enumerate().take(close_ix + 1).rev() {
+            match &n.kind {
+                NodeKind::DetailsClose => depth += 1,
+                NodeKind::Details { .. } => {
+                    if depth <= 1 {
+                        opener = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if opener.is_none() {
+            return false;
+        }
+        let kind = self.nodes.remove(node);
+        let at = close_ix.min(self.nodes.len());
+        self.nodes.insert(at, kind);
+        true
     }
 }
 
@@ -4459,5 +4594,55 @@ mod feature_tests {
         let c = d.backspace(p.blocks[ti].display.start).expect("merge");
         assert_eq!(c, body_end, "c={c} {:?}", d.project().display);
         assert!(d.to_gfm().contains("bodytail"), "{:?}", d.to_gfm());
+    }
+
+    #[test]
+    fn tab_outdent_ejects_body_block_after_close() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\nmore\n\n</details>\n");
+        let p = d.project();
+        let bi = p.blocks.iter().position(|b| p.display.get(b.display.clone()) == Some("body")).unwrap();
+        let c = d.tab(p.blocks[bi].display.start, true).expect("eject");
+        let gfm = d.to_gfm();
+        // Body block moved after </details>, summary + sibling kept inside.
+        let close = gfm.find("</details>").unwrap();
+        assert!(gfm[close..].contains("body"), "{gfm:?}");
+        assert!(gfm[..close].contains("more"), "{gfm:?}");
+        let p2 = d.project();
+        assert!(c <= p2.display.len());
+    }
+
+    #[test]
+    fn tab_indent_adopts_trailing_block_into_details() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n\ntail\n");
+        let p = d.project();
+        let ti = p.blocks.iter().position(|b| p.display.get(b.display.clone()) == Some("tail")).unwrap();
+        let c = d.tab(p.blocks[ti].display.start, false).expect("adopt");
+        let gfm = d.to_gfm();
+        let close = gfm.find("</details>").unwrap();
+        assert!(gfm[..close].contains("tail"), "{gfm:?}");
+        let p2 = d.project();
+        assert!(c <= p2.display.len());
+    }
+
+    #[test]
+    fn tab_indent_nonadjacent_block_stays_outside() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n\nmid\n\ntail\n");
+        let p = d.project();
+        let ti = p.blocks.iter().position(|b| p.display.get(b.display.clone()) == Some("tail")).unwrap();
+        // Not directly after the close → no adopt (plain tab has no non-list target).
+        assert!(d.tab(p.blocks[ti].display.start, false).is_none());
+    }
+
+    #[test]
+    fn backspace_body_start_ejects_after_close() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n");
+        let p = d.project();
+        let bi = p.blocks.iter().position(|b| p.display.get(b.display.clone()) == Some("body")).unwrap();
+        let c = d.backspace(p.blocks[bi].display.start).expect("eject");
+        let gfm = d.to_gfm();
+        let close = gfm.find("</details>").unwrap();
+        assert!(gfm[close..].contains("body"), "{gfm:?}");
+        let p2 = d.project();
+        assert_eq!(c, p2.blocks.iter().find(|b| p2.display.get(b.display.clone()) == Some("body")).unwrap().display.start, "c={c} {:?}", p2.display);
     }
 }

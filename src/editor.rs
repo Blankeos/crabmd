@@ -192,20 +192,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-b", WordBackWs, Some("Normal")),
         KeyBinding::new("shift-e", WordEndWs, Some("Normal")),
         KeyBinding::new("0", Digit0, Some("Normal")),
-        KeyBinding::new("^", LineFirstNonBlank, Some("Normal")),
-        KeyBinding::new("$", LineEnd, Some("Normal")),
+        KeyBinding::new("^", LineFirstNonBlank, Some("Vim && Normal")),
+        KeyBinding::new("$", LineEnd, Some("Vim && Normal")),
         KeyBinding::new("g", PendingG, Some("Normal")),
         KeyBinding::new("z", PendingZ, Some("Normal")),
-        KeyBinding::new("shift-g", LastDoc, Some("Vim")),
-        KeyBinding::new("x", SelectLine, Some("Helix")),
-        KeyBinding::new("x", DeleteChar, Some("Vim")),
+        KeyBinding::new("shift-g", LastDoc, Some("Vim && Normal")),
+        KeyBinding::new("x", SelectLine, Some("Helix && Normal")),
+        KeyBinding::new("x", DeleteChar, Some("Vim && Normal")),
         KeyBinding::new("d", DeleteOp, Some("Normal")),
-        KeyBinding::new("shift-d", DeleteToEnd, Some("Vim")),
+        KeyBinding::new("shift-d", DeleteToEnd, Some("Vim && Normal")),
         KeyBinding::new("v", VisualChar, Some("Normal")),
-        KeyBinding::new("shift-v", VisualLine, Some("Vim")),
+        KeyBinding::new("shift-v", VisualLine, Some("Vim && Normal")),
         KeyBinding::new("u", Undo, Some("Normal")),
-        KeyBinding::new("shift-u", Redo, Some("Helix")),
-        KeyBinding::new("ctrl-r", Redo, Some("Vim")),
+        KeyBinding::new("shift-u", Redo, Some("Helix && Normal")),
+        KeyBinding::new("ctrl-r", Redo, Some("Vim && Normal")),
         KeyBinding::new("1", Digit1, Some("Normal")),
         KeyBinding::new("2", Digit2, Some("Normal")),
         KeyBinding::new("3", Digit3, Some("Normal")),
@@ -230,7 +230,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-/", SearchBack, Some("Normal")),
         KeyBinding::new("cmd-f", OpenSearch, Some("Workspace")),
         KeyBinding::new("ctrl-f", OpenSearch, Some("Workspace")),
-        KeyBinding::new("/", InsertSlash, Some("Helix")),
+        KeyBinding::new("/", InsertSlash, Some("Helix && Normal")),
         KeyBinding::new("/", InsertSlash, Some("Notion")),
         KeyBinding::new("n", SearchNext, Some("Normal")),
         KeyBinding::new("shift-n", SearchPrev, Some("Normal")),
@@ -951,17 +951,24 @@ impl Workspace {
             return;
         };
         let viewport = self.scroll_handle.bounds();
-        if let Some(bounds) = self.scroll_handle.bounds_for_item(ix) {
-            if viewport.size.height > px(0.) && bounds.size.height > viewport.size.height {
+        // No layout yet (or a caret outside any unit): never scroll blind —
+        // a guess here jumps the surface and can blank the window until the
+        // next corrective scroll (e.g. footer "disappearing" on type/esc).
+        if viewport.size.height <= px(0.) {
+            return;
+        }
+        let Some(bounds) = self.scroll_handle.bounds_for_item(ix) else {
+            return;
+        };
+        if bounds.size.height > viewport.size.height {
+            return;
+        }
+        {
+            let offset = self.scroll_handle.offset();
+            let top = bounds.top() + offset.y;
+            let bottom = bounds.bottom() + offset.y;
+            if top >= viewport.top() && bottom <= viewport.bottom() {
                 return;
-            }
-            if viewport.size.height > px(0.) {
-                let offset = self.scroll_handle.offset();
-                let top = bounds.top() + offset.y;
-                let bottom = bounds.bottom() + offset.y;
-                if top >= viewport.top() && bottom <= viewport.bottom() {
-                    return;
-                }
             }
         }
         self.scroll_handle.scroll_to_item(ix);
@@ -8284,9 +8291,25 @@ impl Workspace {
         if self.pending_op == Some(kind) {
             let count = take_count(&mut self.pending_count);
             self.clear_pending();
-            let mut range = visual_line_range(&self.source, self.caret);
+            // NOTE: caret + ranges are display offsets (not GFM source).
+            // `>>` must target the same block Tab would (`doc.tab` at the
+            // caret line), so build the range from the display buffer.
+            let display = self.proj().display;
+            let caret = self.caret.min(display.len());
+            let mut range = logical_line_range(&display, caret);
             for _ in 1..count {
-                range = extend_visual_line(&self.source, range, 1);
+                if range.end >= display.len() {
+                    break;
+                }
+                let nxt = (range.end + 1).min(display.len());
+                let next_line = logical_line_range(&display, nxt);
+                if next_line.start <= range.start && next_line.end <= range.end {
+                    break;
+                }
+                range = range.start..next_line.end;
+                if range.end >= display.len() {
+                    break;
+                }
             }
             self.apply_indent_range(range, kind, window, cx);
         } else {
@@ -8317,11 +8340,26 @@ impl Workspace {
         // from the pre-edit snapshot; applied bottom-up / top-down below).
         let display = self.proj().display;
         let mut starts = Vec::new();
+        // Normalize exclusive `b`: when it sits exactly at a line start it
+        // belongs to the next line (e.g. VisualLine sels include the trailing
+        // newline), so it must not pull an extra line into the operator.
+        let mut b_norm = b;
+        if b_norm > a && b_norm <= display.len() {
+            let lb = logical_line_range(&display, b_norm.min(display.len()));
+            // `logical_line_range` clamps, so only treat as line-start when
+            // `b` is strictly inside the buffer or at len with a preceding
+            // newline (i.e. it really starts a new line).
+            let at_line_start = lb.start == b_norm
+                && (b_norm < display.len()
+                    || display.as_bytes().last() == Some(&b'\n'));
+            if at_line_start {
+                b_norm = b_norm.saturating_sub(1);
+            }
+        }
         let mut line = logical_line_range(&display, a);
-        // Include the line containing `b` (exclusive end may sit at its start).
         loop {
             starts.push(line.start);
-            if line.end >= b || line.end >= display.len() {
+            if line.end >= b_norm || line.end >= display.len() {
                 break;
             }
             let next = logical_line_range(&display, line.end + 1);
@@ -8456,16 +8494,41 @@ impl Workspace {
         self.pending_replace = None;
         self.pending_find = None;
         self.pending_bracket = None;
+        // NOTE: caret + ranges are display offsets (not GFM source). Build
+        // operator ranges from the display buffer so `>j` / `>G` hit the same
+        // blocks Tab would.
+        let display = self.proj().display;
+        let caret = self.caret.min(display.len());
+        let first = logical_line_range(&display, caret);
         let range = if to_end {
-            let first = visual_line_range(&self.source, self.caret);
-            first.start..self.source.len()
+            first.start..display.len()
         } else if to_start {
-            0..visual_line_range(&self.source, self.caret).end
+            0..first.end
         } else {
             // Operator + motion covers the motion (`>j` = current + next).
-            let mut r = visual_line_range(&self.source, self.caret);
+            let mut r = first;
             for _ in 0..count {
-                r = extend_visual_line(&self.source, r, dir);
+                if dir >= 0 {
+                    if r.end >= display.len() {
+                        break;
+                    }
+                    let nxt = (r.end + 1).min(display.len());
+                    let next_line = logical_line_range(&display, nxt);
+                    if next_line.start <= r.start && next_line.end <= r.end {
+                        break;
+                    }
+                    r = r.start..next_line.end;
+                } else {
+                    if r.start == 0 {
+                        break;
+                    }
+                    let prev = logical_line_range(&display, r.start.saturating_sub(1));
+                    // Guard against no-progress on empty buffers.
+                    if prev.start >= r.start {
+                        break;
+                    }
+                    r = prev.start..r.end;
+                }
             }
             r
         };

@@ -429,6 +429,8 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::on_new_window))
             .on_action(cx.listener(Self::on_close_window))
             .child(self.render_tab_bar(cx))
-            .child(active)
+            // Flex-1 wrapper (not `size_full` on the workspace itself) so the
+            // tab bar never pushes the workspace footer off the window bottom.
+            .child(v_flex().flex_1().w_full().min_h_0().child(active))
     }
 }

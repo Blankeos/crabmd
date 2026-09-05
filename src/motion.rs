@@ -253,6 +253,20 @@ pub fn word_range_at(source: &str, offset: usize) -> Range<usize> {
     let Some((_, c)) = next_char(source, probe) else {
         return offset..offset;
     };
+    // Caret resting on the line break (Normal-mode `$` / `gl` parks on the
+    // newline): text objects target the line's last word instead of no-op.
+    // Mid-line blanks still return empty.
+    let probe = if c == '\n' {
+        match prev_char(source, probe) {
+            Some((n, pc)) if !pc.is_whitespace() => probe - n,
+            _ => return offset..offset,
+        }
+    } else {
+        probe
+    };
+    let Some((_, c)) = next_char(source, probe) else {
+        return offset..offset;
+    };
     let cls = class(c);
     if cls == Class::Blank {
         return offset..offset;
@@ -276,6 +290,19 @@ pub fn big_word_range_at(source: &str, offset: usize) -> Range<usize> {
         }
     } else {
         offset
+    };
+    let Some((_, c)) = next_char(source, probe) else {
+        return offset..offset;
+    };
+    // Same EOL back-off as `word_range_at`: a caret parked on the line
+    // break targets the line's last WORD.
+    let probe = if c == '\n' {
+        match prev_char(source, probe) {
+            Some((n, pc)) if !pc.is_whitespace() => probe - n,
+            _ => return offset..offset,
+        }
+    } else {
+        probe
     };
     let Some((_, c)) = next_char(source, probe) else {
         return offset..offset;
@@ -1465,6 +1492,18 @@ mod word_select_tests {
         assert_eq!(big_word_range_at("foo-bar baz", 2), 0..7);
         assert_eq!(big_word_range_at("foo-bar baz", 8), 8..11);
         assert_eq!(big_word_range_at("foo bar", 3), 3..3);
+    }
+
+    #[test]
+    fn word_range_at_eol_targets_last_word() {
+        // Caret parked on the line break (Normal `$`/`gl`): miw/viw still
+        // selects the line's last word instead of no-op.
+        assert_eq!(word_range_at("Title\nnext", 5), 0..5);
+        assert_eq!(big_word_range_at("Title\nnext", 5), 0..5);
+        // Mid-line blanks still select nothing.
+        assert_eq!(word_range_at("a b", 1), 1..1);
+        // Empty line break backs onto whitespace → nothing.
+        assert_eq!(word_range_at("a\n\nb", 2), 2..2);
     }
 
     #[test]
