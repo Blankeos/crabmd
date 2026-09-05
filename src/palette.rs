@@ -320,7 +320,16 @@ pub enum PaletteAction {
 pub struct PaletteItem {
     pub label: &'static str,
     pub hint: &'static str,
+    pub shortcut: Option<&'static str>,
     pub action: PaletteAction,
+}
+
+impl PaletteItem {
+    /// Right-side text, Zed-style: real shortcut when one exists,
+    /// otherwise the fuzzy hint (e.g. theme appearance).
+    pub fn right(&self) -> &'static str {
+        self.shortcut.unwrap_or(self.hint)
+    }
 }
 
 pub fn items_for(mode: PaletteMode, view_source: bool) -> Vec<PaletteItem> {
@@ -335,17 +344,20 @@ pub fn root_commands(view_source: bool) -> Vec<PaletteItem> {
     vec![
         PaletteItem {
             label: "Change Theme…",
-            hint: "appearance",
+            hint: "appearance themes",
+            shortcut: Some("⌘K T"),
             action: PaletteAction::OpenThemes,
         },
         PaletteItem {
             label: "Change Editor…",
             hint: "helix / vim / notion",
+            shortcut: None,
             action: PaletteAction::OpenEditors,
         },
         PaletteItem {
             label: "Toggle Full Width",
             hint: "column",
+            shortcut: None,
             action: PaletteAction::ToggleFullWidth,
         },
         PaletteItem {
@@ -354,12 +366,14 @@ pub fn root_commands(view_source: bool) -> Vec<PaletteItem> {
             } else {
                 "Show Markdown Source"
             },
-            hint: "source",
+            hint: "source markdown",
+            shortcut: Some("⌘⇧V"),
             action: PaletteAction::ToggleSource,
         },
         PaletteItem {
             label: "Settings",
             hint: "preferences",
+            shortcut: Some("⌘,"),
             action: PaletteAction::OpenSettings,
         },
     ]
@@ -371,6 +385,7 @@ pub fn theme_commands() -> Vec<PaletteItem> {
         .map(|name| PaletteItem {
             label: name,
             hint: theme::appearance_hint(name),
+            shortcut: None,
             action: PaletteAction::SetTheme(name),
         })
         .collect()
@@ -386,6 +401,7 @@ pub fn editor_commands() -> Vec<PaletteItem> {
     .map(|(kind, label, hint)| PaletteItem {
         label,
         hint,
+        shortcut: None,
         action: PaletteAction::SetEditor(kind),
     })
     .collect()
@@ -403,6 +419,9 @@ pub fn filter_items(items: &[PaletteItem], query: &str) -> Vec<PaletteItem> {
         .filter(|item| {
             item.label.to_ascii_lowercase().contains(&q)
                 || item.hint.to_ascii_lowercase().contains(&q)
+                || item
+                    .shortcut
+                    .is_some_and(|s| s.to_ascii_lowercase().contains(&q))
         })
         .collect()
 }

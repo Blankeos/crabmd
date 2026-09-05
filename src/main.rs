@@ -467,6 +467,7 @@ Keys (Helix / Vim normal — tabbed buffers):
   cmd-q         quit the app (prompts per window, removes the socket)
   cmd/ctrl-s    save (explicit write; no autosave)
   cmd-shift-p   command palette (theme, editor, full width, source)
+  cmd-shift-v   toggle markdown source view
   cmd-k t       theme picker (zed-style chord; cmd may stay held for t)
   cmd-,         settings
   cmd-f         find

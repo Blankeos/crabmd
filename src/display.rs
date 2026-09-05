@@ -1063,48 +1063,6 @@ fn body_abs_range(slice: &str, body: &str, abs: usize) -> Range<usize> {
     }
 }
 
-/// Inline `code` with GitHub-like in-flow side bearings: one real space
-/// each side, code-marked so the pill wash covers it. The spaces are layout
-/// width, so neighbors keep their word gap (margin) *and* the pill gets
-/// inner padding — an overlay alone can never do both. Pad segments carry
-/// zero-width source (the code boundary), so caret/save mapping is
-/// unaffected. A side the code text already pads (leading/trailing
-/// whitespace) gets no extra space.
-fn emit_code(
-    display: &mut String,
-    segments: &mut Vec<Segment>,
-    source: Range<usize>,
-    text: &str,
-    marks: Marks,
-) {
-    let code_marks = Marks {
-        code: true,
-        ..marks
-    };
-    if text.is_empty() {
-        emit_plain(display, segments, source, text, code_marks);
-        return;
-    }
-    let mut pad = |display: &mut String, segments: &mut Vec<Segment>, at: usize| {
-        let d0 = display.len();
-        display.push(' ');
-        segments.push(Segment {
-            display: d0..display.len(),
-            source: at..at,
-            marks: code_marks,
-        });
-    };
-    if !text.starts_with(char::is_whitespace) {
-        let at = source.start;
-        pad(display, segments, at);
-    }
-    let end = source.end;
-    emit_plain(display, segments, source, text, code_marks);
-    if !text.ends_with(char::is_whitespace) {
-        pad(display, segments, end);
-    }
-}
-
 fn emit_plain(
     display: &mut String,
     segments: &mut Vec<Segment>,
@@ -1311,7 +1269,16 @@ fn project_inlines(
                 } else {
                     abs.clone()
                 };
-                emit_code(display, segments, inner, text, marks);
+                emit_plain(
+                    display,
+                    segments,
+                    inner,
+                    text,
+                    Marks {
+                        code: true,
+                        ..marks
+                    },
+                );
             }
             Event::SoftBreak | Event::HardBreak => {
                 if skip_alert_label || skip_alert_break {
@@ -1475,7 +1442,16 @@ fn project_table(
             Event::Code(t) => {
                 let text = flatten_table_cell_text(t.as_ref());
                 if !text.trim().is_empty() || !t.is_empty() {
-                    emit_code(display, segments, abs, text.as_ref(), marks);
+                    emit_plain(
+                        display,
+                        segments,
+                        abs,
+                        text.as_ref(),
+                        Marks {
+                            code: true,
+                            ..marks
+                        },
+                    );
                 }
             }
             Event::Text(t) => {
@@ -1571,6 +1547,7 @@ pub const CODE_LANGS: &[&str] = &[
     "sql",
     "c",
     "cpp",
+    "mermaid",
 ];
 
 pub const COLUMN_PX: f32 = 740.0;

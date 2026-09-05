@@ -3480,49 +3480,24 @@ fn emit_inlines_inner(
     links: &mut Vec<String>,
     flatten_newlines: bool,
 ) {
-    for (i, run) in inlines.iter().enumerate() {
+    for run in inlines {
         let marks = run.marks;
         if let Some(id) = marks.link {
             while links.len() as u32 <= id {
                 links.push(String::new());
             }
         }
-        // GitHub-like in-flow side bearings for inline code (mirrors
-        // `emit_code` in display.rs): one real code-marked space each side
-        // of a code run so the pill gets inner padding while neighbors keep
-        // their word gap. Zero-width source so caret/save mapping is
-        // unaffected. Only at code boundaries — consecutive code runs share
-        // one pill — and never beside existing whitespace.
-        let mut pad = |display: &mut String, segments: &mut Vec<Segment>| {
-            let d0 = display.len();
-            display.push(' ');
-            segments.push(Segment {
-                display: d0..display.len(),
-                source: d0..d0,
-                marks,
-            });
-        };
-        let text: &str = if flatten_newlines {
-            &crate::display::flatten_table_cell_text(&run.text)
-        } else {
-            &run.text
-        };
-        let prev_code = i > 0 && inlines[i - 1].marks.code;
-        let next_code = i + 1 < inlines.len() && inlines[i + 1].marks.code;
-        if marks.code && !text.is_empty() && !prev_code && !text.starts_with(char::is_whitespace)
-        {
-            pad(display, segments);
-        }
         let d0 = display.len();
-        display.push_str(text);
+        if flatten_newlines {
+            display.push_str(&crate::display::flatten_table_cell_text(&run.text));
+        } else {
+            display.push_str(&run.text);
+        }
         segments.push(Segment {
             display: d0..display.len(),
             source: d0..display.len(),
             marks,
         });
-        if marks.code && !text.is_empty() && !next_code && !text.ends_with(char::is_whitespace) {
-            pad(display, segments);
-        }
     }
 }
 
@@ -4114,8 +4089,8 @@ mod feature_tests {
         c = d.insert_text(c, None, "code", Marks::default());
         c = d.insert_text(c, None, "`", Marks::default());
         let p = d.project();
-        assert_eq!(p.display, " code ");
-        assert!(p.marks_at(1, crate::display::Affinity::Inside).code);
+        assert_eq!(p.display, "code");
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).code);
         assert!(d.to_gfm().contains("`code`"), "{}", d.to_gfm());
         let _ = c;
     }

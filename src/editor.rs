@@ -138,6 +138,7 @@ actions!(
         CopySelection,
         PasteClipboard,
         SelectAll,
+        ToggleSource,
         IndentShift,
         DedentShift,
         AutoIndent,
@@ -193,7 +194,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("^", LineFirstNonBlank, Some("Normal")),
         KeyBinding::new("$", LineEnd, Some("Normal")),
         KeyBinding::new("g", PendingG, Some("Normal")),
-        KeyBinding::new("shift-g", LastDoc, Some("Normal")),
+        KeyBinding::new("shift-g", LastDoc, Some("Vim")),
         KeyBinding::new("x", SelectLine, Some("Helix")),
         KeyBinding::new("x", DeleteChar, Some("Vim")),
         KeyBinding::new("d", DeleteOp, Some("Normal")),
@@ -264,6 +265,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-c", CopySelection, Some("Workspace")),
         KeyBinding::new("cmd-v", PasteClipboard, Some("Workspace")),
         KeyBinding::new("ctrl-v", PasteClipboard, Some("Workspace")),
+        KeyBinding::new("cmd-shift-v", ToggleSource, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-v", ToggleSource, Some("Workspace")),
         KeyBinding::new("cmd-a", SelectAll, Some("Workspace")),
         KeyBinding::new("ctrl-a", SelectAll, Some("Workspace")),
         KeyBinding::new("%", SelectAll, Some("Helix && Normal")),
@@ -748,10 +751,13 @@ impl Workspace {
             return None;
         }
         // Prefer the live column width from the surface when painted so the
-        // char-column fallback matches soft-wrap more closely.
+        // char-column fallback matches soft-wrap more closely. Only full
+        // (unsegmented) blocks carry the text-area width — word pieces are
+        // content-sized — so skip small hits.
         let width = self
             .hits
             .iter()
+            .filter(|h| h.doc_len > 40)
             .find_map(|h| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.layout.bounds()))
                     .ok()
@@ -1723,11 +1729,12 @@ impl Workspace {
     }
 
     /// Prefer real TextLayout wraps over the char-column estimate so up/down
-    /// stay on the painted visual row within a soft-wrapped block.
+    /// stay on the painted visual row within a soft-wrapped block. Resolves
+    /// across word-piece hits via the shared nearest-glyph lookup, then
+    /// requires row progress inside the same block (edge rows fall back to
+    /// char-column motion).
     fn layout_move_vertical(&mut self, from: usize, down: bool) -> Option<usize> {
-        let hit = self.hits.iter().find(|h| {
-            from >= h.display_start && from <= h.display_start.saturating_add(h.doc_len)
-        })?;
+        let hit = surface::piece_for_offset(&self.hits, from)?;
         let local = from.saturating_sub(hit.display_start).min(hit.doc_len);
         let layout = hit.layout.clone();
         let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1737,8 +1744,6 @@ impl Workspace {
         .flatten()?;
         let line_h =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.line_height())).ok()?;
-        let bounds =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| layout.bounds())).ok()?;
         if line_h <= px(0.) {
             return None;
         }
@@ -1748,18 +1753,29 @@ impl Workspace {
         } else {
             pos.y - (line_h * 0.5)
         };
-        if target_y < bounds.top() || target_y >= bounds.bottom() {
+        let target = point(*goal, target_y);
+        let next = surface::index_for_point(&self.hits, target)?;
+        if next == from {
             return None;
         }
-        let target = point(*goal, target_y);
-        let idx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            layout.index_for_position(target)
+        // Same block, and strictly onto another visual row.
+        let p = self.proj();
+        let blk = p.block_at_display(from)?;
+        if next < blk.display.start || next > blk.display.end {
+            return None;
+        }
+        let hit2 = surface::piece_for_offset(&self.hits, next)?;
+        let local2 = next.saturating_sub(hit2.display_start).min(hit2.doc_len);
+        let pos2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hit2.layout.position_for_index(local2)
         }))
-        .ok()?
-        .unwrap_or_else(|e| e)
-        .min(hit.doc_len);
-        let next = hit.display_start + idx;
-        if next == from {
+        .ok()
+        .flatten()?;
+        let dy: f32 = (pos2.y - pos.y).into();
+        if down && dy <= 0.5 {
+            return None;
+        }
+        if !down && dy >= -0.5 {
             return None;
         }
         Some(next)
@@ -3149,6 +3165,30 @@ impl Workspace {
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_palette(PaletteMode::Root, window, cx);
     }
+    fn on_toggle_source(
+        &mut self,
+        _: &ToggleSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.prevent_default();
+        // Dismiss transient UI so the raw source gets the full surface.
+        self.cmd_palette = None;
+        self.palette_theme_backup = None;
+        self.command = None;
+        self.search = None;
+        self.toggle_source(window, cx);
+    }
+    fn toggle_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.view_source = !self.view_source;
+        if self.view_source {
+            self.status = "source view — esc/cmd-shift-v to exit".into();
+        } else {
+            self.status = if self.dirty { "unsaved" } else { "ready" }.into();
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
     /// Open the palette, optionally straight into a submenu (settings theme
     /// picker opens Themes directly).
     fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -3269,13 +3309,8 @@ impl Workspace {
                 self.close_palette(window, cx);
             }
             PaletteAction::ToggleSource => {
-                self.view_source = !self.view_source;
-                if self.view_source {
-                    self.status = "source view — esc/cmd-shift-p to exit".into();
-                } else {
-                    self.status = if self.dirty { "unsaved" } else { "ready" }.into();
-                }
                 self.close_palette(window, cx);
+                self.toggle_source(window, cx);
             }
             PaletteAction::OpenSettings => {
                 // Discard any uncommitted theme preview before leaving.
@@ -5024,7 +5059,7 @@ impl Workspace {
                                                         div()
                                                             .text_xs()
                                                             .text_color(p.text_muted)
-                                                            .child(item.hint),
+                                                            .child(item.right()),
                                                     ),
                                             )
                                             .into_any_element()
@@ -5143,6 +5178,12 @@ impl Workspace {
                 code_ranges,
             ))
         };
+        // Mixed-size inline code (85% of body). Mono blocks stay uniform.
+        let code_px = if _mono {
+            None
+        } else {
+            font_px.filter(|_| code_font.is_some()).map(|s| s * crate::surface::INLINE_CODE_SCALE)
+        };
         surface::edit_text(
             view.clone(),
             focus,
@@ -5161,6 +5202,7 @@ impl Workspace {
             font_px,
             heading,
             code_font,
+            code_px,
             {
                 let view = view.clone();
                 move |d, shift, cmd, clicks, window, cx| {
@@ -8431,6 +8473,7 @@ impl Workspace {
             font_px,
             false,
             None,
+            None,
             |_, _, _, _, _, _| {},
             |_, _, _| {},
         );
@@ -9836,22 +9879,21 @@ impl EntityInputHandler for Workspace {
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
         let p = self.proj();
         let start = Self::offset_from_utf16(&p.display, range_utf16.start);
-        for hit in &self.hits {
-            let len =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.len())).ok()?;
-            if start >= hit.display_start && start <= hit.display_start + len {
-                let local = start.saturating_sub(hit.display_start);
-                let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hit.layout.position_for_index(local)
-                }))
-                .ok()
-                .flatten()?;
-                let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    hit.layout.line_height()
-                }))
-                .unwrap_or(px(16.));
-                return Some(gpui::Bounds::new(pos, gpui::size(px(2.), h)));
-            }
+        let hit = surface::piece_for_offset(&self.hits, start)?;
+        let len =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hit.layout.len())).ok()?;
+        if start >= hit.display_start && start <= hit.display_start + len {
+            let local = start.saturating_sub(hit.display_start);
+            let pos = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hit.layout.position_for_index(local)
+            }))
+            .ok()
+            .flatten()?;
+            let h = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hit.layout.line_height()
+            }))
+            .unwrap_or(px(16.));
+            return Some(gpui::Bounds::new(pos, gpui::size(px(2.), h)));
         }
         None
     }
@@ -9898,7 +9940,7 @@ impl Render for Workspace {
         let search_pos = self.search_position();
         let search_view = cx.entity();
         let status = if self.view_source {
-            SharedString::from("source view — esc/cmd-shift-p to exit")
+            SharedString::from("source view — esc/cmd-shift-v to exit")
         } else {
             self.status.clone()
         };
@@ -9988,6 +10030,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_selection))
             .on_action(cx.listener(Self::on_paste_clipboard))
             .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_toggle_source))
             .on_action(cx.listener(Self::on_indent_shift))
             .on_action(cx.listener(Self::on_dedent_shift))
             .on_action(cx.listener(Self::on_auto_indent))
