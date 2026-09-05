@@ -42,9 +42,9 @@ use crate::images;
 use crate::mermaid::{self, MermaidStore};
 use crate::mode::{self, Caret, ExCommand, Mode};
 use crate::motion::{
-    after_caret_same_line, apply_motion, block_caret_range, extend_visual_line, find_char,
+    after_caret_same_line, apply_motion, block_caret_range, find_char,
     first_non_blank_in, last_line_start, line_start_n, logical_line_range, paragraph_jump,
-    push_count, search_next, search_prev, take_count, visual_line_range, whichwrap, word_range_at,
+    push_count, search_next, search_prev, take_count, whichwrap, word_range_at,
     FindKind, Motion,
 };
 use crate::palette::{LineField, PaletteAction, PaletteMode, PaletteState};
@@ -94,6 +94,7 @@ actions!(
         Digit8,
         Digit9,
         SelectLine,
+        ExtendLineBounds,
         DeleteOp,
         DeleteChar,
         DeleteToEnd,
@@ -199,6 +200,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", LastDoc, Some("Vim && Normal")),
         KeyBinding::new("x", SelectLine, Some("Helix && Normal")),
         KeyBinding::new("x", DeleteChar, Some("Vim && Normal")),
+        // Helix `X`: expand selection to line bounds (no auto-extend on
+        // repeat). Lowercase `x` in Select does the same first, then extends
+        // on repeat (`extend_line_below`).
+        KeyBinding::new("shift-x", ExtendLineBounds, Some("Helix && Normal")),
         KeyBinding::new("d", DeleteOp, Some("Normal")),
         KeyBinding::new("shift-d", DeleteToEnd, Some("Vim && Normal")),
         KeyBinding::new("v", VisualChar, Some("Normal")),
@@ -491,6 +496,10 @@ pub struct Workspace {
     pending_z: bool,
     pending_count: Option<usize>,
     visual_anchor: Option<usize>,
+    /// Helix `x` line-select is sticky: `j`/`k` (and any motion via
+    /// `snap_visual_sel`) stays linewise until esc / `v` / mode exit.
+    /// Vim `V` uses `Mode::VisualLine`; Helix uses `Mode::Select` + flag.
+    select_linewise: bool,
     slash_index: usize,
     last_slash_query: String,
     focus: FocusHandle,
@@ -627,6 +636,7 @@ impl Workspace {
             pending_z: false,
             pending_count: None,
             visual_anchor: None,
+            select_linewise: false,
             slash_index: 0,
             last_slash_query: String::new(),
             focus: cx.focus_handle(),
@@ -788,6 +798,7 @@ impl Workspace {
     fn commit_caret(&mut self, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.caret = caret.min(self.proj().display.len());
         self.sel = None;
+        self.select_linewise = false;
         self.mark_dirty();
         self.refresh(window, cx);
         self.sync_title(window);
@@ -886,9 +897,19 @@ impl Workspace {
         let p = self.proj();
         let da = anchor.min(p.display.len());
         let dc = self.caret.min(p.display.len());
-        if self.mode == Mode::VisualLine {
+        // Linewise: Vim `V` always; Helix `x` while `select_linewise` holds
+        // (charwise `v` / esc clears it). Expands any anchor/caret pair to
+        // full display lines (trailing newline inclusive, never the previous
+        // line's newline).
+        if self.mode == Mode::VisualLine
+            || (self.mode == Mode::Select && self.select_linewise)
+        {
             let a = da.min(dc);
             let b = da.max(dc);
+            // Linewise union: full lines containing anchor and head.
+            // Caret is kept inside its line (`line_end_caret`, never the next
+            // line's start), so no end-edge back-off — a head at a line start
+            // (e.g. `0`, empty line) genuinely belongs to that line.
             let start = logical_line_range(&p.display, a).start;
             let mut end = logical_line_range(&p.display, b).end;
             if end < p.display.len() && p.display.as_bytes()[end] == b'\n' {
@@ -906,6 +927,51 @@ impl Workspace {
         }
     }
 
+    /// One display line, trailing newline inclusive (never the previous
+    /// line's newline). Selection flavour of `logical_line_delete_range`,
+    /// whose last-line "steal the previous newline" is for `dd`, not `V`/`x`
+    /// (it would highlight the block above).
+    fn line_select_range(display: &str, offset: usize) -> Range<usize> {
+        let r = logical_line_range(display, offset);
+        let mut end = r.end;
+        if end < display.len() && display.as_bytes()[end] == b'\n' {
+            end += 1;
+        }
+        r.start..end
+    }
+
+    /// Caret for a linewise selection: last content offset, not `range.end`.
+    /// `range.end` includes the trailing newline (= next line's start), so it
+    /// renders the block caret in the *next* block. Back off one char (floored
+    /// for multibyte) so `V`/`x` sits at the end of the selected line.
+    fn line_end_caret(display: &str, range: Range<usize>) -> usize {
+        if range.end <= range.start {
+            return range.start.min(display.len());
+        }
+        let at = range.end.saturating_sub(1).min(display.len());
+        floor_char_boundary(display, at).max(range.start)
+    }
+
+    /// Grow a linewise selection by one display line. `dir > 0` extends down,
+    /// otherwise up. Pure display offsets (never GFM source).
+    fn extend_line_range(display: &str, sel: Range<usize>, dir: i8) -> Range<usize> {
+        let start = sel.start.min(sel.end).min(display.len());
+        let end = sel.start.max(sel.end).min(display.len());
+        if dir >= 0 {
+            let at = if end < display.len() {
+                end
+            } else {
+                end.saturating_sub(1)
+            };
+            let next = Self::line_select_range(display, at);
+            start.min(next.start)..end.max(next.end)
+        } else {
+            let at = start.saturating_sub(1);
+            let prev = Self::line_select_range(display, at);
+            prev.start.min(start)..end.max(prev.end)
+        }
+    }
+
     fn land(&mut self, next: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.caret = next.min(self.proj().display.len());
         if self.mode.extends_selection() {
@@ -916,6 +982,7 @@ impl Workspace {
         } else {
             self.sel = None;
             self.visual_anchor = None;
+            self.select_linewise = false;
             // Drop rectangular table selection on caret moves (unless still in that cell).
             if let Some(rect) = self.table_sel {
                 let still = self
@@ -1092,7 +1159,9 @@ impl Workspace {
     }
 
     fn uses_block_caret(&self) -> bool {
-        self.config.editor.is_modal() && !self.mode.is_insert() && !self.mode.is_visual()
+        // Modal navigation always keeps the block caret — Normal *and* visual
+        // (`v`/`V`/`x`). A thin `|` in visual reads as Insert mode.
+        self.config.editor.is_modal() && !self.mode.is_insert()
     }
 
     fn finish_insert_undo(&mut self) {
@@ -1127,6 +1196,7 @@ impl Workspace {
             self.mode = Mode::Normal;
             self.sel = None;
             self.visual_anchor = None;
+            self.select_linewise = false;
             self.refresh_raw(window, cx);
         }
         self.sync_title(window);
@@ -1379,6 +1449,7 @@ impl Workspace {
             } else {
                 self.mode
             };
+            self.select_linewise = false;
             self.snap_visual_sel();
         } else {
             self.caret = d;
@@ -1388,6 +1459,7 @@ impl Workspace {
                 self.mode = Mode::Normal;
                 self.sel = None;
                 self.visual_anchor = None;
+                self.select_linewise = false;
             } else {
                 self.sel = None;
             }
@@ -1475,6 +1547,8 @@ impl Workspace {
             } else {
                 Mode::Visual
             };
+            // Mouse drags are charwise; never inherit linewise `x`.
+            self.select_linewise = false;
         }
         match self.mouse_granularity {
             SelectGranularity::Char => {
@@ -1627,6 +1701,7 @@ impl Workspace {
             self.mode = Mode::Normal;
             self.sel = None;
             self.visual_anchor = None;
+            self.select_linewise = false;
             self.refresh(window, cx);
             return;
         }
@@ -1638,6 +1713,7 @@ impl Workspace {
         self.clear_pending();
         self.visual_anchor = None;
         self.sel = None;
+        self.select_linewise = false;
         self.refresh(window, cx);
     }
 
@@ -1648,6 +1724,7 @@ impl Workspace {
         self.mode = Mode::Insert;
         self.sel = None;
         self.visual_anchor = None;
+        self.select_linewise = false;
         self.clear_pending();
         match caret {
             Caret::Start => self.caret = 0,
@@ -1734,6 +1811,9 @@ impl Workspace {
                 } else {
                     Mode::Visual
                 };
+                // Shift-arrow keyboard selection is charwise; never inherit a
+                // stale linewise `x` flag.
+                self.select_linewise = false;
             }
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -1830,8 +1910,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let start = range.start.min(self.source.len());
-        let end = range.end.min(self.source.len());
+        // Ranges here are display offsets (surface hits); clamp to the display
+        // buffer, never GFM source (lengths diverge).
+        let n = self.proj().display.len();
+        let start = range.start.min(n);
+        let end = range.end.min(n);
         if shift {
             if self.visual_anchor.is_none() {
                 self.visual_anchor = Some(self.caret);
@@ -1842,6 +1925,7 @@ impl Workspace {
             } else {
                 Mode::Visual
             };
+            self.select_linewise = false;
             self.snap_visual_sel();
         } else {
             self.caret = start;
@@ -1850,6 +1934,7 @@ impl Workspace {
                 self.mode = Mode::Normal;
                 self.sel = None;
                 self.visual_anchor = None;
+                self.select_linewise = false;
             }
             let _ = end;
         }
@@ -1868,13 +1953,14 @@ impl Workspace {
             range.start
         };
         self.visual_anchor = Some(anchor);
-        self.caret = at.min(self.source.len());
+        self.caret = at.min(self.proj().display.len());
         if self.config.editor.is_modal() && !self.mode.is_insert() {
             self.mode = if self.config.editor == EditorKind::Helix {
                 Mode::Select
             } else {
                 Mode::Visual
             };
+            self.select_linewise = false;
         }
         self.snap_visual_sel();
         self.refresh_raw(window, cx);
@@ -2090,15 +2176,45 @@ impl Workspace {
             self.consume_pending_op_for_lines(1, false, false, window, cx);
             return;
         }
-        if self.mode == Mode::VisualLine {
+        // Linewise move (Vim `V`, Helix `Select`+linewise): `j` moves the head
+        // down, anchor stays fixed — `snap` recomputes the line union so `k`
+        // shrinks back instead of expanding both ways (`jkjk` used to grow
+        // up+down+up). Never union-extend the old selection itself.
+        if self.mode == Mode::VisualLine
+            || (self.mode == Mode::Select && self.select_linewise)
+        {
             window.prevent_default();
-            let sel = self
-                .sel
-                .clone()
-                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
-            let next = extend_visual_line(&self.source, sel, 1);
-            self.sel = Some(next.clone());
-            self.caret = next.end.min(self.source.len());
+            let count = take_count(&mut self.pending_count).max(1);
+            if self.visual_anchor.is_none() {
+                let a = self.sel.clone().map(|s| s.start).unwrap_or(self.caret);
+                self.visual_anchor = Some(a);
+            }
+            self.pending_g = false;
+            self.pending_z = false;
+            let p = self.proj();
+            let wrap = self.wrap_cols();
+            let mut at = self.caret.min(p.display.len());
+            for _ in 0..count {
+                let stepped = if let Some(n) = self.layout_move_vertical(at, true) {
+                    n
+                } else {
+                    let s = apply_motion(&p.display, at, Motion::Down, 1, wrap);
+                    if s == at {
+                        break;
+                    }
+                    s
+                };
+                let stepped = self.skip_hidden_rows(&p, stepped, Motion::Down, wrap);
+                if stepped == at {
+                    break;
+                }
+                at = stepped;
+            }
+            self.caret = at;
+            self.affinity = Affinity::Inside;
+            self.snap_visual_sel();
+            self.pending_d = false;
+            self.pending_op = None;
             self.refresh_raw(window, cx);
             return;
         }
@@ -2114,15 +2230,41 @@ impl Workspace {
             self.consume_pending_op_for_lines(-1, false, false, window, cx);
             return;
         }
-        if self.mode == Mode::VisualLine {
+        if self.mode == Mode::VisualLine
+            || (self.mode == Mode::Select && self.select_linewise)
+        {
             window.prevent_default();
-            let sel = self
-                .sel
-                .clone()
-                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
-            let next = extend_visual_line(&self.source, sel, -1);
-            self.sel = Some(next.clone());
-            self.caret = next.start;
+            let count = take_count(&mut self.pending_count).max(1);
+            if self.visual_anchor.is_none() {
+                let a = self.sel.clone().map(|s| s.start).unwrap_or(self.caret);
+                self.visual_anchor = Some(a);
+            }
+            self.pending_g = false;
+            self.pending_z = false;
+            let p = self.proj();
+            let wrap = self.wrap_cols();
+            let mut at = self.caret.min(p.display.len());
+            for _ in 0..count {
+                let stepped = if let Some(n) = self.layout_move_vertical(at, false) {
+                    n
+                } else {
+                    let s = apply_motion(&p.display, at, Motion::Up, 1, wrap);
+                    if s == at {
+                        break;
+                    }
+                    s
+                };
+                let stepped = self.skip_hidden_rows(&p, stepped, Motion::Up, wrap);
+                if stepped == at {
+                    break;
+                }
+                at = stepped;
+            }
+            self.caret = at;
+            self.affinity = Affinity::Inside;
+            self.snap_visual_sel();
+            self.pending_d = false;
+            self.pending_op = None;
             self.refresh_raw(window, cx);
             return;
         }
@@ -2356,20 +2498,122 @@ impl Workspace {
         }
         window.prevent_default();
         self.clear_pending();
-        if self.mode != Mode::Select {
-            self.mode = Mode::Select;
-            let range = visual_line_range(&self.source, self.caret);
-            self.visual_anchor = Some(range.start);
-            self.sel = Some(range.clone());
-            self.caret = range.end.min(self.source.len());
-        } else {
-            let sel = self
-                .sel
-                .clone()
-                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
-            let next = extend_visual_line(&self.source, sel, 1);
+        // Helix `x` (`extend_line_below`): NOT select mode. From Normal it
+        // selects the current display line (never GFM source); repeat `x`
+        // extends one line down. Movements after `x` replace (clear) the
+        // selection — only `v` enters extend mode. In Select (after `v` +
+        // moves) `x` first expands anchor..caret to line bounds end-to-end,
+        // then extends one line down on repeat.
+        let p = self.proj();
+        if self.mode == Mode::Select {
+            // Expand whatever was traversed since `v` to full lines.
+            let anchor = self
+                .visual_anchor
+                .or_else(|| self.sel.clone().map(|s| s.start))
+                .unwrap_or(self.caret);
+            let expanded = Self::lines_for_ends(&p.display, anchor, self.caret);
+            let already = self.select_linewise
+                && self.sel.as_ref().is_some_and(|s| *s == expanded);
+            let next = if already {
+                // Repeat `x` once at bounds: extend one line down.
+                Self::extend_line_range(&p.display, expanded, 1)
+            } else {
+                expanded
+            };
+            self.select_linewise = true;
+            self.visual_anchor = Some(next.start);
             self.sel = Some(next.clone());
-            self.caret = next.end.min(self.source.len());
+            // End of the last selected line, not the next block's start.
+            self.caret = Self::line_end_caret(&p.display, next);
+        } else {
+            // Normal: one-shot line selection (stay in Normal so `j`/`k`
+            // replace/clear instead of extending).
+            let cur = Self::line_select_range(&p.display, self.caret);
+            // Repeat `x` keeps extending while the existing selection is the
+            // current line or a line-aligned run containing the caret (2nd,
+            // 3rd, … press grows the run by one line).
+            let next = if self.sel.as_ref().is_some_and(|s| {
+                *s == cur
+                    || (s.start < s.end
+                        && self.caret >= s.start
+                        && self.caret <= s.end
+                        && Self::line_select_range(&p.display, s.start) == *s)
+            }) {
+                let base = self
+                    .sel
+                    .clone()
+                    .filter(|s| s.start < s.end)
+                    .unwrap_or_else(|| cur.clone());
+                // Union in case the caret line is outside the run.
+                let base = base.start.min(cur.start)..base.end.max(cur.end);
+                Self::extend_line_range(&p.display, base, 1)
+            } else {
+                cur
+            };
+            self.mode = Mode::Normal;
+            self.select_linewise = false;
+            self.visual_anchor = None;
+            self.sel = Some(next.clone());
+            self.caret = Self::line_end_caret(&p.display, next);
+        }
+        self.refresh_raw(window, cx);
+    }
+
+    /// Full-line union covering both `a` and `b` (each expanded to its display
+    /// line, trailing newline inclusive). Used by Helix `x`/`X` in Select to
+    /// select every traversed line end-to-end.
+    fn lines_for_ends(display: &str, a: usize, b: usize) -> Range<usize> {
+        let ra = Self::line_select_range(display, a.min(display.len()));
+        let rb = Self::line_select_range(display, b.min(display.len()));
+        ra.start.min(rb.start)..ra.end.max(rb.end)
+    }
+
+    fn on_extend_line_bounds(
+        &mut self,
+        _: &ExtendLineBounds,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.editor != EditorKind::Helix || !self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        self.clear_pending();
+        // Helix `X` (`extend_to_line_bounds`): expand to line bounds,
+        // idempotent — repeat does nothing (unlike `x` which extends down).
+        let p = self.proj();
+        if self.mode == Mode::Select {
+            let anchor = self
+                .visual_anchor
+                .or_else(|| self.sel.clone().map(|s| s.start))
+                .unwrap_or(self.caret);
+            let expanded = Self::lines_for_ends(&p.display, anchor, self.caret);
+            self.select_linewise = true;
+            self.visual_anchor = Some(expanded.start);
+            self.sel = Some(expanded.clone());
+            self.caret = Self::line_end_caret(&p.display, expanded);
+        } else {
+            // Normal `X`: keep a line-aligned run containing the caret as-is
+            // (idempotent); otherwise select the current line.
+            let cur = Self::line_select_range(&p.display, self.caret);
+            let keep = self.sel.as_ref().is_some_and(|s| {
+                *s == cur
+                    || (s.start < s.end
+                        && self.caret >= s.start
+                        && self.caret <= s.end
+                        && Self::line_select_range(&p.display, s.start) == *s)
+            });
+            let next = if keep {
+                self.sel.clone().unwrap_or_else(|| cur.clone())
+            } else {
+                cur.clone()
+            };
+            self.mode = Mode::Normal;
+            self.select_linewise = false;
+            self.visual_anchor = None;
+            self.sel = Some(next.clone());
+            self.caret = Self::line_end_caret(&p.display, next);
         }
         self.refresh_raw(window, cx);
     }
@@ -2434,12 +2678,35 @@ impl Workspace {
         }
         window.prevent_default();
         self.clear_pending();
+        // `v` toggles: entering Select/Visual from Normal, exiting back to
+        // Normal from Select/Visual (like Vim). Without this a second `v`
+        // would collapse the active selection to the caret.
+        if self.mode == Mode::Select || self.mode == Mode::Visual {
+            self.mode = Mode::Normal;
+            self.sel = None;
+            self.visual_anchor = None;
+            self.select_linewise = false;
+            self.refresh_raw(window, cx);
+            return;
+        }
+        // Vim `V` then `v`: drop back to charwise Visual on the same caret
+        // instead of stacking modes.
+        if self.mode == Mode::VisualLine {
+            self.mode = Mode::Visual;
+            self.visual_anchor = Some(self.caret);
+            self.select_linewise = false;
+            self.sel = None;
+            self.refresh_raw(window, cx);
+            return;
+        }
         self.visual_anchor = Some(self.caret);
         self.mode = if self.config.editor == EditorKind::Helix {
             Mode::Select
         } else {
             Mode::Visual
         };
+        // Charwise `v` leaves linewise mode (next `j`/`k` is charwise via snap).
+        self.select_linewise = false;
         self.sel = None;
         self.refresh_raw(window, cx);
     }
@@ -2449,20 +2716,25 @@ impl Workspace {
             return;
         }
         self.clear_pending();
+        // Vim `V`: exactly one display line (same source-vs-display fix as
+        // Helix `x` above).
+        let p = self.proj();
         if self.mode == Mode::VisualLine {
-            let sel = self
+            let base = self
                 .sel
                 .clone()
-                .unwrap_or_else(|| visual_line_range(&self.source, self.caret));
-            let next = extend_visual_line(&self.source, sel, 1);
+                .unwrap_or_else(|| Self::line_select_range(&p.display, self.caret));
+            let next = Self::extend_line_range(&p.display, base, 1);
             self.sel = Some(next.clone());
-            self.caret = next.end.min(self.source.len());
+            // End of the selected line — `range.end` would land the block
+            // caret in the next block.
+            self.caret = Self::line_end_caret(&p.display, next);
         } else {
-            let range = visual_line_range(&self.source, self.caret);
+            let range = Self::line_select_range(&p.display, self.caret);
             self.mode = Mode::VisualLine;
             self.visual_anchor = Some(range.start);
             self.sel = Some(range.clone());
-            self.caret = range.end.min(self.source.len());
+            self.caret = Self::line_end_caret(&p.display, range);
         }
         self.refresh_raw(window, cx);
     }
@@ -3020,7 +3292,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let line_only = self.config.editor == EditorKind::Vim;
-        if let Some(next) = find_char(&self.source, self.caret, ch, kind, count, line_only) {
+        // Caret is a display offset; `f`/`t` must scan the display buffer
+        // (GFM source diverges — e.g. `# `, `- `, fences — and used to jump
+        // to the wrong block).
+        let p = self.proj();
+        if let Some(next) = find_char(&p.display, self.caret, ch, kind, count, line_only) {
             self.land(next, window, cx);
         }
         cx.notify();
@@ -10415,6 +10691,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_digit8))
             .on_action(cx.listener(Self::on_digit9))
             .on_action(cx.listener(Self::on_select_line))
+            .on_action(cx.listener(Self::on_extend_line_bounds))
             .on_action(cx.listener(Self::on_delete_op))
             .on_action(cx.listener(Self::on_delete_char))
             .on_action(cx.listener(Self::on_delete_to_end))
