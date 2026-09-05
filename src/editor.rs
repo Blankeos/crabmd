@@ -545,6 +545,9 @@ pub struct Workspace {
     block_dragging: Option<usize>,
     block_drag_gap: Option<usize>,
     block_menu: Option<usize>,
+    /// Keyboard selection inside the open grip menu (0 = Duplicate, 1 = Delete).
+    /// Reset to 0 whenever the menu opens; up/down moves it, enter activates.
+    block_menu_index: usize,
     /// Copy-button flash per code block, keyed by block display start
     /// with the click time. Shows a check ~1.2s, then reverts to copy.
     code_copied: std::collections::HashMap<usize, std::time::Instant>,
@@ -665,6 +668,7 @@ impl Workspace {
             block_dragging: None,
             block_drag_gap: None,
             block_menu: None,
+            block_menu_index: 0,
             code_copied: std::collections::HashMap::new(),
             code_scroll: std::collections::HashMap::new(),
             code_scroll_seen: Vec::new(),
@@ -1682,6 +1686,11 @@ impl Workspace {
                     }
                     at = step;
                 }
+                // Closed `<details>` bodies and `</details>` chrome render
+                // zero-height: skip over them so `k`/`j` never land invisible.
+                // Closed: `k` lands on the summary; open: `k` skips the chrome
+                // onto the last block inside. Column is preserved by stepping.
+                at = self.skip_hidden_rows(&p, at, motion, wrap);
             }
             at
         } else {
@@ -1902,6 +1911,11 @@ impl Workspace {
             self.close_slash(window, cx);
             return;
         }
+        if self.block_menu.take().is_some() {
+            self.block_menu_index = 0;
+            cx.notify();
+            return;
+        }
         window.prevent_default();
         self.leave_insert(window, cx);
     }
@@ -1985,6 +1999,31 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        // Closed `<details>`: `o` opens below the disclosure (outside the
+        // hidden body). When open, plain `open_line` already lands inside.
+        if !above {
+            let on_closed_details = {
+                let p = self.proj();
+                match p.block_at_display(self.caret) {
+                    Some(b)
+                        if matches!(b.extra, BlockExtra::Details { .. })
+                            && self.is_details_collapsed(b) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if on_closed_details {
+                self.push_doc_undo();
+                if let Some(caret) = self.doc.open_after_details(self.caret) {
+                    self.sync_gfm();
+                    self.mark_dirty();
+                    self.enter_insert(Caret::Offset(caret), window, cx);
+                    return;
+                }
+            }
+        }
         self.push_doc_undo();
         let caret = self.doc.open_line(self.caret, above);
         self.sync_gfm();
@@ -4165,6 +4204,43 @@ impl Workspace {
                 _ => {}
             }
             return true;
+        }
+
+        // Open grip (drag-handle) menu owns the keyboard: esc closes,
+        // up/down moves the selection, enter activates it. Placed after
+        // the palette/link/command/search overlays (those win) but before
+        // newline/caret handling so arrows/enter never leak through.
+        if let Some(ix) = self.block_menu {
+            if !mods.control && !mods.platform && !mods.alt {
+                match key {
+                    "escape" => {
+                        window.prevent_default();
+                        self.block_menu = None;
+                        self.block_menu_index = 0;
+                        cx.notify();
+                        return true;
+                    }
+                    "up" => {
+                        window.prevent_default();
+                        // Two items: wrap around.
+                        self.block_menu_index = if self.block_menu_index == 0 { 1 } else { 0 };
+                        cx.notify();
+                        return true;
+                    }
+                    "down" => {
+                        window.prevent_default();
+                        self.block_menu_index = (self.block_menu_index + 1) % 2;
+                        cx.notify();
+                        return true;
+                    }
+                    "enter" => {
+                        window.prevent_default();
+                        self.activate_block_menu_selection(ix, window, cx);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         if key == "enter"
@@ -6689,7 +6765,7 @@ impl Workspace {
         };
         let chev = svg()
             .path(crate::assets::path("chevron-down"))
-            .size(px(10.))
+            .size(px(14.))
             .text_color(pal.text_muted)
             .with_transformation(Transformation::rotate(radians(to)))
             .with_animation(
@@ -6745,6 +6821,65 @@ impl Workspace {
         } else {
             !self.expanded_html.contains(&block.source.start)
         }
+    }
+
+    /// Block index at a display offset (mirrors `block_at_display`).
+    fn block_index_at(p: &crate::display::Projection, d: usize) -> Option<usize> {
+        let d = d.min(p.display.len());
+        p.blocks
+            .iter()
+            .position(|b| d >= b.display.start && d < b.display.end)
+            .or_else(|| {
+                p.blocks
+                    .iter()
+                    .rposition(|b| d >= b.display.start && d <= b.display.end)
+            })
+    }
+
+    /// `true` when block `ix` is a hidden body row of a collapsed `<details>`
+    /// (strictly inside `open..=close`, nesting-aware via the range check).
+    fn block_in_collapsed_details(&self, p: &crate::display::Projection, ix: usize) -> bool {
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.extra, BlockExtra::Details { .. }))
+            .filter_map(|(a, _)| crate::display::details_block_range(p, a))
+            .any(|(a, b)| {
+                ix > a
+                    && ix <= b
+                    && p.blocks
+                        .get(a)
+                        .is_some_and(|db| self.is_details_collapsed(db))
+            })
+    }
+
+    /// Step over zero-height rows after a vertical move so the caret never
+    /// rests invisible: collapsed `<details>` bodies and `</details>` chrome
+    /// (also skipped when open, so `k` lands on the last block inside).
+    /// Stepping reuses the motion, preserving the column.
+    fn skip_hidden_rows(
+        &self,
+        p: &crate::display::Projection,
+        mut at: usize,
+        motion: Motion,
+        wrap: Option<usize>,
+    ) -> usize {
+        for _ in 0..p.blocks.len().saturating_add(2) {
+            let Some(ix) = Self::block_index_at(p, at) else {
+                break;
+            };
+            let hidden = matches!(p.blocks[ix].extra, BlockExtra::DetailsClose)
+                || self.block_in_collapsed_details(p, ix);
+            if !hidden {
+                break;
+            }
+            let step = apply_motion(&p.display, at, motion, 1, wrap);
+            if step == at {
+                break;
+            }
+            at = step;
+        }
+        at
     }
 
     /// Collapse/expand a `<details>` block. Collapsing pulls the caret out
@@ -7643,6 +7778,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Grip menu owns Enter while open: keymap dispatch runs before
+        // capture, so this must be intercepted here (not just in
+        // `handle_capture_key`) or Enter inserts a newline instead.
+        if let Some(ix) = self.block_menu {
+            window.prevent_default();
+            self.activate_block_menu_selection(ix, window, cx);
+            return;
+        }
         self.insert_newline(false, window, cx);
     }
     fn on_insert_hard_break(
@@ -7651,6 +7794,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(ix) = self.block_menu {
+            window.prevent_default();
+            self.activate_block_menu_selection(ix, window, cx);
+            return;
+        }
         self.insert_newline(true, window, cx);
     }
     fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -8743,6 +8891,9 @@ impl Workspace {
                         } else {
                             Some(ix)
                         };
+                        // Keyboard starts on the first item every open so
+                        // up/down + enter behave like a native menu.
+                        this.block_menu_index = 0;
                         cx.notify();
                     });
                 }
@@ -8794,6 +8945,8 @@ impl Workspace {
         let panel = pal.background_panel;
         let border = pal.border;
         let hover = pal.background_element;
+        let sel = self.block_menu_index;
+        let view = cx.entity();
         Some(
             deferred(
                 v_flex()
@@ -8820,9 +8973,21 @@ impl Workspace {
                             .py_1()
                             .rounded(px(4.))
                             .cursor_pointer()
+                            .when(sel == 0, |el| el.bg(hover))
                             .hover(|el| el.bg(hover))
+                            .on_mouse_move({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        if this.block_menu_index != 0 {
+                                            this.block_menu_index = 0;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
                             .on_mouse_down(MouseButton::Left, {
-                                let view = cx.entity();
+                                let view = view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |this, cx| {
                                         this.block_menu = None;
@@ -8843,9 +9008,21 @@ impl Workspace {
                             .py_1()
                             .rounded(px(4.))
                             .cursor_pointer()
+                            .when(sel == 1, |el| el.bg(hover))
                             .hover(|el| el.bg(hover))
+                            .on_mouse_move({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        if this.block_menu_index != 1 {
+                                            this.block_menu_index = 1;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
                             .on_mouse_down(MouseButton::Left, {
-                                let view = cx.entity();
+                                let view = view.clone();
                                 move |_, window, cx| {
                                     view.update(cx, |this, cx| {
                                         this.block_menu = None;
@@ -9025,6 +9202,7 @@ impl Workspace {
 
     fn delete_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.block_menu = None;
+        self.block_menu_index = 0;
         self.push_doc_undo();
         let caret = self.doc.delete_unit(ix);
         self.sync_gfm();
@@ -9033,10 +9211,27 @@ impl Workspace {
 
     fn duplicate_block_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.block_menu = None;
+        self.block_menu_index = 0;
         self.push_doc_undo();
         let caret = self.doc.duplicate_unit(ix);
         self.sync_gfm();
         self.commit_caret(caret, window, cx);
+    }
+
+    /// Shared activation for the grip menu selection (0 = Duplicate,
+    /// 1 = Delete). Used by click, hover-synced keyboard Enter, and the
+    /// newline actions (Enter fires as an action before capture, so it
+    /// can't rely on `handle_capture_key` alone). Reuse this for any
+    /// future two-item block menus to keep behavior consistent.
+    fn activate_block_menu_selection(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let sel = self.block_menu_index;
+        self.block_menu = None;
+        self.block_menu_index = 0;
+        if sel == 0 {
+            self.duplicate_block_at(ix, window, cx);
+        } else {
+            self.delete_block_at(ix, window, cx);
+        }
     }
 
     fn drop_block_at(&mut self, from: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -10046,6 +10241,19 @@ impl Render for Workspace {
                     cx.stop_propagation();
                 }
             }))
+            // Outside-click dismiss for the grip menu: the grip handle and
+            // the menu itself stop propagation on mouse-down, so reaching
+            // here means the click landed elsewhere — just close, then let
+            // the click continue to its normal target.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    if this.block_menu.take().is_some() {
+                        this.block_menu_index = 0;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {

@@ -1241,6 +1241,42 @@ impl Doc {
         Some(self.caret_after(at.min(self.nodes.len() - 1), None, None, 0))
     }
 
+    /// `o` on a *collapsed* `<details>` summary: insert an empty paragraph
+    /// *after* the matching `</details>` (summary left intact) so the new
+    /// line lands outside the hidden body. Returns None when `caret` isn't
+    /// on a Details node. When open, plain `open_line` already lands inside.
+    pub fn open_after_details(&mut self, caret: usize) -> Option<usize> {
+        let loc = self.loc(caret);
+        if !matches!(self.nodes.get(loc.node)?.kind, NodeKind::Details { .. }) {
+            return None;
+        }
+        // Depth-counted close so nested disclosures resolve correctly.
+        let mut depth = 0usize;
+        let mut close = None;
+        for (j, n) in self.nodes.iter().enumerate().skip(loc.node) {
+            match &n.kind {
+                NodeKind::Details { .. } => depth += 1,
+                NodeKind::DetailsClose => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let at = close.map(|j| j + 1).unwrap_or(loc.node + 1);
+        self.nodes.insert(
+            at.min(self.nodes.len()),
+            Node {
+                id: next_id(),
+                kind: NodeKind::Paragraph { inlines: vec![] },
+            },
+        );
+        Some(self.caret_after(at.min(self.nodes.len() - 1), None, None, 0))
+    }
+
     fn enter_list(&mut self, loc: Loc) -> usize {
         let NodeKind::List { items, ordered } = &mut self.nodes[loc.node].kind else {
             return 0;
@@ -2007,8 +2043,7 @@ impl Doc {
 
     pub fn open_line(&mut self, caret: usize, above: bool) -> usize {
         let loc = self.loc(caret);
-        let at = if above { loc.node } else { loc.node + 1 };
-        self.nodes.insert(
+        let at = if above { loc.node } else { loc.node + 1 };        self.nodes.insert(
             at,
             Node {
                 id: next_id(),
