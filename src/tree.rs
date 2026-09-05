@@ -1125,6 +1125,23 @@ impl Doc {
         if hard {
             return self.insert_text(caret, None, "\n", Marks::default());
         }
+        // ```[lang] + Enter on an empty paragraph becomes a code block.
+        // Any lang is accepted (unknown falls back to plain highlighting).
+        if loc.item.is_none() {
+            if let NodeKind::Paragraph { .. } = &self.nodes[loc.node].kind {
+                let cur = self.inlines_at(loc).to_vec();
+                if loc.offset == inlines_len(&cur) {
+                    if let Some(lang) = parse_fence_lang(&inlines_text(&cur)) {
+                        self.nodes[loc.node].kind = NodeKind::Code {
+                            lang,
+                            text: String::new(),
+                            indent: 0,
+                        };
+                        return self.caret_after(loc.node, None, None, 0);
+                    }
+                }
+            }
+        }
         // Notion: Enter at the start of a heading inserts an empty block above
         // and keeps the heading text (does not demote the body to a paragraph).
         // Caret stays on the heading (`|Table`), not on the new empty line.
@@ -3239,6 +3256,17 @@ fn parse_shortcut(text: &str) -> Option<(NodeKind, String)> {
     None
 }
 
+/// ` ``` ` or ` ```lang ` (info string) → code-block language.
+/// Anything after the fence is accepted as lang (first token); unknown
+/// languages fall back to plain highlighting at render time.
+fn parse_fence_lang(text: &str) -> Option<String> {
+    let rest = text.trim().strip_prefix("```")?;
+    if rest.contains('`') || rest.contains('\n') {
+        return None;
+    }
+    Some(rest.split_whitespace().next().unwrap_or("").to_string())
+}
+
 fn node_to_gfm(n: &Node, links: &[String]) -> String {
     match &n.kind {
         NodeKind::Paragraph { inlines } => inlines_to_gfm(inlines, links),
@@ -3738,8 +3766,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_space_converts() {
-        let mut d = Doc::empty();
+    fn hash_space_converts() {        let mut d = Doc::empty();
         let mut c = d.insert_text(0, None, "#", Marks::default());
         assert_eq!(d.project().display, "#");
         c = d.insert_text(c, None, " ", Marks::default());
@@ -3749,6 +3776,27 @@ mod tests {
         ));
         assert_eq!(d.project().display, "");
         let _ = c;
+    }
+
+    #[test]
+    fn fence_enter_becomes_code_block() {
+        for (typed, lang) in [("```", ""), ("```rust", "rust"), ("```rs", "rs"), ("```mermaid", "mermaid"), ("```whatever", "whatever")] {
+            let mut d = Doc::empty();
+            let mut c = 0;
+            for ch in typed.chars() {
+                c = d.insert_text(c, None, &ch.to_string(), Marks::default());
+            }
+            c = d.enter(c, false);
+            match &d.nodes[0].kind {
+                NodeKind::Code { lang: l, text, .. } => {
+                    assert_eq!(l, lang, "{typed:?}");
+                    assert_eq!(text, "", "{typed:?}");
+                }
+                other => panic!("{typed:?} -> {other:?}"),
+            }
+            assert!(d.to_gfm().starts_with(&format!("```{lang}")), "{}", d.to_gfm());
+            let _ = c;
+        }
     }
 
     #[test]

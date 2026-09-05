@@ -5505,6 +5505,37 @@ impl Workspace {
                     .font_family(family)
                     .text_size(self.buffer_font_px())
                     .text_color(pal.markdown_code_block)
+                    // Clicking empty box area (past-EOL, padding) misses the
+                    // narrow text element. The inner handler stops
+                    // propagation, so this only fires there: focus nearest.
+                    .on_mouse_down(MouseButton::Left, {
+                        let view = cx.entity();
+                        let code_range = block.display.clone();
+                        move |ev: &MouseDownEvent, window, cx| {
+                            view.update(cx, |this, cx| {
+                                let avail: Vec<surface::Hit> = this
+                                    .hits
+                                    .iter()
+                                    .filter(|h| {
+                                        h.display_start >= code_range.start
+                                            && h.display_start <= code_range.end
+                                    })
+                                    .cloned()
+                                    .collect();
+                                let d = surface::index_for_point(&avail, ev.position)
+                                    .unwrap_or(code_range.end)
+                                    .clamp(code_range.start, code_range.end);
+                                this.click_display(
+                                    d,
+                                    ev.modifiers.shift,
+                                    ev.modifiers.platform || ev.modifiers.control,
+                                    ev.click_count,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    })
                     // Floating picker: painted last so it stays
                     // clickable above the scroll body, with a
                     // translucent pill so code shows through.
@@ -8287,6 +8318,36 @@ impl Workspace {
                 self.apply_indent_range(sel, kind, window, cx);
                 return;
             }
+        }
+        // Helix `>` / `<` / `=` indent immediately (like Tab in Normal):
+        // single press acts on the current line (or selection above), honoring
+        // counts (`2>` = current + next). Vim keeps operator-pending semantics
+        // (`>>`, `>j`, `>G`) handled below.
+        if self.config.editor == EditorKind::Helix {
+            let count = take_count(&mut self.pending_count);
+            self.clear_pending();
+            // NOTE: caret + ranges are display offsets (not GFM source), so
+            // build the range from the display buffer to hit the same block
+            // Tab would (`doc.tab` at the caret line).
+            let display = self.proj().display;
+            let caret = self.caret.min(display.len());
+            let mut range = logical_line_range(&display, caret);
+            for _ in 1..count {
+                if range.end >= display.len() {
+                    break;
+                }
+                let nxt = (range.end + 1).min(display.len());
+                let next_line = logical_line_range(&display, nxt);
+                if next_line.start <= range.start && next_line.end <= range.end {
+                    break;
+                }
+                range = range.start..next_line.end;
+                if range.end >= display.len() {
+                    break;
+                }
+            }
+            self.apply_indent_range(range, kind, window, cx);
+            return;
         }
         if self.pending_op == Some(kind) {
             let count = take_count(&mut self.pending_count);
