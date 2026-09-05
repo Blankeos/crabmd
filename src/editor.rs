@@ -82,6 +82,7 @@ actions!(
         FirstDoc,
         LastDoc,
         PendingG,
+        PendingZ,
         Digit0,
         Digit1,
         Digit2,
@@ -194,6 +195,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("^", LineFirstNonBlank, Some("Normal")),
         KeyBinding::new("$", LineEnd, Some("Normal")),
         KeyBinding::new("g", PendingG, Some("Normal")),
+        KeyBinding::new("z", PendingZ, Some("Normal")),
         KeyBinding::new("shift-g", LastDoc, Some("Vim")),
         KeyBinding::new("x", SelectLine, Some("Helix")),
         KeyBinding::new("x", DeleteChar, Some("Vim")),
@@ -486,6 +488,7 @@ pub struct Workspace {
     mode: Mode,
     pending_g: bool,
     pending_d: bool,
+    pending_z: bool,
     pending_count: Option<usize>,
     visual_anchor: Option<usize>,
     slash_index: usize,
@@ -621,6 +624,7 @@ impl Workspace {
             mode: Mode::Normal,
             pending_g: false,
             pending_d: false,
+            pending_z: false,
             pending_count: None,
             visual_anchor: None,
             slash_index: 0,
@@ -1124,6 +1128,7 @@ impl Workspace {
     fn clear_pending(&mut self) {
         self.pending_g = false;
         self.pending_d = false;
+        self.pending_z = false;
         self.pending_count = None;
         self.pending_replace = None;
         self.pending_find = None;
@@ -1667,6 +1672,7 @@ impl Workspace {
         window.prevent_default();
         let count = take_count(&mut self.pending_count);
         self.pending_g = false;
+        self.pending_z = false;
         let vertical = matches!(motion, Motion::Up | Motion::Down);
         if !vertical {
             self.goal_x = None;
@@ -1945,6 +1951,20 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        // `za` toggles a `<details>` disclosure (vim fold echo). The prefix
+        // is consumed here (in dispatch) because capture runs after keymap
+        // dispatch; any other key disarms it in `handle_capture_key`.
+        if self.pending_z {
+            self.pending_z = false;
+            if !self.is_modal_nav() {
+                cx.propagate();
+                return;
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            self.toggle_details_at_caret(window, cx);
+            return;
+        }
         if !self.is_modal_nav() {
             cx.propagate();
             return;
@@ -2190,6 +2210,53 @@ impl Workspace {
         } else {
             self.pending_g = true;
             cx.notify();
+        }
+    }
+
+    /// Vim `za`: `z` arms a fold prefix, `a` toggles the `<details>` at the
+    /// caret (or the innermost enclosing one from inside the body).
+    fn on_pending_z(&mut self, _: &PendingZ, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_modal_nav() {
+            cx.propagate();
+            return;
+        }
+        window.prevent_default();
+        // `z` starts a fresh prefix; cancel other pending keys.
+        self.pending_g = false;
+        self.pending_d = false;
+        self.pending_op = None;
+        self.pending_obj = None;
+        self.pending_change = false;
+        self.pending_z = true;
+        cx.notify();
+    }
+
+    /// Toggle the `<details>` at the caret (summary row) or the innermost
+    /// enclosing one when the caret is inside the body. No-op elsewhere.
+    fn toggle_details_at_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        let p = self.proj();
+        let Some(ix) = Self::block_index_at(&p, self.caret) else {
+            return;
+        };
+        if matches!(p.blocks[ix].extra, BlockExtra::Details { .. }) {
+            let src = p.blocks[ix].source.start;
+            self.toggle_details(src, cx);
+            return;
+        }
+        let inner = p
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.extra, BlockExtra::Details { .. }))
+            .filter_map(|(a, _)| {
+                crate::display::details_block_range(&p, a).filter(|&(_, b)| ix > a && ix <= b)
+            })
+            .map(|(a, _)| a)
+            .max();
+        if let Some(a) = inner {
+            let src = p.blocks[a].source.start;
+            self.toggle_details(src, cx);
         }
     }
 
@@ -2690,6 +2757,9 @@ impl Workspace {
             self.doc.delete_char(self.caret)
         };
         self.sync_gfm();
+        // The tree lands on the last body node, which is invisible when that
+        // `<details>` is collapsed — pull the caret onto the summary instead.
+        let caret = self.redirect_collapsed_details_caret(caret);
         self.commit_caret(caret, window, cx);
     }
 
@@ -4116,6 +4186,17 @@ impl Workspace {
             self.pending_g = false;
             self.apply_buffer_motion(Motion::LineFirstNonBlank, window, cx);
             return true;
+        }
+
+        // `z` arms a fold prefix (`za`); any other plain key disarms it.
+        // Capture runs after dispatch and `a` consumes the prefix in its own
+        // action, so this only clears the leftover armed state.
+        if self.pending_z && self.is_modal_nav() {
+            let plain_a = key == "a" && !mods.control && !mods.platform && !mods.alt && !mods.shift;
+            let plain_z = key == "z" && !mods.control && !mods.platform && !mods.alt && !mods.shift;
+            if !plain_a && !plain_z {
+                self.pending_z = false;
+            }
         }
 
         if self.command.is_some() {
@@ -6821,6 +6902,35 @@ impl Workspace {
         } else {
             !self.expanded_html.contains(&block.source.start)
         }
+    }
+
+    /// Innermost *collapsed* `<details>` opener whose range strictly contains
+    /// block `ix` (body or `</details>` chrome — never the summary itself).
+    fn collapsed_details_above(&self, p: &crate::display::Projection, ix: usize) -> Option<usize> {
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.extra, BlockExtra::Details { .. }))
+            .filter_map(|(a, _)| {
+                crate::display::details_block_range(p, a).filter(|&(_, b)| ix > a && ix <= b)
+            })
+            .filter(|&(a, _)| p.blocks.get(a).is_some_and(|db| self.is_details_collapsed(db)))
+            .map(|(a, _)| a)
+            .max()
+    }
+
+    /// After a backspace erase below a disclosure, the tree lands on the last
+    /// body node — invisible when collapsed. Redirect onto the summary end
+    /// (last col); open disclosures keep the tree landing (last block inside).
+    fn redirect_collapsed_details_caret(&self, caret: usize) -> usize {
+        let p = self.proj();
+        let Some(ix) = Self::block_index_at(&p, caret) else {
+            return caret;
+        };
+        let Some(a) = self.collapsed_details_above(&p, ix) else {
+            return caret;
+        };
+        p.blocks[a].display.end
     }
 
     /// Block index at a display offset (mirrors `block_at_display`).
@@ -10169,6 +10279,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_first_doc))
             .on_action(cx.listener(Self::on_last_doc))
             .on_action(cx.listener(Self::on_pending_g))
+            .on_action(cx.listener(Self::on_pending_z))
             .on_action(cx.listener(Self::on_digit0))
             .on_action(cx.listener(Self::on_digit1))
             .on_action(cx.listener(Self::on_digit2))

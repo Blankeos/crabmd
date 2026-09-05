@@ -1347,12 +1347,7 @@ impl Doc {
         }
         match &self.nodes[loc.node].kind {
             NodeKind::List { .. } => return Some(self.backspace_list(loc)),
-            NodeKind::Heading { .. }
-            | NodeKind::HtmlHeading { .. }
-            | NodeKind::Details { .. }
-            | NodeKind::Quote { .. }
-            | NodeKind::Alert { .. }
-            | NodeKind::Code { .. } => {
+            NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. } | NodeKind::Code { .. } => {
                 if loc.node > 0 {
                     // Empty block above a heading: drop the empty slot and keep
                     // the heading (`# Table`). Merging into an empty paragraph
@@ -1361,7 +1356,7 @@ impl Doc {
                         &self.nodes[loc.node - 1].kind,
                         NodeKind::Paragraph { inlines } if inlines_len(inlines) == 0
                     );
-                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. } | NodeKind::Details { .. }) {
+                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Heading { .. } | NodeKind::HtmlHeading { .. }) {
                         let heading = loc.node;
                         self.nodes.remove(loc.node - 1);
                         return Some(self.caret_after(heading - 1, None, None, 0));
@@ -1369,15 +1364,35 @@ impl Doc {
                     return Some(self.merge_nodes(loc.node - 1, loc.node));
                 }
                 let inlines = match &self.nodes[loc.node].kind {
-                    NodeKind::Heading { inlines, .. }
-                    | NodeKind::HtmlHeading { inlines, .. }
-                    | NodeKind::Details { inlines, .. }
-                    | NodeKind::Quote { inlines }
-                    | NodeKind::Alert { inlines, .. } => inlines.clone(),
+                    NodeKind::Heading { inlines, .. } | NodeKind::HtmlHeading { inlines, .. } => inlines.clone(),
                     NodeKind::Code { text, .. } => vec![Inline {
                         text: text.clone(),
                         marks: Marks::default(),
                     }],
+                    _ => vec![],
+                };
+                self.nodes[loc.node].kind = NodeKind::Paragraph { inlines };
+                return Some(self.caret_after(loc.node, None, None, 0));
+            }
+            NodeKind::Details { .. } | NodeKind::Quote { .. } | NodeKind::Alert { .. } => {
+                // Two-step erase (like list items): first backspace strips the
+                // wrapper and keeps the text as a paragraph; a second one
+                // merges/deletes. One-shot merging would nuke the disclosure.
+                if loc.node > 0 {
+                    let prev_empty = matches!(
+                        &self.nodes[loc.node - 1].kind,
+                        NodeKind::Paragraph { inlines } if inlines_len(inlines) == 0
+                    );
+                    if prev_empty && matches!(self.nodes[loc.node].kind, NodeKind::Details { .. }) {
+                        let cur = loc.node;
+                        self.nodes.remove(cur - 1);
+                        return Some(self.caret_after(cur - 1, None, None, 0));
+                    }
+                }
+                let inlines = match &self.nodes[loc.node].kind {
+                    NodeKind::Details { inlines, .. }
+                    | NodeKind::Quote { inlines }
+                    | NodeKind::Alert { inlines, .. } => inlines.clone(),
                     _ => vec![],
                 };
                 self.nodes[loc.node].kind = NodeKind::Paragraph { inlines };
@@ -1389,7 +1404,9 @@ impl Doc {
                         return Some(0);
                     }
                     self.nodes.remove(loc.node);
-                    let prev = loc.node - 1;
+                    // The node above may be `</details>` chrome (zero-height):
+                    // land on the last body node, or the summary when empty.
+                    let prev = self.visible_keep_above(loc.node - 1);
                     let len = self.node_text_len(prev);
                     return Some(self.caret_after(prev, self.last_item(prev), None, len));
                 }
@@ -1404,7 +1421,7 @@ impl Doc {
                     return Some(0);
                 }
                 self.nodes.remove(loc.node);
-                let prev = loc.node - 1;
+                let prev = self.visible_keep_above(loc.node - 1);
                 let len = self.node_text_len(prev);
                 return Some(self.caret_after(prev, self.last_item(prev), None, len));
             }
@@ -2446,6 +2463,9 @@ impl Doc {
     }
 
     fn merge_nodes(&mut self, keep: usize, drop: usize) -> usize {
+        // Merging into `</details>` chrome would land invisible (and drop the
+        // text on the floor): merge into the last body node / summary instead.
+        let keep = self.visible_keep_above(keep);
         if keep >= drop || drop >= self.nodes.len() {
             return self.caret_after(keep, None, None, self.node_text_len(keep));
         }
@@ -2480,6 +2500,48 @@ impl Doc {
         }
         self.nodes.remove(drop);
         self.caret_after(keep, self.last_item(keep), None, keep_len)
+    }
+
+    /// Identity unless `keep` is `</details>` chrome (zero-height): then the
+    /// last body node before the close, or the summary when the body is
+    /// empty. Keeps backspace merges/landings on a visible block.
+    fn visible_keep_above(&self, keep: usize) -> usize {
+        if !matches!(self.nodes.get(keep).map(|n| &n.kind), Some(NodeKind::DetailsClose)) {
+            return keep;
+        }
+        self.above_details_close(keep)
+    }
+
+    /// Visible node above the `</details>` at `close_ix`: last body node, or
+    /// the summary when empty. Nested closes resolve recursively; malformed
+    /// input (no opener) falls back to the node above.
+    fn above_details_close(&self, close_ix: usize) -> usize {
+        let mut depth = 0usize;
+        let mut opener = None;
+        for (j, n) in self.nodes.iter().enumerate().take(close_ix + 1).rev() {
+            match &n.kind {
+                NodeKind::DetailsClose => depth += 1,
+                NodeKind::Details { .. } => {
+                    if depth <= 1 {
+                        opener = Some(j);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(o) = opener else {
+            return close_ix.saturating_sub(1);
+        };
+        let mut t = close_ix.saturating_sub(1);
+        while t > o {
+            if !matches!(self.nodes.get(t).map(|n| &n.kind), Some(NodeKind::DetailsClose)) {
+                break;
+            }
+            t = self.above_details_close(t);
+        }
+        if t > o { t } else { o }
     }
 }
 
@@ -4334,5 +4396,68 @@ mod feature_tests {
             panic!("{:?}", d.nodes[close + 1].kind);
         };
         assert_eq!(inlines_text(inlines), "llo");
+    }
+
+    #[test]
+    fn backspace_details_is_two_step() {
+        let mut d = Doc::from_gfm("head\n\n<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n");
+        let p = d.project();
+        let di = p.blocks.iter().position(|b| matches!(b.extra, BlockExtra::Details { .. })).unwrap();
+        // First backspace strips the wrapper, keeps the summary text.
+        let c = d.backspace(p.blocks[di].display.start).expect("convert");
+        let NodeKind::Paragraph { inlines } = &d.nodes[di].kind else {
+            panic!("{:?}", d.nodes[di].kind);
+        };
+        assert_eq!(inlines_text(inlines), "Hi");
+        assert!(d.to_gfm().contains("body"), "{:?}", d.to_gfm());
+        // Second backspace merges into the previous block.
+        let c2 = d.backspace(c).expect("merge");
+        let gfm = d.to_gfm();
+        assert!(gfm.contains("headHi"), "{gfm:?}");
+        assert!(!gfm.contains("<summary>"), "{gfm:?}");
+        assert_eq!(c2, "head".len());
+    }
+
+    #[test]
+    fn backspace_quote_is_two_step() {
+        let mut d = Doc::from_gfm("head\n\n> hi\n");
+        let p = d.project();
+        let qi = p.blocks.iter().position(|b| matches!(b.extra, BlockExtra::Quote)).unwrap();
+        let c = d.backspace(p.blocks[qi].display.start).expect("convert");
+        let NodeKind::Paragraph { inlines } = &d.nodes[qi].kind else {
+            panic!("{:?}", d.nodes[qi].kind);
+        };
+        assert_eq!(inlines_text(inlines), "hi");
+        let c2 = d.backspace(c).expect("merge");
+        assert!(d.to_gfm().contains("headhi"), "{:?}", d.to_gfm());
+        assert_eq!(c2, "head".len());
+    }
+
+    #[test]
+    fn backspace_empty_after_details_lands_last_inside() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n\ntail\n");
+        let p = d.project();
+        // Empty paragraph after the close (like `o` on a closed disclosure).
+        let ins = d.open_after_details(p.blocks[0].display.start).expect("insert");
+        // Backspace erases it and lands on the last block inside, text kept.
+        let c = d.backspace(ins).expect("remove");
+        let p2 = d.project();
+        let ci = p2.blocks.iter().position(|b| matches!(b.extra, BlockExtra::DetailsClose)).unwrap();
+        assert_eq!(c, p2.blocks[ci - 1].display.end, "c={c} {:?}", p2.display);
+        assert!(d.to_gfm().contains("body"), "{:?}", d.to_gfm());
+    }
+
+    #[test]
+    fn backspace_text_after_details_merges_last_inside() {
+        let mut d = Doc::from_gfm("<details>\n<summary>Hi</summary>\n\nbody\n\n</details>\n\ntail\n");
+        let p = d.project();
+        let ti = p.blocks.iter().position(|b| p.display.get(b.display.clone()) == Some("tail")).unwrap();
+        let ci = p.blocks.iter().position(|b| matches!(b.extra, BlockExtra::DetailsClose)).unwrap();
+        let body_end = p.blocks[ci - 1].display.end;
+        // Text merges into the last body node (never into the chrome, which
+        // would silently drop it) and the caret lands at the old body end.
+        let c = d.backspace(p.blocks[ti].display.start).expect("merge");
+        assert_eq!(c, body_end, "c={c} {:?}", d.project().display);
+        assert!(d.to_gfm().contains("bodytail"), "{:?}", d.to_gfm());
     }
 }
