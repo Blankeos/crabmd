@@ -2565,10 +2565,9 @@ impl Workspace {
             // 3rd, … press grows the run by one line).
             let next = if self.sel.as_ref().is_some_and(|s| {
                 *s == cur
-                    || (s.start < s.end
-                        && self.caret >= s.start
+                    || (self.caret >= s.start
                         && self.caret <= s.end
-                        && Self::line_select_range(&p.display, s.start) == *s)
+                        && Self::is_linewise_run(&p.display, s))
             }) {
                 let base = self
                     .sel
@@ -2597,6 +2596,23 @@ impl Workspace {
         let ra = Self::line_select_range(display, a.min(display.len()));
         let rb = Self::line_select_range(display, b.min(display.len()));
         ra.start.min(rb.start)..ra.end.max(rb.end)
+    }
+
+    /// Multi-line-aware line alignment: `range` starts at a display line
+    /// start and ends at a display line start (or EOF). Single-line
+    /// `line_select_range(...) == range` checks reject 2+ line runs, which
+    /// broke repeat `x` past the 2nd press (`xxx` reset to the caret line
+    /// instead of growing to 3).
+    fn is_linewise_run(display: &str, range: &Range<usize>) -> bool {
+        if range.start >= range.end {
+            return false;
+        }
+        let a = range.start.min(display.len());
+        let b = range.end.min(display.len());
+        if crate::motion::logical_line_range(display, a).start != a {
+            return false;
+        }
+        b == display.len() || crate::motion::logical_line_range(display, b).start == b
     }
 
     fn on_extend_line_bounds(
@@ -2630,10 +2646,9 @@ impl Workspace {
             let cur = Self::line_select_range(&p.display, self.caret);
             let keep = self.sel.as_ref().is_some_and(|s| {
                 *s == cur
-                    || (s.start < s.end
-                        && self.caret >= s.start
+                    || (self.caret >= s.start
                         && self.caret <= s.end
-                        && Self::line_select_range(&p.display, s.start) == *s)
+                        && Self::is_linewise_run(&p.display, s))
             });
             let next = if keep {
                 self.sel.clone().unwrap_or_else(|| cur.clone())
@@ -5564,8 +5579,35 @@ impl Workspace {
         let d_caret = self.caret;
         let d_sel = self.sel.clone();
         let d_marked = self.marked.clone();
-        let local_caret = if d_caret >= display.start && d_caret <= display.end {
-            Some(d_caret - display.start)
+        // Charwise visual head sits at the exclusive selection end (e.g.
+        // `miw`/`viw` on "Kitchen" leaves caret on the trailing space).
+        // Inverting that next char reads as an extra selected column
+        // ("kitchen " instead of "kitchen"). Pull the *rendered* caret back
+        // onto the last selected char when the head is forward at `sel.end`.
+        // Model caret stays exclusive so `snap` keeps the full range.
+        let eff_caret = match (&d_sel, self.visual_anchor) {
+            (Some(s), _) if self.mode == Mode::VisualLine
+                || (self.mode == Mode::Select && self.select_linewise) =>
+            {
+                d_caret
+            }
+            (Some(s), anchor)
+                if self.mode.is_visual()
+                    && s.start < s.end
+                    && d_caret == s.end
+                    && anchor.is_some_and(|a| a <= d_caret) =>
+            {
+                p.display[..d_caret.min(p.display.len())]
+                    .chars()
+                    .next_back()
+                    .map(|c| d_caret - c.len_utf8())
+                    .unwrap_or(s.start)
+                    .max(s.start)
+            }
+            _ => d_caret,
+        };
+        let local_caret = if eff_caret >= display.start && eff_caret <= display.end {
+            Some(eff_caret - display.start)
         } else {
             None
         };
