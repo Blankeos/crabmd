@@ -231,11 +231,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-backspace", BlockBackspace, Some("Input")),
         KeyBinding::new(":", OpenCommand, Some("Normal")),
         KeyBinding::new("shift-;", OpenCommand, Some("Normal")),
-        KeyBinding::new("/", OpenSearch, Some("Vim && Normal")),
+        KeyBinding::new("/", OpenSearch, Some("Normal")),
         KeyBinding::new("shift-/", SearchBack, Some("Normal")),
         KeyBinding::new("cmd-f", OpenSearch, Some("Workspace")),
         KeyBinding::new("ctrl-f", OpenSearch, Some("Workspace")),
-        KeyBinding::new("/", InsertSlash, Some("Helix && Normal")),
         KeyBinding::new("/", InsertSlash, Some("Notion")),
         KeyBinding::new("n", SearchNext, Some("Normal")),
         KeyBinding::new("shift-n", SearchPrev, Some("Normal")),
@@ -2015,6 +2014,12 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if self.last_search.take().is_some() {
+            // Committed `/` / `cmd-f` query with the bar already closed:
+            // esc clears highlights + footer count, then still leaves
+            // insert below so one press does both.
+            cx.notify();
+        }
         window.prevent_default();
         self.leave_insert(window, cx);
     }
@@ -3103,7 +3108,10 @@ impl Workspace {
         cx.notify();
     }
     fn cancel_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Esc abandons the bar AND clears the committed query so
+        // highlights + footer count disappear (vim `:noh` style).
         self.search = None;
+        self.last_search = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -3989,6 +3997,12 @@ impl Workspace {
                 } else {
                     self.sync_title(window);
                 }
+            }
+            ExCommand::BufferNext => {
+                window.dispatch_action(Box::new(crate::tabs::NextTab), cx);
+            }
+            ExCommand::BufferPrev => {
+                window.dispatch_action(Box::new(crate::tabs::PrevTab), cx);
             }
             ExCommand::Unknown(s) => {
                 self.status = format!("unknown command: {s}").into();
@@ -8017,6 +8031,9 @@ impl Workspace {
         let del_cols = n.map(|t| t.col_count()).unwrap_or(1);
         let del_row_label = if del_rows > 1 { "Del rows" } else { "Del row" };
         let del_col_label = if del_cols > 1 { "Del cols" } else { "Del col" };
+        let linked_url = self.selected_link_url();
+        let is_linked = linked_url.is_some();
+        let link_label = if is_linked { "Edit link" } else { "Link" };
         v_flex()
             .gap_1()
             .p_1()
@@ -8032,8 +8049,14 @@ impl Workspace {
                     .child(self.mark_btn("I", Mark::Italic, cx))
                     .child(self.mark_btn("U", Mark::Underline, cx))
                     .child(self.mark_btn("S", Mark::Strike, cx))
-                    .child(self.mark_btn("<>", Mark::Code, cx)),
+                    .child(self.mark_btn("<>", Mark::Code, cx))
+                    .child(self.link_btn(link_label, cx))
+                    .when_some(linked_url.clone(), |el, url| {
+                        el.child(self.open_link_btn(url, cx))
+                    })
+                    .when(is_linked, |el| el.child(self.unlink_btn(cx))),
             )
+            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
             .child(
                 h_flex()
                     .gap_1()
@@ -8181,14 +8204,9 @@ impl Workspace {
             return div().into_any_element();
         };
         let p = &self.palette;
-        let linked_url: Option<String> = if let Some(s) = self.sel.as_ref() {
-            (s.start..s.end)
-                .find_map(|i| self.proj().link_at(i).map(|(_, u)| u.to_string()))
-                .or_else(|| self.proj().link_at(self.caret).map(|(_, u)| u.to_string()))
-        } else {
-            self.proj().link_at(self.caret).map(|(_, u)| u.to_string())
-        };
+        let linked_url = self.selected_link_url();
         let is_linked = linked_url.is_some();
+        let link_label = if is_linked { "Edit link" } else { "Link" };
 
         h_flex()
             .gap_1()
@@ -8204,38 +8222,57 @@ impl Workspace {
             .child(self.mark_btn("U", Mark::Underline, cx))
             .child(self.mark_btn("S", Mark::Strike, cx))
             .child(self.mark_btn("<>", Mark::Code, cx))
+            .child(self.link_btn(link_label, cx))
+            .when_some(linked_url.clone(), |el, url| {
+                el.child(self.open_link_btn(url, cx))
+            })
+            .when(is_linked, |el| el.child(self.unlink_btn(cx)))
+            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
+            .into_any_element()
+    }
+
+    fn link_btn(&self, label: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 Button::new("mk-link")
                     .ghost()
                     .xsmall()
-                    .label("Link")
+                    .label(label)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.on_toggle_link(&ToggleLink, window, cx);
                     })),
             )
-            .when_some(linked_url.clone(), |el, url| {
-                el.child(
-                    Button::new("go-link")
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::default().path(crate::assets::path("arrow-up-right")))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_link_url(&url, window, cx);
-                        })),
-                )
-            })
-            .when(is_linked, |el| {
-                el.child(
-                    Button::new("rm-link")
-                        .ghost()
-                        .xsmall()
-                        .label("Unlink")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.remove_link_action(window, cx);
-                        })),
-                )
-            })
-            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
+            .into_any_element()
+    }
+
+    fn open_link_btn(&self, url: String, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new("go-link")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::default().path(crate::assets::path("arrow-up-right")))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_link_url(&url, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn unlink_btn(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new("rm-link")
+                    .ghost()
+                    .xsmall()
+                    .label("Unlink")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.remove_link_action(window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -8304,12 +8341,19 @@ impl Workspace {
         h_flex()
             .items_center()
             .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(div().text_xs().text_color(p.text_muted).child("url"))
             .child(
                 div()
                     .text_sm()
                     .text_color(p.markdown_text)
                     .child(self.link_draft.render()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(p.text_muted)
+                    .child("Enter ↵ save · Esc cancel"),
             )
             .into_any_element()
     }
@@ -8470,6 +8514,16 @@ impl Workspace {
         }
         self.toggle_mark_action(Mark::Underline, window, cx);
     }
+    fn selected_link_url(&self) -> Option<String> {
+        if let Some(s) = self.sel.as_ref().filter(|s| s.start != s.end) {
+            (s.start.min(s.end)..s.end.max(s.start))
+                .find_map(|i| self.proj().link_at(i).map(|(_, u)| u.to_string()))
+                .or_else(|| self.proj().link_at(self.caret).map(|(_, u)| u.to_string()))
+        } else {
+            self.proj().link_at(self.caret).map(|(_, u)| u.to_string())
+        }
+    }
+
     fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
         if self.view_source || self.cmd_palette.is_some() {
             return;
@@ -8478,7 +8532,11 @@ impl Workspace {
             return;
         }
         self.link_open = true;
+        // Prefill the draft with the existing URL so Link doubles as Edit.
         self.link_draft.clear();
+        if let Some(url) = self.selected_link_url() {
+            self.link_draft.insert_str(&url);
+        }
         self.focus.focus(window, cx);
         cx.notify();
     }

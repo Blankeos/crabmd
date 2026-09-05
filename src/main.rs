@@ -472,6 +472,7 @@ Keys (Helix / Vim normal — tabbed buffers):
   cmd-,         settings
   cmd-f         find
   :w / :write   write from the command-line; :q closes the tab, :wq saves and closes it, :qa quits
+  :bn / :bp     next / previous tab (buffer)
   /             insert a GFM block (headings, lists, code, table, quote, hr, alerts)
   h/j/k/l       h/l stay on the line; j/k wrap-aware file lines
   w/b/e W/B/E   word / WORD; 0/^/$ line start / first non-blank / line end

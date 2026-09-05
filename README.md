@@ -101,7 +101,7 @@ visual lines when **Wrap lines** is on (default). Counts work: `5h`, `2k`,
 | `o` / `O` | open a line below / above **inside this block**. New empty block only for rule / table / html / raw |
 | `u` | undo (document-level) |
 | `escape` | normal; in visual, collapse the selection to the caret |
-| `:` | command-line (`w` / `q` / `wq` / `qa`). Escape or empty Enter cancels |
+| `:` | command-line (`w` / `q` / `wq` / `qa` / `bn` / `bp`). Escape or empty Enter cancels |
 
 ### Helix
 

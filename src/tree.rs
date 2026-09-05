@@ -1756,7 +1756,7 @@ impl Doc {
         }
         let loc = self.loc(a);
         let loc_b = self.loc(b);
-        if loc.node != loc_b.node || loc.item != loc_b.item {
+        if loc.node != loc_b.node || loc.item != loc_b.item || loc.cell != loc_b.cell {
             return b;
         }
         let id = if url.is_empty() {

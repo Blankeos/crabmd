@@ -57,6 +57,9 @@ pub enum ExCommand {
     QuitAll,
     /// `:wqa` / `:xa` — save the current buffer, then quit the app.
     WriteQuitAll,
+    /// `:bn` / `:bp` — next / previous tab (buffer).
+    BufferNext,
+    BufferPrev,
     Cancel,
     Unknown(String),
 }
@@ -76,6 +79,8 @@ pub fn parse_ex(input: &str) -> ExCommand {
         "wq!" | "x!" => ExCommand::WriteQuit { force: true },
         "qa" | "qa!" => ExCommand::QuitAll,
         "wqa" | "wqa!" | "xa" => ExCommand::WriteQuitAll,
+        "bn" | "bnext" => ExCommand::BufferNext,
+        "bp" | "bprev" | "bprevious" => ExCommand::BufferPrev,
         _ => ExCommand::Unknown(t.to_string()),
     }
 }
@@ -157,6 +162,10 @@ mod tests {
         assert_eq!(parse_ex("qa"), ExCommand::QuitAll);
         assert_eq!(parse_ex("wqa"), ExCommand::WriteQuitAll);
         assert_eq!(parse_ex("xa"), ExCommand::WriteQuitAll);
+        assert_eq!(parse_ex("bn"), ExCommand::BufferNext);
+        assert_eq!(parse_ex("bnext"), ExCommand::BufferNext);
+        assert_eq!(parse_ex("bp"), ExCommand::BufferPrev);
+        assert_eq!(parse_ex("bprev"), ExCommand::BufferPrev);
         assert_eq!(parse_ex("nope"), ExCommand::Unknown("nope".into()));
         assert_eq!(parse_ex("foo bar"), ExCommand::Unknown("foo bar".into()));
     }
