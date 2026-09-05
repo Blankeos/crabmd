@@ -48,7 +48,15 @@ pub enum Caret {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExCommand {
     Write,
-    WriteQuit,
+    /// `:q[!]` — close the current tab (buffer). Prompts when dirty
+    /// unless `force` (`:q!` discards changes).
+    Quit { force: bool },
+    /// `:wq` / `:x` — save, then close the current tab.
+    WriteQuit { force: bool },
+    /// `:qa` — quit the app (per-window close guard still applies).
+    QuitAll,
+    /// `:wqa` / `:xa` — save the current buffer, then quit the app.
+    WriteQuitAll,
     Cancel,
     Unknown(String),
 }
@@ -61,8 +69,13 @@ pub fn parse_ex(input: &str) -> ExCommand {
     }
     let cmd = t.split_whitespace().next().unwrap_or(t);
     match cmd {
-        "w" | "write" => ExCommand::Write,
-        "wq" | "x" | "xit" => ExCommand::WriteQuit,
+        "w" | "w!" | "write" => ExCommand::Write,
+        "q" => ExCommand::Quit { force: false },
+        "q!" => ExCommand::Quit { force: true },
+        "wq" | "x" | "xit" => ExCommand::WriteQuit { force: false },
+        "wq!" | "x!" => ExCommand::WriteQuit { force: true },
+        "qa" | "qa!" => ExCommand::QuitAll,
+        "wqa" | "wqa!" | "xa" => ExCommand::WriteQuitAll,
         _ => ExCommand::Unknown(t.to_string()),
     }
 }
@@ -136,8 +149,14 @@ mod tests {
         assert_eq!(parse_ex("w"), ExCommand::Write);
         assert_eq!(parse_ex("write"), ExCommand::Write);
         assert_eq!(parse_ex("  w  "), ExCommand::Write);
-        assert_eq!(parse_ex("wq"), ExCommand::WriteQuit);
-        assert_eq!(parse_ex("x"), ExCommand::WriteQuit);
+        assert_eq!(parse_ex("wq"), ExCommand::WriteQuit { force: false });
+        assert_eq!(parse_ex("wq!"), ExCommand::WriteQuit { force: true });
+        assert_eq!(parse_ex("x"), ExCommand::WriteQuit { force: false });
+        assert_eq!(parse_ex("q"), ExCommand::Quit { force: false });
+        assert_eq!(parse_ex("q!"), ExCommand::Quit { force: true });
+        assert_eq!(parse_ex("qa"), ExCommand::QuitAll);
+        assert_eq!(parse_ex("wqa"), ExCommand::WriteQuitAll);
+        assert_eq!(parse_ex("xa"), ExCommand::WriteQuitAll);
         assert_eq!(parse_ex("nope"), ExCommand::Unknown("nope".into()));
         assert_eq!(parse_ex("foo bar"), ExCommand::Unknown("foo bar".into()));
     }

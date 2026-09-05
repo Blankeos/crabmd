@@ -62,7 +62,8 @@ Also not scored (helix-only chrome): view mode `z`/`Z`, space mode, match mode `
 | `p` | Paste after selection | — | no |
 | `]p` | Next paragraph | next blank-line / GFM block | yes |
 | `[p` | Previous paragraph | previous blank-line / GFM block | yes |
-| `:w` | Write file | `:w` / `:write` / `:wq` | yes |
+| `:w` | Write file | `:w` / `:write` | yes |
+| `:q` | Close buffer | `:q` closes the tab (`:q!` discards); `:wq` / `:x` saves and closes | yes |
 
 Helix `;` is collapse selection and `,` keeps the primary selection — not scored. crabmd binds `;` / `,` to vim-style repeat-find in both keymaps. Extra, not scored: `]h` / `[h` next/prev ATX heading.
 
@@ -113,6 +114,7 @@ Cursor list is the vim.rtorr movement a markdown writer needs (not `H`/`M`/`L` s
 | `A` | Insert at end of line | line end | yes |
 | `o` | Open line below | open below | yes |
 | `O` | Open line above | open above | yes |
-| `:w` | Write file | `:w` / `:write` / `:wq` | yes |
+| `:w` | Write file | `:w` / `:write` | yes |
+| `:q` | Close buffer | `:q` closes the tab (`:q!` discards); `:wq` / `:x` saves and closes | yes |
 
 `[p` / `]p` work on the Vim keymap too (not scored here; `{` / `}` are the cheat-sheet keys and stay `no`).

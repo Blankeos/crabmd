@@ -471,7 +471,7 @@ Keys (Helix / Vim normal — tabbed buffers):
   cmd-k t       theme picker (zed-style chord; cmd may stay held for t)
   cmd-,         settings
   cmd-f         find
-  :w / :write   write from the command-line; :wq writes and quits
+  :w / :write   write from the command-line; :q closes the tab, :wq saves and closes it, :qa quits
   /             insert a GFM block (headings, lists, code, table, quote, hr, alerts)
   h/j/k/l       h/l stay on the line; j/k wrap-aware file lines
   w/b/e W/B/E   word / WORD; 0/^/$ line start / first non-blank / line end

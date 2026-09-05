@@ -58,7 +58,8 @@ just preview notes.md     # release, faster startup
 There is **no autosave**. The file stays dirty until an explicit write:
 
 - `:w` / `:write` in Helix or Vim Normal (footer command-line)
-- `:wq` writes and quits
+- `:q` closes the tab (`:q!` discards changes); `:wq` / `:x` saves and closes it
+- `:qa` quits; `:wqa` saves and quits
 - `⌘S` / `Ctrl+S`, or the Save button in the status bar
 
 Opening a missing path still creates the empty file (that is open, not save).
@@ -100,7 +101,7 @@ visual lines when **Wrap lines** is on (default). Counts work: `5h`, `2k`,
 | `o` / `O` | open a line below / above **inside this block**. New empty block only for rule / table / html / raw |
 | `u` | undo (document-level) |
 | `escape` | normal; in visual, collapse the selection to the caret |
-| `:` | command-line (`w` / `write` / `wq`). Escape or empty Enter cancels |
+| `:` | command-line (`w` / `q` / `wq` / `qa`). Escape or empty Enter cancels |
 
 ### Helix
 

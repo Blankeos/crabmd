@@ -3108,14 +3108,31 @@ impl Workspace {
         cx.notify();
     }
     fn submit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Enter cycles forward (shift+enter is handled at capture level and
-        // calls `cycle_search(false)` directly). Keep the bar open so repeated
-        // enter keeps cycling; esc closes.
-        self.cycle_search(true, window, cx);
+        // Enter commits + closes (vim `/` style) so `n` / `shift-n`
+        // cycle immediately. The query lives on in `last_search`,
+        // so highlights + footer count persist after close.
+        self.commit_search(true, window, cx);
+    }
+    /// Commit the open bar then close it: reuse `cycle_search` for the
+    /// jump, then drop the bar and refocus the editor. Stays open when
+    /// there is nothing to commit (empty bar, no `last_search`).
+    fn commit_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let typed_empty = self
+            .search
+            .as_ref()
+            .map(|s| s.0.is_empty())
+            .unwrap_or(true);
+        if typed_empty && self.last_search.is_none() {
+            return;
+        }
+        self.cycle_search(forward, window, cx);
+        self.search = None;
+        self.focus.focus(window, cx);
+        cx.notify();
     }
     /// Cycle the open search bar without closing it: commit the typed query
-    /// to `last_search`, then jump. Used by enter (forward) / shift+enter
-    /// (backward) and the footer ‹ › buttons.
+    /// to `last_search`, then jump. Used by the footer ‹ › buttons while
+    /// the bar is open (enter / shift+enter commit + close instead).
     fn cycle_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let backward = self.search.as_ref().map(|s| s.1).unwrap_or(false);
         let typed = self
@@ -3943,7 +3960,28 @@ impl Workspace {
                 }
                 self.sync_title(window);
             }
-            ExCommand::WriteQuit => {
+            ExCommand::Quit { force } => {
+                // Same as cmd-w: the shell prompts when the tab is dirty.
+                if force {
+                    window.dispatch_action(Box::new(crate::tabs::ForceCloseTab), cx);
+                } else {
+                    window.dispatch_action(Box::new(crate::tabs::CloseTab), cx);
+                }
+            }
+            ExCommand::WriteQuit { .. } => {
+                // Save, then close the tab (last tab closes the window).
+                if self.write_to_disk(cx) {
+                    self.status = "written".into();
+                    self.sync_title(window);
+                    window.dispatch_action(Box::new(crate::tabs::CloseTab), cx);
+                } else {
+                    self.sync_title(window);
+                }
+            }
+            ExCommand::QuitAll => {
+                cx.quit();
+            }
+            ExCommand::WriteQuitAll => {
                 if self.write_to_disk(cx) {
                     self.status = "written".into();
                     self.sync_title(window);
@@ -4002,6 +4040,13 @@ impl Workspace {
 
     pub fn save_now(&mut self, cx: &mut Context<Self>) -> bool {
         self.write_to_disk(cx)
+    }
+
+    /// Drop unsaved changes without writing (`:q!` on a lone tab).
+    /// Marks the buffer clean so the window should-close guard lets go.
+    pub fn discard_unsaved(&mut self, cx: &mut Context<Self>) {
+        self.dirty = false;
+        cx.notify();
     }
 
     pub fn sync_title_now(&self, window: &mut Window) {
@@ -4584,7 +4629,7 @@ impl Workspace {
                 "escape" => self.cancel_search(window, cx),
                 "enter" => {
                     if mods.shift {
-                        self.cycle_search(false, window, cx);
+                        self.commit_search(false, window, cx);
                     } else {
                         self.submit_search(window, cx);
                     }

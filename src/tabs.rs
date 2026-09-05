@@ -19,7 +19,15 @@ use crate::theme::Palette;
 
 actions!(
     crabmd,
-    [NextTab, PrevTab, CloseTab, NewTab, NewWindow, CloseWindow]
+    [
+        NextTab,
+        PrevTab,
+        CloseTab,
+        ForceCloseTab,
+        NewTab,
+        NewWindow,
+        CloseWindow
+    ]
 );
 
 pub fn bind_tab_keys(cx: &mut App) {
@@ -266,6 +274,27 @@ impl WorkspaceShell {
         self.close_tab_at(ix, window, cx);
     }
 
+    /// `:q!` — drop the active tab immediately, no save prompt.
+    /// A lone tab closes the window directly (bypassing the
+    /// should-close guard, which would otherwise re-prompt).
+    fn on_force_close(&mut self, _: &ForceCloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.active;
+        if ix >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            // Bypass the should-close guard: this tab's changes are
+            // intentionally discarded by `:q!`.
+            self.tabs[ix].update(cx, |ws, cx| ws.discard_unsaved(cx));
+            window.remove_window();
+            return;
+        }
+        self.tabs.remove(ix);
+        self.active = self.active.min(self.tabs.len() - 1);
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
     fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         // `cmd-k cmd-t` must open Themes, not a new tab. `cmd-t` keymap
         // dispatch beats the editor capture handler, so consume a pending
@@ -425,6 +454,7 @@ impl Render for WorkspaceShell {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_close))
+            .on_action(cx.listener(Self::on_force_close))
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_new_window))
             .on_action(cx.listener(Self::on_close_window))
