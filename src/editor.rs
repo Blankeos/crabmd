@@ -2465,9 +2465,40 @@ impl Workspace {
         let caret = if range.start == range.end {
             self.doc.delete_char(self.caret)
         } else {
-            self.doc.delete_display(range)
+            // Linewise selections (`V`, Helix `v`+`x`, Helix Normal `x`/`X`)
+            // remove whole units; charwise selections merge remnants.
+            // Word/backspace deletes that happen to cover a whole block must
+            // keep charwise semantics (leave an empty slot, not drop the
+            // node), so only explicit linewise state routes here.
+            // Helix Normal `x`/`X` stays in Normal with a line-aligned `sel`
+            // (the only Normal+selection path), so verify alignment instead
+            // of trusting any Normal+sel.
+            let helix_normal_linewise = self.config.editor == EditorKind::Helix
+                && self.mode == Mode::Normal
+                && {
+                    let d = self.proj().display;
+                    let a = range.start.min(range.end);
+                    let b = range.start.max(range.end);
+                    a < b
+                        && crate::motion::logical_line_range(&d, a).start == a
+                        && (b == d.len()
+                            || crate::motion::logical_line_range(&d, b).start == b)
+                };
+            let linewise = self.mode == Mode::VisualLine
+                || self.select_linewise
+                || helix_normal_linewise;
+            if linewise {
+                self.doc.delete_linewise_range(range)
+            } else {
+                self.doc.delete_display(range)
+            }
         };
         self.sync_gfm();
+        // Deleting a selection lands back in Normal (Vim visual `d`/`x`,
+        // Helix `d` with `x`/`v` selection) — staying visual with no `sel`
+        // leaves a stale highlight / mode.
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
         self.commit_caret(caret, window, cx);
     }
 

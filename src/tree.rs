@@ -760,6 +760,95 @@ impl Doc {
         self.caret_after(start.node, start.item, start.cell, start.offset)
     }
 
+    /// Linewise delete for `V`+`d`, Helix `x`+`d` etc: remove every unit
+    /// (block / list item) fully covered by `range`, no merging.
+    /// The generic `delete_display` path empties the first node, no-ops the
+    /// last (`end_off == 0` when the range ends at the next line's start),
+    /// then merges — so deleting 2 full lines deleted only the first.
+    /// Falls back to `delete_display` when nothing is fully covered (e.g. a
+    /// single row inside a multi-line code block) or details are involved.
+    pub fn delete_linewise_range(&mut self, range: Range<usize>) -> usize {
+        let a = range.start.min(range.end);
+        let b = range.end.max(range.start);
+        if a == b {
+            return a;
+        }
+        let p0 = self.project();
+        let us = units(&p0);
+        let mut full: Vec<usize> = Vec::new();
+        let mut partial = false;
+        for (idx, u) in us.iter().enumerate() {
+            let r = unit_display(&p0, *u);
+            if r.start >= a && r.end <= b {
+                // Zero-length empty slots at the very edge (`r.start ==
+                // r.end == b`) are separators, not covered units.
+                if r.start < r.end || r.start < b {
+                    full.push(idx);
+                }
+            } else if r.start < b && r.end > a {
+                partial = true;
+                break;
+            }
+        }
+        if full.is_empty() {
+            return self.delete_display(a..b);
+        }
+        // Details pairs stay on the generic path (never orphan `</details>`).
+        let involves_details = full.iter().any(|&fi| {
+            let u = us[fi];
+            matches!(
+                self.nodes.get(u.block).map(|n| &n.kind),
+                Some(NodeKind::Details { .. }) | Some(NodeKind::DetailsClose)
+            )
+        });
+        if involves_details {
+            return self.delete_display(a..b);
+        }
+        if partial {
+            // Mixed full + partial edges: drop the interior whole units,
+            // then let the generic path handle the edge fragments.
+            // Only interior units are strictly inside after trimming the
+            // first/last overlapped units; simplest safe route: delete fully
+            // covered units that don't touch the range edges... For now,
+            // fall back — pure whole-unit ranges (the `x`/`V` case) are the
+            // reported bug; partial+full mixes keep merge semantics.
+            // Check whether the partials are just the trailing-newline edge:
+            // if every partial is fully inside except separator, still safe.
+            // Conservative: fall back to generic when any true partial.
+            return self.delete_display(a..b);
+        }
+        for &fi in full.iter().rev() {
+            let u = us[fi];
+            match u.item {
+                Some(i) => {
+                    if let NodeKind::List { items, .. } = &mut self.nodes[u.block].kind {
+                        if items.len() <= 1 {
+                            self.nodes.remove(u.block);
+                        } else if i < items.len() {
+                            items.remove(i);
+                        }
+                    }
+                }
+                None => {
+                    if u.block < self.nodes.len() {
+                        self.nodes.remove(u.block);
+                    }
+                }
+            }
+        }
+        if self.nodes.is_empty() {
+            self.nodes.push(Node {
+                id: next_id(),
+                kind: NodeKind::Paragraph { inlines: vec![] },
+            });
+            return 0;
+        }
+        // `a` was the start of the first removed unit: the next unit now
+        // sits there (or EOF when deleting at the end).
+        let p1 = self.project();
+        a.min(p1.display.len())
+    }
+
     pub fn delete_char(&mut self, caret: usize) -> usize {
         if caret == 0 {
             return 0;
