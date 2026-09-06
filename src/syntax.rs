@@ -105,6 +105,9 @@ fn scan_token(lang: &str, text: &str, bytes: &[u8], i: usize) -> Option<(usize, 
     if matches!(lang, "python" | "bash" | "yaml" | "toml" | "ruby") && c == '#' {
         return Some((eol(text, i), Kind::Comment));
     }
+    if lang == "mermaid" && text[i..].starts_with("%%") {
+        return Some((eol(text, i), Kind::Comment));
+    }
     if lang == "python" && (text[i..].starts_with("\"\"\"") || text[i..].starts_with("'''")) {
         let q = &text[i..i + 3];
         let end = text[i + 3..]
@@ -143,7 +146,9 @@ fn scan_token(lang: &str, text: &str, bytes: &[u8], i: usize) -> Option<(usize, 
             return Some((j, Kind::Keyword));
         }
         let rest = text[j..].trim_start();
-        if rest.starts_with('(') {
+        if rest.starts_with('(')
+            || (lang == "mermaid" && (rest.starts_with('[') || rest.starts_with('{')))
+        {
             return Some((j, Kind::Function));
         }
         return None;
@@ -400,6 +405,53 @@ fn is_keyword(lang: &str, word: &str) -> bool {
                 | "group"
                 | "limit"
         ),
+        "mermaid" => matches!(
+            word,
+            "graph"
+                | "flowchart"
+                | "sequenceDiagram"
+                | "classDiagram"
+                | "stateDiagram"
+                | "erDiagram"
+                | "gantt"
+                | "pie"
+                | "journey"
+                | "gitGraph"
+                | "mindmap"
+                | "timeline"
+                | "subgraph"
+                | "end"
+                | "participant"
+                | "actor"
+                | "note"
+                | "loop"
+                | "alt"
+                | "opt"
+                | "par"
+                | "and"
+                | "else"
+                | "rect"
+                | "critical"
+                | "break"
+                | "class"
+                | "classDef"
+                | "click"
+                | "style"
+                | "linkStyle"
+                | "direction"
+                | "title"
+                | "section"
+                | "dateFormat"
+                | "TB"
+                | "TD"
+                | "BT"
+                | "RL"
+                | "LR"
+                | "over"
+                | "of"
+                | "as"
+                | "As"
+        ),
         "toml" | "yaml" => matches!(word, "true" | "false" | "null" | "yes" | "no"),
         "json" => matches!(word, "true" | "false" | "null"),
         "css" => matches!(
@@ -475,5 +527,19 @@ mod tests {
         assert!(hs
             .iter()
             .any(|(r, _)| &"fn main() { let x = \"hi\"; }"[r.clone()] == "\"hi\""));
+    }
+
+    #[test]
+    fn mermaid_keywords_comments_and_nodes() {
+        let p = theme::load_named("opencode").unwrap();
+        let src = "%% comment\ngraph TD\n  A[Start] --> B\n";
+        let hs = highlights("mermaid", src, &p);
+        assert!(
+            hs.iter().any(|(r, _)| &src[r.clone()] == "%% comment"),
+            "{hs:?}"
+        );
+        assert!(hs.iter().any(|(r, _)| &src[r.clone()] == "graph"), "{hs:?}");
+        assert!(hs.iter().any(|(r, _)| &src[r.clone()] == "TD"), "{hs:?}");
+        assert!(hs.iter().any(|(r, _)| &src[r.clone()] == "A"), "{hs:?}");
     }
 }

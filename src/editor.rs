@@ -52,6 +52,7 @@ use crate::slash::{self, SlashItem};
 use crate::surface::{self, Hit};
 use crate::syntax;
 use crate::theme::{self, Appearance, Palette};
+use crate::toast::{ToastKind, Toasts};
 use crate::undo::{Snapshot, UndoStack};
 use crate::wysiwyg::{self, Mark};
 
@@ -255,7 +256,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleBold, Some("Workspace")),
         KeyBinding::new("ctrl-b", ToggleBold, Some("Workspace")),
         KeyBinding::new("cmd-i", ToggleItalic, Some("Workspace")),
-        KeyBinding::new("ctrl-i", ToggleItalic, Some("Workspace")),
+        KeyBinding::new("ctrl-i", ToggleItalic, Some("Notion")),
         KeyBinding::new("cmd-u", ToggleUnderline, Some("Workspace")),
         KeyBinding::new("ctrl-u", ToggleUnderline, Some("Workspace")),
         KeyBinding::new("cmd-e", ToggleCode, Some("Workspace")),
@@ -517,9 +518,35 @@ pub struct Workspace {
     sticky: crate::display::Marks,
     link_open: bool,
     link_draft: LineField,
+    link_label_draft: LineField,
+    /// False = URL field focused, true = label field focused. Tab toggles.
+    link_focus_label: bool,
+    /// Notion-style hover card: display-absolute range + URL under the mouse.
+    /// `on_link` = cursor on link text, `on_card` = cursor on the card itself.
+    /// The card stays visible while either is true; clearing is delayed (grace
+    /// timer) so the mouse can travel from text to card. `gen` invalidates
+    /// stale hide timers.
+    link_hover_range: Option<Range<usize>>,
+    link_hover_url: Option<String>,
+    link_hover_on_link: bool,
+    link_hover_on_card: bool,
+    link_hover_gen: u64,
     palette_scroll: ScrollHandle,
     slash_scroll: ScrollHandle,
+    /// Notion-database frontmatter header: collapsed toggle. Properties are
+    /// plain `key: value` text rows — fully navigable, no rename state.
+    fm_collapsed: bool,
     hits: Vec<Hit>,
+    /// Previous frame's hits (window-space layouts after prepaint), used to
+    /// anchor floating UI (selection bubble, link hover card) to the actual
+    /// target text position. Current-frame layouts aren't measured yet, so
+    /// positioning reads from this 1-frame-old snapshot.
+    prev_hits: Vec<Hit>,
+    /// Display-absolute link ranges, rebuilt each render for the
+    /// follow-mouse link hint overlay.
+    link_spans: Vec<Range<usize>>,
+    /// Short-lived toast notices (missing link targets, etc.).
+    toasts: Toasts,
     pending_replace: Option<usize>,
     pending_find: Option<(FindKind, usize)>,
     last_find: Option<(FindKind, char)>,
@@ -653,9 +680,20 @@ impl Workspace {
             sticky: crate::display::Marks::default(),
             link_open: false,
             link_draft: LineField::new(),
+            link_label_draft: LineField::new(),
+            link_focus_label: false,
+            link_hover_range: None,
+            link_hover_url: None,
+            link_hover_on_link: false,
+            link_hover_on_card: false,
+            link_hover_gen: 0,
             palette_scroll: ScrollHandle::new(),
             slash_scroll: ScrollHandle::new(),
+            fm_collapsed: false,
             hits: Vec::new(),
+            prev_hits: Vec::new(),
+            link_spans: Vec::new(),
+            toasts: Toasts::default(),
             pending_replace: None,
             pending_find: None,
             last_find: None,
@@ -739,7 +777,11 @@ impl Workspace {
         // Keep "Workspace" out of the context so Workspace-scoped bindings
         // (notably enter → InsertNewline) do not fire while the find/command
         // bar owns the keyboard. Capture handlers still see every key.
-        if self.command.is_some() || self.search.is_some() || self.cmd_palette.is_some() {
+        if self.command.is_some()
+            || self.search.is_some()
+            || self.cmd_palette.is_some()
+            || self.link_open
+        {
             return "Command";
         }
         match (self.config.editor, self.mode) {
@@ -1302,24 +1344,18 @@ impl Workspace {
         if self.link_open {
             self.link_open = false;
             self.link_draft.clear();
+            self.link_label_draft.clear();
+            self.link_focus_label = false;
         }
         if !shift {
             let p = self.proj();
-            if let Some((range, url)) = p.link_at(d) {
-                if cmd {
-                    self.open_link_url(url, window, cx);
-                    return;
-                } else if click_count == 1 {
-                    // Clicking on a link selects the link and opens the link bubble
-                    self.caret = range.end;
-                    self.sel = Some(range);
-                    self.mouse_dragging = false;
-                    self.clamp_caret();
-                    self.follow_caret = false;
-                    self.focus.focus(window, cx);
-                    cx.notify();
-                    return;
-                }
+            if let Some((_range, url)) = p.link_at(d) {
+                // Notion-style: plain click follows the link, no cmd needed.
+                // Editing happens via the hover card's Edit button.
+                let url = url.to_string();
+                self.clear_link_hover();
+                self.open_link_url(&url, window, cx);
+                return;
             }
         }
         // Images / videos: single click selects the block and opens the
@@ -1345,7 +1381,8 @@ impl Workspace {
                 self.media_sel = None;
             }
         }
-        if click_count >= 2 && !shift {            let p = self.proj();
+        if click_count >= 2 && !shift {
+            let p = self.proj();
             let d = d.min(p.display.len());
             let (range, gran) = if click_count >= 3 {
                 (
@@ -1477,6 +1514,8 @@ impl Workspace {
         if self.link_open {
             self.link_open = false;
             self.link_draft.clear();
+            self.link_label_draft.clear();
+            self.link_focus_label = false;
         }
         if !self.mouse_dragging {
             return;
@@ -1976,6 +2015,14 @@ impl Workspace {
         }
         if self.cmd_palette.is_some() {
             self.cancel_palette(window, cx);
+            return;
+        }
+        if self.link_open {
+            self.link_open = false;
+            self.link_draft.clear();
+            self.link_label_draft.clear();
+            self.link_focus_label = false;
+            cx.notify();
             return;
         }
         if self.view_source {
@@ -2675,6 +2722,12 @@ impl Workspace {
             return;
         }
         window.prevent_default();
+        // Helix/Vim `gd`: follow the link under the caret (goto definition).
+        if self.pending_g {
+            self.pending_g = false;
+            self.follow_link_at_caret(window, cx);
+            return;
+        }
         if self.mode.is_visual() {
             self.delete_selection_or_char(window, cx);
             return;
@@ -3175,6 +3228,8 @@ impl Workspace {
     }
     /// All non-overlapping matches of the active query in display text.
     /// Capped so a huge file + 1-char query can't stall the frame.
+    /// Property rows are plain display text (`key: value`), so keys match
+    /// here with no special case.
     fn search_all_matches(&self) -> Vec<std::ops::Range<usize>> {
         let Some(q) = self.active_search_query() else {
             return Vec::new();
@@ -3671,7 +3726,7 @@ impl Workspace {
         self.clear_pending();
         self.command = None;
         self.search = None;
-        self.link_open = false;
+        self.cancel_link();
         self.settings_open = false;
         let mut state = PaletteState::open_in(mode);
         if mode == PaletteMode::Themes {
@@ -4040,6 +4095,31 @@ impl Workspace {
         &self.path
     }
 
+    pub fn caret_offset(&self) -> usize {
+        self.caret
+    }
+
+    pub fn jump_to_heading(
+        &mut self,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(d) = self.proj().heading_at_slug(slug) {
+            self.caret = d;
+            self.sel = None;
+            self.follow_caret = true;
+            self.refresh(window, cx);
+        }
+    }
+
+    pub fn restore_caret(&mut self, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.caret = caret.min(self.proj().display.len());
+        self.sel = None;
+        self.follow_caret = true;
+        self.refresh(window, cx);
+    }
+
     pub fn tab_title(&self) -> String {
         self.path
             .file_name()
@@ -4287,6 +4367,85 @@ impl Workspace {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
 
+        // Link URL field owns the keyboard: context is `Command` so motions
+        // / italic / enter-newline do not steal keys. Capture still types
+        // into the draft (and handles paste, since Workspace paste is unbound).
+        if self.link_open {
+            window.prevent_default();
+            // Tab / Shift-Tab switch fields here (capture runs before
+            // keymap dispatch and stops propagation, so the indent
+            // actions never fire while the popover is open — the
+            // link_open guards there are just a backstop).
+            if key == "tab" && !mods.platform && !mods.control && !mods.alt {
+                self.link_focus_label = !self.link_focus_label;
+                cx.notify();
+                return true;
+            }
+            if (key == "z" || key == "Z")
+                && (mods.platform || mods.control)
+                && !mods.alt
+                && !mods.shift
+            {
+                self.link_field_mut().undo();
+                cx.notify();
+                return true;
+            }
+            if (key == "v") && (mods.platform || mods.control) && !mods.alt {
+                if let Some(clip) = cx.read_from_clipboard() {
+                    if let Some(raw) = clip.text() {
+                        self.link_field_mut()
+                            .insert_str(&raw.replace(['\n', '\r'], ""));
+                        cx.notify();
+                    }
+                }
+                return true;
+            }
+            if (key == "c") && (mods.platform || mods.control) && !mods.alt {
+                let field = if self.link_focus_label {
+                    &self.link_label_draft
+                } else {
+                    &self.link_draft
+                };
+                if !field.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        field.as_str().to_string(),
+                    ));
+                }
+                return true;
+            }
+            if self.link_field_mut().delete_key(key, mods)
+                || self.link_field_mut().caret_key(key, mods)
+            {
+                cx.notify();
+                return true;
+            }
+            match key {
+                "escape" => {
+                    self.cancel_link();
+                    cx.notify();
+                }
+                "enter" => self.commit_link(window, cx),
+                "backspace" => {
+                    self.link_field_mut().backspace();
+                    cx.notify();
+                }
+                "space" => {
+                    self.link_field_mut().insert_char(' ');
+                    cx.notify();
+                }
+                k if k.chars().count() == 1 && !mods.control && !mods.platform => {
+                    if let Some(ch) = k.chars().next() {
+                        if !ch.is_control() {
+                            self.link_field_mut().insert_char(ch);
+                            cx.notify();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // Zed-style `cmd-k` chord starter at capture level (GPUI keymap
         // dispatch proved unreliable for this chord, so it is handled
         // manually here): `cmd-k` then `t` opens Themes. Note capture runs
@@ -4446,40 +4605,6 @@ impl Workspace {
                                 state.index = 0;
                             }
                             self.scroll_palette_to_selected();
-                            cx.notify();
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return true;
-        }
-
-        if self.link_open {
-            window.prevent_default();
-            if self.link_draft.delete_key(key, mods) || self.link_draft.caret_key(key, mods) {
-                cx.notify();
-                return true;
-            }
-            match key {
-                "escape" => {
-                    self.link_open = false;
-                    self.link_draft.clear();
-                    cx.notify();
-                }
-                "enter" => self.commit_link(window, cx),
-                "backspace" => {
-                    self.link_draft.backspace();
-                    cx.notify();
-                }
-                "space" => {
-                    self.link_draft.insert_char(' ');
-                    cx.notify();
-                }
-                k if k.chars().count() == 1 && !mods.control && !mods.platform => {
-                    if let Some(ch) = k.chars().next() {
-                        if !ch.is_control() {
-                            self.link_draft.insert_char(ch);
                             cx.notify();
                         }
                     }
@@ -5631,6 +5756,8 @@ impl Workspace {
         fit_content: bool,
         syntax_lang: Option<&str>,
         _mono: bool,
+        font_scale: f32,
+        muted_prefix_len: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.proj();
@@ -5674,6 +5801,20 @@ impl Workspace {
         let local_marked = surface::clip_range(d_marked, display.clone());
         let runs = surface::mark_runs(&p, display.clone());
         let mut hs = surface::highlights(text.len(), &runs, local_sel, local_marked, &pal, heading);
+        // Muted `key: ` prefix (property rows): color-only, pushed before
+        // syntax/search so occurrence + selection highlights compose over it.
+        if let Some(len) = muted_prefix_len {
+            let len = len.min(text.len());
+            if len > 0 {
+                hs.push((
+                    0..len,
+                    gpui::HighlightStyle {
+                        color: Some(pal.text_muted),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
         if let Some(lang) = syntax_lang {
             hs.extend(syntax::highlights(lang, text, &pal));
             hs = surface::flatten(text.len(), hs);
@@ -5733,7 +5874,10 @@ impl Workspace {
                 Some(6) => 0.85,
                 _ => 1.0,
             };
-            (self.config.markdown_font.family.clone(), px(base * scale))
+            (
+                self.config.markdown_font.family.clone(),
+                px(base * scale * font_scale),
+            )
         };
         let font = Some(gpui::SharedString::from(family));
         let font_px = Some(size);
@@ -5756,6 +5900,15 @@ impl Workspace {
         } else {
             font_px.filter(|_| code_font.is_some()).map(|s| s * crate::surface::INLINE_CODE_SCALE)
         };
+        let link_ranges: Vec<_> = runs
+            .iter()
+            .filter(|(_, m)| m.link.is_some())
+            .map(|(r, _)| r.clone())
+            .collect();
+        // Display-absolute link spans for the follow-mouse hint overlay
+        // (`LinkHintLayer` hit-tests in display space).
+        self.link_spans
+            .extend(link_ranges.iter().map(|r| display.start + r.start..display.start + r.end));
         surface::edit_text(
             view.clone(),
             focus,
@@ -5775,6 +5928,7 @@ impl Workspace {
             heading,
             code_font,
             code_px,
+            link_ranges,
             {
                 let view = view.clone();
                 move |d, shift, cmd, clicks, window, cx| {
@@ -5787,6 +5941,14 @@ impl Workspace {
                 let view = view.clone();
                 move |d, window, cx| {
                     view.update(cx, |this, cx| this.drag_display(d, window, cx));
+                }
+            },
+            {
+                let view = view.clone();
+                move |range: Range<usize>, hovering: bool, _window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.set_link_hover(range, hovering, cx);
+                    });
                 }
             },
         )
@@ -5832,6 +5994,22 @@ impl Workspace {
             BlockExtra::Code { lang, .. } if !lang.is_empty() => Some(lang.as_str()),
             _ => None,
         };
+        // Property rows are just smaller navigable text: the full
+        // `key: value` line renders at 85% with the `key: ` prefix muted.
+        // The prefix highlight is color-only, so selection tint and search
+        // highlights still compose over it.
+        let is_prop = matches!(block.extra, BlockExtra::Property);
+        let muted_prefix_len = if is_prop {
+            text.find(':').map(|i| {
+                let mut end = i + 1;
+                while text[end..].starts_with(' ') && end - (i + 1) < 1 {
+                    end += 1;
+                }
+                end.min(text.len())
+            })
+        } else {
+            None
+        };
         let body = self.render_edit(
             block.display.clone(),
             &text,
@@ -5842,6 +6020,8 @@ impl Workspace {
             is_code,
             syntax_lang,
             is_code,
+            if is_prop { 0.85 } else { 1.0 },
+            muted_prefix_len,
             cx,
         );
         let modal_open = self.cmd_palette.is_some()
@@ -5850,6 +6030,7 @@ impl Workspace {
             || self.search.is_some();
         let slash = self.slash_is_open()
             && !modal_open
+            && !is_prop
             && p.block_at_display(self.caret)
                 .map(|b| b.source == block.source)
                 .unwrap_or(false);
@@ -5890,6 +6071,36 @@ impl Workspace {
                 .px_3()
                 .child(body)
                 .into_any_element(),
+            // Frontmatter property: the whole `key: value` line is one
+            // navigable text row (smaller, key prefix muted via highlight).
+            // Caret, insert mode, motions, selection, undo, search — all
+            // native. The × removes the row.
+            BlockExtra::Property => {
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(body))
+                    .child(
+                        div()
+                            .id(("fm-x", ix))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(pal.text_muted)
+                            .child("×")
+                            .on_mouse_down(MouseButton::Left, {
+                                let view = cx.entity();
+                                move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    view.update(cx, |this, cx| {
+                                        this.fm_remove_node(ix, window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                    .into_any_element()
+            }
             BlockExtra::Code { lang, .. } => {
                 let caret = self.caret;
                 let family = self.config.buffer_font.family.clone();
@@ -7852,6 +8063,8 @@ impl Workspace {
                     false,
                     None,
                     false,
+                    1.0,
+                    None,
                     cx,
                 );
                 h_flex()
@@ -7959,12 +8172,12 @@ impl Workspace {
                         let saved_sel = if table_sel.is_some_and(|t| t.is_multi()) {
                             let s = self.sel.take();
                             let edit = self.render_edit(
-                                disp, &text, header, None, None, wrap, false, None, false, cx,
+                                disp, &text, header, None, None, wrap, false, None, false, 1.0, None, cx,
                             );
                             self.sel = s;
                             edit
                         } else {
-                            self.render_edit(disp, &text, header, None, None, wrap, false, None, false, cx)
+                            self.render_edit(disp, &text, header, None, None, wrap, false, None, false, 1.0, None, cx)
                         };
                         let edit = saved_sel;
                         let show_tools = tools_at == Some((r, c));
@@ -8026,6 +8239,20 @@ impl Workspace {
     /// Combined selection bubble + grid controls, floating over the table.
     fn render_table_tools(&self, cx: &mut Context<Self>) -> AnyElement {
         let pal = &self.palette;
+        // While editing a link, show only the link fields — same as the
+        // selection bubble: formatting + grid buttons stay hidden.
+        if self.link_open {
+            return v_flex()
+                .gap_1()
+                .p_1()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(pal.border)
+                .bg(pal.background_panel)
+                .shadow_sm()
+                .child(self.render_link_field(cx))
+                .into_any_element();
+        }
         let n = self.table_sel.map(|t| t.normalize());
         let del_rows = n.map(|t| t.row_count()).unwrap_or(1);
         let del_cols = n.map(|t| t.col_count()).unwrap_or(1);
@@ -8053,10 +8280,8 @@ impl Workspace {
                     .child(self.link_btn(link_label, cx))
                     .when_some(linked_url.clone(), |el, url| {
                         el.child(self.open_link_btn(url, cx))
-                    })
-                    .when(is_linked, |el| el.child(self.unlink_btn(cx))),
+                    }),
             )
-            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
             .child(
                 h_flex()
                     .gap_1()
@@ -8197,13 +8422,25 @@ impl Workspace {
     }
 
     fn render_bubble(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.palette;
+        // While editing a link, show only the link fields — the mark/link
+        // buttons would act on the selection underneath and steal clicks.
+        if self.link_open {
+            return h_flex()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(p.border)
+                .bg(p.background_panel)
+                .shadow_sm()
+                .child(self.render_link_field(cx))
+                .into_any_element();
+        }
         let Some(_sel) = self.sel.clone().filter(|s| s.start != s.end) else {
-            if self.link_open {
-                return self.render_link_field(cx);
-            }
             return div().into_any_element();
         };
-        let p = &self.palette;
         let linked_url = self.selected_link_url();
         let is_linked = linked_url.is_some();
         let link_label = if is_linked { "Edit link" } else { "Link" };
@@ -8226,8 +8463,6 @@ impl Workspace {
             .when_some(linked_url.clone(), |el, url| {
                 el.child(self.open_link_btn(url, cx))
             })
-            .when(is_linked, |el| el.child(self.unlink_btn(cx)))
-            .when(self.link_open, |el| el.child(self.render_link_field(cx)))
             .into_any_element()
     }
 
@@ -8261,22 +8496,70 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn unlink_btn(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                Button::new("rm-link")
-                    .ghost()
-                    .xsmall()
-                    .label("Unlink")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.remove_link_action(window, cx);
-                    })),
-            )
-            .into_any_element()
+    /// Floating-UI anchor: window-space X of a display offset from last
+    /// frame's measured layouts, as a row-relative left offset (clamped).
+    /// Falls back to the old fixed inset when layouts aren't ready yet.
+    fn float_left_for_anchor(&self, ui: usize, anchor_d: usize, pop_w: f32, fallback: f32) -> Pixels {
+        let viewport_w: f32 = self.scroll_handle.bounds().size.width.into();
+        let max_left = (viewport_w - pop_w - 16.).max(0.);
+        let anchor_x: Option<f32> =
+            surface::caret_screen_x(&self.prev_hits, anchor_d).map(|x| x.into());
+        let row_left: Option<f32> = self
+            .scroll_handle
+            .bounds_for_item(ui)
+            .map(|b| {
+                let off = self.scroll_handle.offset();
+                (b.left() + off.x).into()
+            });
+        match (anchor_x, row_left) {
+            (Some(ax), Some(rx)) => px((ax - rx - 8.).clamp(0., max_left)),
+            _ => px(fallback.min(max_left.max(fallback))),
+        }
     }
 
-    fn selection_bubble_for_block(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Window-space room around a target line for floating UI. Returns
+    /// `(row-relative line top, window line top, line height)`, measured
+    /// from last frame's layouts. None when layouts aren't ready yet.
+    fn float_line_geom(&self, ui: usize, anchor_d: usize) -> Option<(f32, f32, f32)> {
+        let (line_top_win, line_h) = surface::caret_screen_y(&self.prev_hits, anchor_d)?;
+        let row_top_win: f32 = self
+            .scroll_handle
+            .bounds_for_item(ui)
+            .map(|b| {
+                let off = self.scroll_handle.offset();
+                (b.top() + off.y).into()
+            })?;
+        let lt: f32 = line_top_win.into();
+        let lh: f32 = line_h.into();
+        Some((lt - row_top_win, lt, lh))
+    }
+
+    /// Window-space viewport top/bottom. None when not measured yet.
+    fn float_viewport(&self) -> Option<(f32, f32)> {
+        let vp = self.scroll_handle.bounds();
+        if vp.size.height <= px(0.) {
+            return None;
+        }
+        Some((vp.top().into(), vp.bottom().into()))
+    }
+
+    /// Pick the popover side. Shared helper lives in `surface` so every
+    /// floating card (bubble, hover, slash) flips the same way.
+    fn float_pick_above(prefer_below: bool, room_above: f32, room_below: f32, pop_h: f32) -> bool {
+        surface::popover_pick_above(prefer_below, room_above, room_below, pop_h)
+    }
+
+    /// Build the anchored popover element (see `surface::popover_anchor`).
+    fn float_anchor(above: bool, left: Pixels, line_rel: f32, line_h: f32, priority: usize, content: AnyElement) -> AnyElement {
+        surface::popover_anchor(above, left, line_rel, line_h, priority, content)
+    }
+
+    fn selection_bubble_for_block(
+        &self,
+        ix: usize,
+        ui: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         // Never float the selection bubble above a modal overlay (palette,
         // settings, : command, search): the backdrop occludes the doc and
         // the modal's deferred pass already paints above the document.
@@ -8293,32 +8576,69 @@ impl Workspace {
         if matches!(this.extra, BlockExtra::Table { .. }) {
             return None;
         }
-        let show = if let Some(sel) = self.sel.as_ref().filter(|s| s.start != s.end) {
+        let anchor_d = if let Some(sel) = self.sel.as_ref().filter(|s| s.start != s.end) {
             let d0 = p.to_display(sel.start.min(sel.end));
-            p.block_at_display(d0)
+            if !p
+                .block_at_display(d0)
                 .is_some_and(|b| b.source == this.source)
+            {
+                return None;
+            }
+            d0
         } else if self.link_open {
             let d = self.caret;
-            p.block_at_display(d)
+            if !p
+                .block_at_display(d)
                 .is_some_and(|b| b.source == this.source)
+            {
+                return None;
+            }
+            d
         } else {
-            false
+            return None;
         };
-        if !show || self.mouse_dragging {
+        if self.mouse_dragging {
             return None;
         }
-        // Float above the selected block (same deferred trick as the slash menu).
-        Some(
-            deferred(
-                div()
-                    .absolute()
-                    .top(px(-40.))
-                    .left(px(48.))
-                    .child(self.render_bubble(cx)),
-            )
-            .with_priority(2)
-            .into_any_element(),
-        )
+        // Anchor to the target text's own line (floating-UI style), not a
+        // fixed inset and not the row top — on wrapped text the selection
+        // may sit several lines below the row start. Heights are rough
+        // flip-only estimates (bubble ~44px, link form ~300px); positioning
+        // never uses them, so the gap is always exactly one step.
+        let (pop_h, pop_w) = if self.link_open {
+            (300., 340.)
+        } else {
+            (44., 340.)
+        };
+        let left = self.float_left_for_anchor(ui, anchor_d, pop_w, 48.);
+        const GAP: f32 = 8.;
+        let Some(((rel, win, lh), (vt, vb))) =
+            self.float_line_geom(ui, anchor_d).zip(self.float_viewport())
+        else {
+            // Layouts not measured yet (first frame): pin above the row.
+            return Some(
+                deferred(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(px(-pop_h - GAP))
+                        .occlude()
+                        .child(self.render_bubble(cx)),
+                )
+                .with_priority(2)
+                .into_any_element(),
+            );
+        };
+        // The tall link form prefers below (Notion); the toolbar above.
+        let above = Self::float_pick_above(self.link_open, win - vt - GAP, vb - (win + lh) - GAP, pop_h);
+        Some(Self::float_anchor(
+            above,
+            left,
+            rel,
+            lh,
+            2,
+            self.render_bubble(cx),
+        ))
     }
 
     fn mark_btn(&self, label: &'static str, mark: Mark, cx: &mut Context<Self>) -> AnyElement {
@@ -8336,18 +8656,129 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_link_field(&self, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_link_field(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = &self.palette;
-        h_flex()
-            .items_center()
-            .gap_1()
+        let label_active = self.link_focus_label;
+        let label_color = if label_active {
+            p.markdown_text
+        } else {
+            p.text_muted
+        };
+        let url_color = if label_active {
+            p.text_muted
+        } else {
+            p.markdown_text
+        };
+        // Focused field gets a real overlay caret via `surface::field_text`:
+        // same 2px `primary` bar as body text, painted over the layout so
+        // the text never shifts when the caret moves (unlike the old `│`
+        // text glyph, which took up space and painted in the text color).
+        let url_text = self.link_draft.as_str().to_string();
+        let url_caret = self.link_draft.caret();
+        let label_text = self.link_label_draft.as_str().to_string();
+        let label_caret = self.link_label_draft.caret();
+        let view = cx.entity();
+        let focus = self.focus.clone();
+        let caret_color = p.primary;
+        let field = |id: &'static str,
+                     focused: bool,
+                     text: String,
+                     caret: usize,
+                     color: gpui::Hsla| {
+            let view = view.clone();
+            let focus = focus.clone();
+            let content: AnyElement = if focused {
+                let click_view = view.clone();
+                surface::field_text(
+                    view.clone(),
+                    focus,
+                    id,
+                    text.into(),
+                    caret,
+                    caret_color,
+                    move |at, window, cx| {
+                        click_view.update(cx, |this, cx| {
+                            this.link_field_set_caret(at, window, cx);
+                        });
+                    },
+                )
+            } else {
+                div().child(text).into_any_element()
+            };
+            div()
+                .px_2()
+                .py_1()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(p.border)
+                .bg(p.background_element.opacity(0.5))
+                .text_sm()
+                .text_color(color)
+                .min_w(px(260.))
+                .cursor_text()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                        view.update(cx, |this, cx| {
+                            this.link_focus_label = focused;
+                            cx.notify();
+                        });
+                    },
+                )
+                .child(content)
+        };
+        v_flex()
+            .gap_2()
+            .p_2()
+            .min_w(px(300.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_xs().text_color(p.text_muted).child("url"))
+            .child(div().text_xs().text_color(p.text_muted).child("Page or URL"))
+            .child(field(
+                "link-url-field",
+                !label_active,
+                url_text,
+                url_caret,
+                url_color,
+            ))
+            .child(div().text_xs().text_color(p.text_muted).child("Link title"))
+            .child(field(
+                "link-label-field",
+                label_active,
+                label_text,
+                label_caret,
+                label_color,
+            ))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(p.markdown_text)
-                    .child(self.link_draft.render()),
+                    .h(px(1.))
+                    .w_full()
+                    .bg(p.border.opacity(0.6)),
+            )
+            .child(
+                div()
+                    .id("link-remove")
+                    .px_2()
+                    .py_1()
+                    .rounded(px(6.))
+                    .hover(|el| el.bg(p.background_element))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.remove_link_action(window, cx);
+                    }))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(icon_el("trash-2", p.text_muted))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(p.markdown_text)
+                                    .child("Remove link"),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -8358,6 +8789,325 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Notion-style hover card: `🌐 truncated-url [copy] [Edit]`. Sticky via
+    /// `on_hover` (card hover keeps it alive) + delayed hide in state, so the
+    /// mouse can travel from link text onto the card. Anchored above the
+    /// hovered block (same deferred trick as the selection bubble).
+    fn render_link_hover_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.palette;
+        let url = self.link_hover_url.clone().unwrap_or_default();
+        let short = if url.chars().count() > 40 {
+            let head: String = url.chars().take(37).collect();
+            format!("{head}…")
+        } else {
+            url
+        };
+        let view = cx.entity();
+        h_flex()
+            .id("link-hover-card")
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.background_panel)
+            .shadow_md()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_hover(move |hovering: &bool, _window, cx| {
+                view.update(cx, |this, cx| {
+                    this.on_link_card_hover(*hovering, cx);
+                });
+            })
+            .child(icon_el("link", p.text_muted))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(p.markdown_text)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .max_w(px(280.))
+                    .child(short),
+            )
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("link-card-copy")
+                            .ghost()
+                            .xsmall()
+                            .icon(icon_el("copy", p.text_muted))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.copy_hover_link(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("link-card-edit")
+                            .ghost()
+                            .xsmall()
+                            .label("Edit")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.edit_hover_link(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn link_hover_card_for_unit(
+        &self,
+        block_ix: usize,
+        item: Option<usize>,
+        ui: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.link_hover_visible() || self.mouse_dragging {
+            return None;
+        }
+        let hover = self.link_hover_range.clone()?;
+        let p = self.proj();
+        let inside = if let Some(item_ix) = item {
+            let block = p.blocks.get(block_ix)?;
+            let BlockExtra::List { items, .. } = &block.extra else {
+                return None;
+            };
+            let it = items.get(item_ix)?;
+            hover.start < it.display.end && hover.end > it.display.start
+        } else {
+            let block = p.blocks.get(block_ix)?;
+            // Tables own their toolbar; the hover card would fight it.
+            if matches!(block.extra, BlockExtra::Table { .. }) {
+                return None;
+            }
+            hover.start < block.display.end && hover.end > block.display.start
+        };
+        if !inside {
+            return None;
+        }
+        // Notion-style: hover card prefers BELOW the link's own line (both
+        // screenshots show below-target cards). Line-anchored, so wrapped
+        // text follows the link's line, not the row top. Flips above only
+        // when there is no room below (keeps it out of the tab bar either
+        // way — positioning never depends on the card height).
+        let left = self.float_left_for_anchor(ui, hover.start, 380., 0.);
+        const GAP: f32 = 8.;
+        const POP_H: f32 = 52.;
+        let Some(((rel, win, lh), (vt, vb))) =
+            self.float_line_geom(ui, hover.start).zip(self.float_viewport())
+        else {
+            // Layouts not measured yet (first frame): drop below the row top.
+            return Some(
+                deferred(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(px(28.))
+                        .occlude()
+                        .child(self.render_link_hover_card(cx)),
+                )
+                .with_priority(3)
+                .into_any_element(),
+            );
+        };
+        let above = Self::float_pick_above(true, win - vt - GAP, vb - (win + lh) - GAP, POP_H);
+        Some(Self::float_anchor(
+            above,
+            left,
+            rel,
+            lh,
+            3,
+            self.render_link_hover_card(cx),
+        ))
+    }
+
+    // --- Frontmatter properties (first-class blocks) ---
+    // Values are `Property` nodes: the full editor (caret, insert mode,
+    // motions, undo, search) works on them with no special cases. This
+    // section is only header chrome (toggle / count / add), key renaming,
+    // and row removal.
+
+    fn fm_prop_count(&self) -> usize {
+        self.doc
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, crate::tree::NodeKind::Property { .. }))
+            .count()
+    }
+
+    fn fm_has_props(&self) -> bool {
+        self.fm_prop_count() > 0
+    }
+
+    /// Leading `Property` run length — where `+` inserts the new row.
+    fn fm_lead(&self) -> usize {
+        self.doc
+            .nodes
+            .iter()
+            .take_while(|n| matches!(n.kind, crate::tree::NodeKind::Property { .. }))
+            .count()
+    }
+
+    /// Insert a new `untitled: ` row after the leading run and land the
+    /// caret after the colon (insert mode when modal, like `o`).
+    fn fm_add_property(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_doc_undo();
+        let at = self.fm_lead();
+        self.doc.nodes.insert(
+            at,
+            crate::tree::Node {
+                id: crate::document::next_id(),
+                kind: crate::tree::NodeKind::Property {
+                    inlines: crate::frontmatter::plain_inlines("untitled: "),
+                },
+            },
+        );
+        self.fm_collapsed = false;
+        self.sync_gfm();
+        self.mark_dirty();
+        let d = self
+            .proj()
+            .blocks
+            .get(at)
+            .map(|b| b.display.start + "untitled: ".len())
+            .unwrap_or(0);
+        self.caret = d;
+        self.sel = None;
+        if self.config.editor.is_modal() {
+            self.enter_insert(Caret::Offset(d), window, cx);
+        } else {
+            self.refresh(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// True removal (no empty shell left behind). Undo-safe.
+    fn fm_remove_node(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let target_id = match self.doc.nodes.get(ix) {
+            Some(n)
+                if matches!(
+                    &n.kind,
+                    crate::tree::NodeKind::Property { .. }
+                ) =>
+            {
+                n.id
+            }
+            _ => return,
+        };
+        let Some(ix) = self.doc.nodes.iter().position(|n| n.id == target_id) else {
+            return;
+        };
+        self.push_doc_undo();
+        self.doc.nodes.remove(ix);
+        if self.doc.nodes.is_empty() {
+            self.doc.nodes.push(crate::tree::Node {
+                id: crate::document::next_id(),
+                kind: crate::tree::NodeKind::Paragraph { inlines: Vec::new() },
+            });
+        }
+        self.sync_gfm();
+        self.mark_dirty();
+        self.clamp_caret();
+        self.refresh(window, cx);
+    }
+
+    /// Slim header chrome: toggle + count + add. Rows are body units now.
+    fn render_fm_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.fm_has_props() {
+            return None;
+        }
+        let p = &self.palette;
+        let view = cx.entity();
+        let collapsed = self.fm_collapsed;
+        let count = self.fm_prop_count();
+        // Same Notion-style animated chevron as `/details`: one chevron-down
+        // glyph, rotated -90° when collapsed. Id folds in `collapsed` so every
+        // toggle remounts and replays the rotation.
+        let (from, to) = if collapsed {
+            (0.0, -std::f32::consts::FRAC_PI_2)
+        } else {
+            (-std::f32::consts::FRAC_PI_2, 0.0)
+        };
+        let chev = svg()
+            .path(crate::assets::path("chevron-down"))
+            .size(px(12.))
+            .text_color(p.text_muted)
+            .with_transformation(Transformation::rotate(radians(to)))
+            .with_animation(
+                ElementId::NamedInteger("fm-chev".into(), collapsed as u64),
+                Animation::new(Duration::from_millis(180)).with_easing(ease_in_out),
+                move |el, delta| {
+                    el.with_transformation(Transformation::rotate(radians(
+                        from + (to - from) * delta,
+                    )))
+                },
+            );
+        let full_width = self.config.full_width;
+        Some(
+            div()
+                .when(!full_width, |el| el.w(px(COLUMN_PX)).mx_auto())
+                .when(full_width, |el| el.w_full())
+                .max_w_full()
+                .min_w_0()
+                .flex_shrink_0()
+                .px_8()
+                .pt_3()
+                .pb_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_start()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("fm-toggle")
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(p.text_muted)
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(chev)
+                                        .child(format!("Properties · {count}")),
+                                )
+                                .on_mouse_down(MouseButton::Left, {
+                                    let view = view.clone();
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        view.update(cx, |this, cx| {
+                                            this.fm_collapsed = !this.fm_collapsed;
+                                            this.refresh(window, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("fm-add")
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(p.text_muted)
+                                .child("+")
+                                .on_mouse_down(MouseButton::Left, {
+                                    let view = view.clone();
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        view.update(cx, |this, cx| {
+                                            this.fm_add_property(window, cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
     fn on_insert_newline(
         &mut self,
         _: &InsertNewline,
@@ -8388,6 +9138,13 @@ impl Workspace {
         self.insert_newline(true, window, cx);
     }
     fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
+        // Backstop only: capture already toggles label/URL focus and stops
+        // propagation, so reaching here means capture was bypassed — just
+        // swallow Tab instead of indenting. Do NOT toggle here (double-flip).
+        if self.link_open {
+            window.prevent_default();
+            return;
+        }
         if self.overlay_input_focused(window, cx) {
             cx.propagate();
             return;
@@ -8432,6 +9189,11 @@ impl Workspace {
         }
     }
     fn on_outdent_tab(&mut self, _: &OutdentTab, window: &mut Window, cx: &mut Context<Self>) {
+        // Backstop only (see `on_indent_tab`): swallow, don't toggle.
+        if self.link_open {
+            window.prevent_default();
+            return;
+        }
         if self.overlay_input_focused(window, cx) {
             cx.propagate();
             return;
@@ -8524,18 +9286,214 @@ impl Workspace {
         }
     }
 
+    /// Display range backing the link popover: the selection when non-empty,
+    /// otherwise the full linked run under the caret (for label editing).
+    fn selected_link_range(&self) -> Option<std::ops::Range<usize>> {
+        if let Some(s) = self.sel.clone().filter(|s| s.start != s.end) {
+            return Some(s.start.min(s.end)..s.end.max(s.start));
+        }
+        self.proj().link_at(self.caret).map(|(r, _)| r)
+    }
+
+    /// Visible text the link popover edits (selection or linked run).
+    fn link_target_text(&self) -> String {
+        let Some(r) = self.selected_link_range() else {
+            return String::new();
+        };
+        let p = self.proj();
+        let a = r.start.min(r.end).min(p.display.len());
+        let b = r.start.max(r.end).min(p.display.len());
+        p.display.get(a..b).unwrap_or("").to_string()
+    }
+
+    fn cancel_link(&mut self) {
+        self.link_open = false;
+        self.link_draft.clear();
+        self.link_label_draft.clear();
+        self.link_focus_label = false;
+    }
+
+    fn clear_link_hover(&mut self) {
+        self.link_hover_range = None;
+        self.link_hover_url = None;
+        self.link_hover_on_link = false;
+        self.link_hover_on_card = false;
+        self.link_hover_gen += 1;
+    }
+
+    fn link_hover_visible(&self) -> bool {
+        self.link_hover_range.is_some()
+            && self.link_hover_url.is_some()
+            && !self.link_open
+            && !self.view_source
+            && self.cmd_palette.is_none()
+            && !self.settings_open
+            && self.command.is_none()
+            && self.search.is_none()
+    }
+
+    /// Hover enter/exit from a link word. `range` is the display-absolute
+    /// link range at render time; the URL is re-resolved so edits don't leave
+    /// a stale card behind.
+    fn set_link_hover(
+        &mut self,
+        range: Range<usize>,
+        hovering: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.link_open || self.view_source {
+            return;
+        }
+        if hovering {
+            let p = self.proj();
+            let probe = range.start.min(p.display.len());
+            let found: Option<(Range<usize>, String)> = p
+                .link_at(probe)
+                .map(|(r, u)| (r, u.to_string()))
+                .or_else(|| {
+                    range.clone().find_map(|i| {
+                        p.link_at(i).map(|(r, u)| (r.clone(), u.to_string()))
+                    })
+                });
+            let Some((actual, url)) = found else {
+                return;
+            };
+            self.link_hover_range = Some(actual);
+            self.link_hover_url = Some(url);
+            self.link_hover_on_link = true;
+            self.link_hover_gen += 1;
+            cx.notify();
+        } else {
+            self.link_hover_on_link = false;
+            self.schedule_link_hover_hide(cx);
+        }
+    }
+
+    fn on_link_card_hover(&mut self, hovering: bool, cx: &mut Context<Self>) {
+        self.link_hover_on_card = hovering;
+        if hovering {
+            self.link_hover_gen += 1;
+            cx.notify();
+        } else {
+            self.schedule_link_hover_hide(cx);
+        }
+    }
+
+    /// Delayed hide so the mouse can travel from link text onto the card.
+    /// Stale timers (newer `gen`) never clear a fresh hover.
+    fn schedule_link_hover_hide(&mut self, cx: &mut Context<Self>) {
+        self.link_hover_gen += 1;
+        let gen = self.link_hover_gen;
+        cx.notify();
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            let _ = cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    if this.link_hover_gen != gen {
+                        return;
+                    }
+                    if !this.link_hover_on_link && !this.link_hover_on_card {
+                        this.link_hover_range = None;
+                        this.link_hover_url = None;
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn copy_hover_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(url) = self.link_hover_url.clone() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(url));
+        self.show_toast(ToastKind::Info, "Copied to clipboard", window, cx);
+    }
+
+    /// Open the Edit Link popover anchored on the hovered link.
+    fn edit_hover_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(range) = self.link_hover_range.clone() else {
+            return;
+        };
+        let url = self.link_hover_url.clone().unwrap_or_default();
+        let p = self.proj();
+        let label = p
+            .display
+            .get(range.clone())
+            .unwrap_or("")
+            .to_string();
+        self.caret = range.end;
+        self.sel = Some(range);
+        self.mouse_dragging = false;
+        self.clamp_caret();
+        // Hide the hover card; the edit popover takes over.
+        self.link_hover_range = None;
+        self.link_hover_url = None;
+        self.link_hover_on_link = false;
+        self.link_hover_on_card = false;
+        self.link_hover_gen += 1;
+        self.link_open = true;
+        // URL first (Notion order: Page or URL, then Link title).
+        self.link_focus_label = false;
+        self.link_draft.clear();
+        self.link_label_draft.clear();
+        if !url.is_empty() {
+            self.link_draft.insert_str(&url);
+        }
+        if !label.is_empty() {
+            self.link_label_draft.insert_str(&label);
+        }
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn link_field_mut(&mut self) -> &mut LineField {
+        if self.link_focus_label {
+            &mut self.link_label_draft
+        } else {
+            &mut self.link_draft
+        }
+    }
+
+    fn link_field_set_caret(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_field_mut().set_caret(at);
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     fn on_toggle_link(&mut self, _: &ToggleLink, window: &mut Window, cx: &mut Context<Self>) {
         if self.view_source || self.cmd_palette.is_some() {
             return;
         }
-        if self.sel.as_ref().is_none_or(|s| s.start == s.end) && !self.link_open {
+        if self.link_open {
+            self.commit_link(window, cx);
+            return;
+        }
+        // No selection: still allow editing when the caret sits on a link
+        // so its label can be changed without re-selecting the text.
+        if self
+            .sel
+            .as_ref()
+            .is_none_or(|s| s.start == s.end)
+            && self.selected_link_url().is_none()
+        {
             return;
         }
         self.link_open = true;
-        // Prefill the draft with the existing URL so Link doubles as Edit.
+        self.link_focus_label = false;
+        // Prefill both drafts so Link doubles as Edit (label + URL).
         self.link_draft.clear();
+        self.link_label_draft.clear();
         if let Some(url) = self.selected_link_url() {
             self.link_draft.insert_str(&url);
+        }
+        let label = self.link_target_text();
+        if !label.is_empty() {
+            self.link_label_draft.insert_str(&label);
         }
         self.focus.focus(window, cx);
         cx.notify();
@@ -8579,9 +9537,14 @@ impl Workspace {
         }
         window.prevent_default();
         if self.link_open {
-            if !self.link_draft.is_empty() {
+            let field = if self.link_focus_label {
+                &self.link_label_draft
+            } else {
+                &self.link_draft
+            };
+            if !field.is_empty() {
                 cx.write_to_clipboard(ClipboardItem::new_string(
-                    self.link_draft.as_str().to_string(),
+                    field.as_str().to_string(),
                 ));
             }
             return;
@@ -8655,7 +9618,7 @@ impl Workspace {
             return;
         }
         if self.link_open {
-            self.link_draft.insert_str(&text.replace('\n', ""));
+            self.link_field_mut().insert_str(&text.replace('\n', ""));
             cx.notify();
             return;
         }
@@ -9277,7 +10240,8 @@ impl Workspace {
     }
 
     fn render_source_view(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        self.hits.clear();
+        self.prev_hits = std::mem::take(&mut self.hits);
+        self.link_spans.clear();
         let pal = self.palette.clone();
         let text = self.source.clone();
         let hs = crate::syntax::highlights("markdown", &text, &pal);
@@ -9308,8 +10272,10 @@ impl Workspace {
             false,
             None,
             None,
+            Vec::new(),
             |_, _, _, _, _, _| {},
             |_, _, _| {},
+            |_, _, _, _| {},
         );
         let full_width = self.config.full_width;
         vec![div()
@@ -9335,7 +10301,10 @@ impl Workspace {
         if cx.has_active_drag() {
             self.block_menu = None;
         }
-        self.hits.clear();
+        // Snapshot last frame's measured layouts for floating-UI anchoring
+        // before rebuilding `hits` (new layouts aren't prepainted yet).
+        self.prev_hits = std::mem::take(&mut self.hits);
+        self.link_spans.clear();
         self.code_scroll_seen.clear();
         let full_width = self.config.full_width;
         let p = self.proj();
@@ -9362,8 +10331,10 @@ impl Workspace {
             .collect();
         let mut kids = Vec::new();
         // Which rows are hidden (collapsed `<details>` bodies + `</details>`
-        // chrome). Precomputed so the loop can skip the last-visible-row
-        // margin and keep hidden rows at true zero height.
+        // chrome + collapsed frontmatter property rows). Precomputed so the
+        // loop can skip the last-visible-row margin and keep hidden rows at
+        // true zero height.
+        let fm_hidden = self.fm_collapsed;
         let gone: Vec<bool> = us
             .iter()
             .copied()
@@ -9372,6 +10343,11 @@ impl Workspace {
                     || hidden
                         .iter()
                         .any(|(a, b)| unit.block > *a && unit.block <= *b)
+                    || (fm_hidden
+                        && matches!(
+                            p.blocks[unit.block].extra,
+                            BlockExtra::Property { .. }
+                        ))
             })
             .collect();
         let last_visible = gone.iter().rposition(|g| !g);
@@ -9458,7 +10434,8 @@ impl Workspace {
                     .child(self.render_drop_edge(ui, n, cx))
                     .child(self.render_block_handle(ui, group, list_item.is_some(), cx))
                     .children(self.render_handle_menu(ui, list_item.is_some(), cx))
-                    .children(self.selection_bubble_for_unit(unit.block, list_item, cx))
+                    .children(self.selection_bubble_for_unit(unit.block, list_item, ui, cx))
+                    .children(self.link_hover_card_for_unit(unit.block, list_item, ui, cx))
                     .into_any_element(),
             );
         }
@@ -9474,6 +10451,10 @@ impl Workspace {
         }
         let seen = std::mem::take(&mut self.code_scroll_seen);
         self.code_scroll.retain(|k, _| seen.contains(k));
+        // Notion-database frontmatter header sits above the body rows.
+        if let Some(header) = self.render_fm_header(cx) {
+            kids.insert(0, header);
+        }
         kids
     }
 
@@ -9768,6 +10749,8 @@ impl Workspace {
             false,
             None,
             false,
+            1.0,
+            None,
             cx,
         );
         h_flex()
@@ -9819,6 +10802,7 @@ impl Workspace {
         &self,
         block_ix: usize,
         item: Option<usize>,
+        ui: usize,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if item.is_some() {
@@ -9838,7 +10822,7 @@ impl Workspace {
                 return None;
             }
         }
-        self.selection_bubble_for_block(block_ix, cx)
+        self.selection_bubble_for_block(block_ix, ui, cx)
     }
 
     fn drop_gap_is_live(from: usize, gap: usize, n: usize) -> bool {
@@ -10066,12 +11050,52 @@ impl Workspace {
     }
 
     fn commit_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self.link_draft.as_str().to_string();
-        self.link_open = false;
-        self.link_draft.clear();
-        let sel = self.sel.clone().unwrap_or(self.caret..self.caret);
+        let url = self.link_draft.as_str().trim().to_string();
+        let new_label = self.link_label_draft.as_str().to_string();
+        // Resolve the target before closing: selection wins, otherwise the
+        // linked run under the caret (so caret-on-link edits keep working).
+        let mut target = self.selected_link_range();
+        let current = self.link_target_text();
+        let existing_url = self.selected_link_url().unwrap_or_default();
+        let label_changed = !new_label.is_empty() && new_label != current;
+        self.cancel_link();
+        if !label_changed && url == existing_url {
+            cx.notify();
+            return;
+        }
+        // Fresh caret with no link and no selection: insert the label first
+        // so there is something to link.
+        if target.is_none() && label_changed {
+            self.push_doc_undo();
+            let at = self.caret;
+            self.caret = self
+                .doc
+                .insert_text(at, None, &new_label, self.sticky);
+            target = Some(at..at + new_label.len());
+            self.sync_gfm();
+            self.sel = None;
+            self.mark_dirty();
+            self.refresh(window, cx);
+            self.sync_title(window);
+            // Fall through to link the freshly inserted label below; the
+            // extra undo push there gives: 1st undo = unlink, 2nd = remove text.
+        }
+        let Some(range) = target else {
+            // URL-only with nowhere to attach (empty caret, no link): nothing
+            // to do — keep the popover closed without touching the doc.
+            self.refresh(window, cx);
+            return;
+        };
         self.push_doc_undo();
-        self.caret = self.doc.apply_link(sel, &url);
+        let mut range = range;
+        if label_changed {
+            let a = range.start.min(range.end);
+            let b = range.end.max(range.start);
+            let at = self.doc.delete_display(a..b);
+            self.caret = self.doc.insert_text(at, None, &new_label, self.sticky);
+            range = at..at + new_label.len();
+        }
+        self.caret = self.doc.apply_link(range, &url);
         self.sync_gfm();
         self.caret = self.caret.min(self.proj().display.len());
         self.sel = None;
@@ -10080,50 +11104,71 @@ impl Workspace {
         self.sync_title(window);
     }
 
+    /// Push a toast notice; it auto-expires after [`Toasts::TTL`].
+    pub(crate) fn show_toast(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<String>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts.push(kind, message);
+        cx.notify();
+        let view = cx.entity();
+        crate::toast::spawn_expiry(view, cx, |this| this.toasts.prune());
+    }
+
     fn open_link_url(&mut self, raw: &str, window: &mut Window, cx: &mut Context<Self>) {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             eprintln!("crabmd: open_link_url: empty url");
             return;
         }
-        // Crosslinks: `other.md`, `./other.md`, `sub/dir.md#anchor` open
-        // in-place (same window). Anchors jump to the first matching heading.
+        // Local markdown: new tab (or focus existing). `#anchor` jumps in-file.
         if let Some((target, anchor)) = Self::split_local_md(trimmed) {
             if target.is_empty() {
-                // `#anchor` in the same file: jump to the matching heading.
-                if let Some(a) = anchor.as_deref().filter(|a| !a.is_empty()) {
-                    let slug = a.to_ascii_lowercase().replace(['-', '_'], " ");
-                    let p = self.proj();
-                    for b in &p.blocks {
-                        if matches!(b.kind, BlockKind::Heading(_)) {
-                            if let Some(text) = p.display.get(b.display.clone()) {
-                                if text.to_ascii_lowercase().contains(&slug) {
-                                    self.caret = b.display.start;
-                                    self.sel = None;
-                                    self.refresh(window, cx);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
+                self.jump_same_file_anchor(anchor.as_deref(), window, cx);
                 return;
             }
             let base = self
                 .path
                 .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let candidate = if std::path::Path::new(&target).is_absolute() {
-                std::path::PathBuf::from(&target)
-            } else {
-                base.join(&target)
-            };
-            if self.open_local_file(&candidate, anchor.as_deref()) {
-                self.refresh(window, cx);
-                self.sync_title(window);
+                .unwrap_or_else(|| PathBuf::from("."));
+            let candidate = crate::tabs::resolve_local_path(&base, &target);
+            if self.same_path(&candidate) {
+                self.jump_same_file_anchor(anchor.as_deref(), window, cx);
                 return;
             }
+            // Missing target: toast, no navigation — never open a "new
+            // empty buffer" for a link that points nowhere.
+            if !candidate.is_file() {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("File not found: {target}"),
+                    window,
+                    cx,
+                );
+                return;
+            }
+            let source = std::fs::read_to_string(&candidate).unwrap_or_default();
+            let from = self.jump_loc();
+            if let Some(shell) = crate::tabs::shell_for_window(window, cx) {
+                // Deferred: we run inside this Workspace's own update, and
+                // the shell reads Workspace entities — touching it now
+                // panics (`cannot read Workspace while already updated`).
+                window.defer(cx, move |window, cx| {
+                    shell.update(cx, |s, cx| {
+                        s.open_markdown_link(from, candidate, source, anchor, window, cx);
+                    });
+                });
+                return;
+            }
+            if self.open_local_file(&candidate, anchor.as_deref(), window, cx) {
+                self.refresh(window, cx);
+                self.sync_title(window);
+            }
+            return;
         }
         let url = if trimmed.starts_with("http://")
             || trimmed.starts_with("https://")
@@ -10136,46 +11181,100 @@ impl Workspace {
         open_in_browser(&url);
     }
 
-    /// Split a link target into `(file, anchor)` when it points at a local
-    /// markdown file. Returns None for URLs / mailto / bare domains.
-    fn split_local_md(raw: &str) -> Option<(String, Option<String>)> {
-        let t = raw.trim();
-        if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("mailto:") {
-            return None;
+    fn jump_loc(&self) -> crate::tabs::JumpLoc {
+        crate::tabs::JumpLoc {
+            path: self.path.clone(),
+            caret: self.caret,
         }
-        // Strip `<...>` autolink brackets pulldown sometimes keeps.
-        let t = t.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(t);
-        if t.is_empty() || t.contains(' ') || t.contains('\n') {
-            return None;
-        }
-        let (file, anchor) = match t.split_once('#') {
-            Some((f, a)) => (f, Some(a.to_string())),
-            None => (t, None),
+    }
+
+    fn same_path(&self, other: &Path) -> bool {
+        crate::tabs::paths_equal(&self.path, other)
+    }
+
+    fn jump_same_file_anchor(
+        &mut self,
+        anchor: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(a) = anchor.filter(|a| !a.is_empty()) else {
+            return;
         };
-        if file.is_empty() {
-            // `#anchor` within the same file — handled as a heading jump by
-            // the caller; not a crosslink open. Report as local with empty
-            // file so callers can distinguish.
-            return Some((String::new(), anchor));
+        let from = self.jump_loc();
+        let Some(d) = self.proj().heading_at_slug(a) else {
+            self.show_toast(
+                ToastKind::Error,
+                format!("No heading: #{a}"),
+                window,
+                cx,
+            );
+            return;
+        };
+        self.caret = d;
+        self.sel = None;
+        self.follow_caret = true;
+        let to = self.jump_loc();
+        if let Some(shell) = crate::tabs::shell_for_window(window, cx) {
+            shell.update(cx, |s, _| s.record_jump(from, to));
         }
-        let lower = file.to_ascii_lowercase();
-        if !(lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown")) {
-            return None;
-        }
-        Some((file.to_string(), anchor))
+        self.refresh(window, cx);
+    }
+
+    fn follow_link_at_caret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = {
+            let p = self.proj();
+            p.link_at(self.caret)
+                .or_else(|| {
+                    self.caret
+                        .checked_sub(1)
+                        .and_then(|d| p.link_at(d))
+                })
+                .map(|(_, u)| u.to_string())
+                .or_else(|| self.selected_link_url())
+        };
+        let Some(url) = url else {
+            self.status = "no link under caret".into();
+            cx.notify();
+            return;
+        };
+        self.open_link_url(&url, window, cx);
+    }
+
+    /// Split a link target into `(file, anchor)` — shared helper in `tabs`
+    /// so link opens and tab restores agree on what counts as local.
+    fn split_local_md(raw: &str) -> Option<(String, Option<String>)> {
+        crate::tabs::split_link_target(raw)
     }
 
     /// Swap the buffer for a sibling markdown file (crosslink navigation).
-    /// Returns false when the file can't be read (caller falls back to a
-    /// browser open). Refuses when dirty to avoid losing edits.
-    fn open_local_file(&mut self, candidate: &std::path::Path, anchor: Option<&str>) -> bool {
+    /// Missing files toast (no navigation). Refuses when dirty to avoid
+    /// losing edits.
+    fn open_local_file(
+        &mut self,
+        candidate: &std::path::Path,
+        anchor: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.dirty {
             self.status = "unsaved changes — save first (cmd-s)".into();
             return true;
         }
-        let resolved = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+        let resolved = crate::tabs::canonical_or_normalized(candidate);
         let Ok(raw) = std::fs::read_to_string(&resolved) else {
-            self.status = format!("missing file: {}", candidate.display()).into();
+            self.show_toast(
+                ToastKind::Error,
+                format!(
+                    "File not found: {}",
+                    candidate
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&candidate.display().to_string())
+                ),
+                window,
+                cx,
+            );
             return true;
         };
         let doc = crate::tree::Doc::from_gfm(&raw);
@@ -10192,22 +11291,13 @@ impl Workspace {
         self.command = None;
         self.search = None;
         self.media_sel = None;
-        self.link_open = false;
+        self.cancel_link();
+        self.fm_collapsed = false;
         self.undo = UndoStack::default();
         self.insert_origin = None;
         if let Some(a) = anchor.filter(|a| !a.is_empty()) {
-            // Jump to the first heading containing the anchor slug.
-            let slug = a.to_ascii_lowercase().replace(['-', '_'], " ");
-            let p = self.proj();
-            for b in &p.blocks {
-                if matches!(b.kind, BlockKind::Heading(_)) {
-                    if let Some(text) = p.display.get(b.display.clone()) {
-                        if text.to_ascii_lowercase().contains(&slug) {
-                            self.caret = b.display.start;
-                            break;
-                        }
-                    }
-                }
+            if let Some(d) = self.proj().heading_at_slug(a) {
+                self.caret = d;
             }
         }
         self.status = "ready".into();
@@ -10290,7 +11380,7 @@ impl Workspace {
     }
 
     fn remove_link_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.link_draft.clear();
+        self.cancel_link();
         let p = self.proj();
         let sel = if let Some(s) = self.sel.clone().filter(|s| s.start != s.end) {
             s
@@ -10643,6 +11733,7 @@ impl EntityInputHandler for Workspace {
             || self.settings_open
             || self.cmd_palette.is_some()
             || self.view_source
+            || self.link_open
         {
             return;
         }
@@ -11311,6 +12402,10 @@ impl Render for Workspace {
             .when(palette_open, |el| {
                 el.child(deferred(self.render_palette(cx)).with_priority(100))
             })
+            // Toasts float above everything (priority 200).
+            .when(!self.toasts.is_empty(), |el| {
+                el.child(deferred(self.toasts.render(&p)).with_priority(200))
+            })
     }
 }
 
@@ -11435,5 +12530,19 @@ mod tests {
         s.insert_char('Y');
         assert_eq!(s.as_str(), "YaXbc");
         assert!(!s.caret_key("up", plain));
+    }
+
+    #[test]
+    fn split_local_md_detects_files_and_anchors() {
+        assert_eq!(
+            Workspace::split_local_md("notes.md#hello"),
+            Some(("notes.md".into(), Some("hello".into())))
+        );
+        assert_eq!(
+            Workspace::split_local_md("#hello"),
+            Some((String::new(), Some("hello".into())))
+        );
+        assert_eq!(Workspace::split_local_md("https://x.com"), None);
+        assert_eq!(Workspace::split_local_md("foo.txt"), None);
     }
 }

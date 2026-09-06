@@ -66,6 +66,27 @@ impl PaletteState {
 pub struct LineField {
     text: String,
     caret: usize,
+    /// Text-level undo (cmd/ctrl-z while editing). Capped so long
+    /// editing sessions stay cheap.
+    undo_stack: Vec<(String, usize)>,
+}
+
+/// Floor `ix` to a char boundary (walks down at most a few bytes).
+fn floor_char_boundary(text: &str, ix: usize) -> usize {
+    let mut c = ix.min(text.len());
+    while !text.is_char_boundary(c) && c > 0 {
+        c -= 1;
+    }
+    c
+}
+
+/// Ceil `ix` to a char boundary (walks up).
+fn ceil_char_boundary(text: &str, ix: usize) -> usize {
+    let mut c = ix.min(text.len());
+    while !text.is_char_boundary(c) && c < text.len() {
+        c += 1;
+    }
+    c
 }
 
 impl LineField {
@@ -81,28 +102,56 @@ impl LineField {
         self.text.is_empty()
     }
 
+    /// Byte offset of the caret (char-boundary clamped on read).
+    pub fn caret(&self) -> usize {
+        floor_char_boundary(&self.text, self.caret)
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.caret = 0;
+        self.undo_stack.clear();
+    }
+
+    /// Move the caret to a byte offset (char-boundary clamped).
+    pub fn set_caret(&mut self, byte: usize) {
+        self.caret = byte.min(self.text.len());
+        self.clamp_caret();
+    }
+
+    /// Snapshot before a text mutation for `undo`. Capped at 64 entries.
+    fn push_history(&mut self) {
+        if self.undo_stack.len() >= 64 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push((self.text.clone(), self.caret));
+    }
+
+    /// Restore the previous text state. False when history is empty.
+    pub fn undo(&mut self) -> bool {
+        let Some((text, caret)) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.text = text;
+        self.caret = caret;
+        self.clamp_caret();
+        true
     }
 
     fn clamp_caret(&mut self) {
-        if self.caret > self.text.len() {
-            self.caret = self.text.len();
-        }
-        while !self.text.is_char_boundary(self.caret) && self.caret > 0 {
-            self.caret -= 1;
-        }
+        self.caret = floor_char_boundary(&self.text, self.caret);
     }
 
     pub fn insert_char(&mut self, ch: char) {
         self.clamp_caret();
+        self.push_history();
         self.text.insert(self.caret, ch);
         self.caret += ch.len_utf8();
     }
 
     pub fn insert_str(&mut self, s: &str) {
         self.clamp_caret();
+        self.push_history();
         self.text.insert_str(self.caret, s);
         self.caret += s.len();
     }
@@ -114,6 +163,7 @@ impl LineField {
         if self.caret == 0 {
             return false;
         }
+        self.push_history();
         let prev = self.text[..self.caret]
             .char_indices()
             .next_back()
@@ -146,6 +196,7 @@ impl LineField {
         if start == self.caret {
             return false;
         }
+        self.push_history();
         self.text.drain(start..self.caret);
         self.caret = start;
         true
@@ -158,6 +209,7 @@ impl LineField {
         if self.caret == 0 {
             return false;
         }
+        self.push_history();
         self.text.drain(..self.caret);
         self.caret = 0;
         true
@@ -193,10 +245,7 @@ impl LineField {
         while ix > 0 && bytes[ix - 1] != b' ' {
             ix -= 1;
         }
-        while !self.text.is_char_boundary(ix) && ix > 0 {
-            ix -= 1;
-        }
-        ix
+        floor_char_boundary(&self.text, ix)
     }
 
     fn word_right_from(&self, mut ix: usize) -> usize {
@@ -208,10 +257,7 @@ impl LineField {
         while ix < len && bytes[ix] != b' ' {
             ix += 1;
         }
-        while !self.text.is_char_boundary(ix) && ix < len {
-            ix += 1;
-        }
-        ix
+        ceil_char_boundary(&self.text, ix)
     }
 
     pub fn move_word_left(&mut self) {
@@ -297,11 +343,22 @@ impl LineField {
 
     /// Render with a visible caret (`▌`) at the caret, not the end.
     pub fn render(&self) -> String {
-        let mut caret = self.caret.min(self.text.len());
-        while !self.text.is_char_boundary(caret) && caret > 0 {
-            caret -= 1;
-        }
-        format!("{}▌{}", &self.text[..caret], &self.text[caret..])
+        self.render_with('▌')
+    }
+
+    /// Thin caret (`│`) for compact popovers like the link editor.
+    pub fn render_thin(&self) -> String {
+        self.render_with('│')
+    }
+
+    fn render_with(&self, caret_glyph: char) -> String {
+        let caret = floor_char_boundary(&self.text, self.caret);
+        format!(
+            "{}{}{}",
+            &self.text[..caret],
+            caret_glyph,
+            &self.text[caret..]
+        )
     }
 }
 

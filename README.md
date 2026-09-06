@@ -102,6 +102,9 @@ visual lines when **Wrap lines** is on (default). Counts work: `5h`, `2k`,
 | `u` | undo (document-level) |
 | `escape` | normal; in visual, collapse the selection to the caret |
 | `:` | command-line (`w` / `q` / `wq` / `qa` / `bn` / `bp`). Escape or empty Enter cancels |
+| `gd` | follow the link under the caret (Helix/Vim goto-definition). Double-click or ⌘/Ctrl-click also works |
+| `ctrl-o` / `ctrl-i` | jump list backward / forward (after following a link) |
+| `ctrl--` / `ctrl-_` | same jump list (Notion/Zed-style; works in every editor) |
 
 ### Helix
 
@@ -115,6 +118,8 @@ Status `NOR` / `SEL` / `INS`.
 | `U` | redo |
 | `ge` | end of document (`goto_last_line`, **not** vim `ge`) |
 | `G` | count → that line; no count → last line |
+| `gd` | follow link under caret |
+| `ctrl-o` / `ctrl-i` | jump list back / forward |
 | `gh` / `gl` / `gs` | line start / end / first non-blank |
 
 Delete-block is gone from `x`. `d` on a selection that covers the whole block source removes the block and keeps a trailing empty paragraph.
@@ -131,6 +136,8 @@ Status `NOR` / `VIS` / `V-LINE` / `INS`.
 | `D` | delete to end of line |
 | `ctrl-r` | redo |
 | `G` | last line of the document; `5G` → line 5 |
+| `gd` | follow link under caret |
+| `ctrl-o` / `ctrl-i` | jump list back / forward |
 
 ### Notion
 
@@ -153,6 +160,11 @@ Click a block to select it and place the caret (end of that block, or the
 native textarea position if you click the focused raw source). Click does
 **not** force Insert; `i` / `a` / `I` / `A` (or double-click intent) enter
 insert. Click in normal stays normal with the caret there.
+
+Click a link to select it and edit the URL (Esc cancels). Double-click or
+⌘/Ctrl-click follows it. Local `.md` files (including ones that do not exist
+yet) open in a new tab. `ctrl--` goes back, `ctrl-_` (ctrl-shift-minus) goes
+forward.
 
 Backspace in Insert (and Notion) joins like one nvim/hx buffer. At document
 column 0, if the previous characters are a block separator (two newlines), both

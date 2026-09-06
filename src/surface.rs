@@ -4,10 +4,11 @@ use std::ops::Range;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, fill, px, size, App, Bounds, Corners, Element, ElementId, Entity, EntityInputHandler,
-    FocusHandle, GlobalElementId, HighlightStyle, Hsla, InspectorElementId,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Pixels, Point, Styled, StyledText, TextLayout, Window,
+    deferred, div, fill, point, px, size, App, AvailableSpace, Bounds, Corners, CursorStyle,
+    Element, ElementId, Entity, EntityInputHandler, FocusHandle, GlobalElementId, HighlightStyle,
+    Hsla, InspectorElementId, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement as _, Pixels, Point, StatefulInteractiveElement as _,
+    Styled, StyledText, TextLayout, Window, AnyElement,
 };
 
 use crate::display::{Marks, Projection};
@@ -20,6 +21,270 @@ pub struct Hit {
     /// when `layout` contains a line-height probe character.
     pub doc_len: usize,
     pub layout: TextLayout,
+}
+
+/// Follow-mouse hover hint for links: a `⌘-click to open` chip painted at
+/// the live cursor position. Native tooltips anchor where they appear
+/// (GPUI stores `mouse_position` at show time), so a custom overlay does
+/// it instead — same pattern as `prepaint_tooltip`: the chip is laid out
+/// as root and prepainted at `mouse + offset` every frame. Follow frames
+/// are driven by `on_mouse_move → window.refresh()` on the link words
+/// (hover-gated, so motion elsewhere costs nothing); hiding is free via
+/// the cursor's hover-exit `notify`. Hit-testing is panic-guarded like
+/// everything else touching `TextLayout`.
+pub struct LinkHintLayer {
+    hits: Vec<Hit>,
+    /// Display-absolute link ranges (block start already added).
+    links: Vec<Range<usize>>,
+    chip: gpui::AnyElement,
+}
+
+/// Show delay before the link hint appears. Hiding is instant (no
+/// delay) — the next frame after hover-exit comes back empty.
+const LINK_HINT_SHOW_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+
+// Hover-edge timing for the hint. The layer is rebuilt every frame so it
+// can't remember when a hover started — thread-local does. UI thread only.
+thread_local! {
+    static LINK_HOVER_START: std::cell::RefCell<Option<std::time::Instant>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Cursor-adjacent placement with viewport flip (GPUI tooltip style).
+/// Shared by the follow-mouse link hint and any future cursor chip.
+pub fn chip_origin_near_cursor(
+    mouse: Point<Pixels>,
+    size: gpui::Size<Pixels>,
+    viewport: gpui::Size<Pixels>,
+) -> Point<Pixels> {
+    let mut origin = mouse + point(px(14.), px(18.));
+    if origin.x + size.width > viewport.width {
+        origin.x = (mouse.x - size.width - px(8.)).max(px(0.));
+    }
+    if origin.y + size.height > viewport.height {
+        origin.y = (mouse.y - size.height - px(8.)).max(px(0.));
+    }
+    origin
+}
+
+/// Pick the popover side. `prefer_below` = Notion-style cards (hover
+/// card, link form); the formatting bubble prefers above. The winning
+/// side only needs to fit `pop_h`; otherwise the roomier side wins so
+/// clipping is minimal. Height is used ONLY for this flip decision —
+/// never for positioning (see [`popover_anchor`]).
+pub fn popover_pick_above(
+    prefer_below: bool,
+    room_above: f32,
+    room_below: f32,
+    pop_h: f32,
+) -> bool {
+    if prefer_below {
+        if room_below >= pop_h {
+            return false;
+        }
+        room_above > room_below
+    } else if room_above >= pop_h {
+        true
+    } else {
+        room_above >= room_below
+    }
+}
+
+/// Build the anchored popover element. The anchor is a zero-size pin at
+/// the target line: above hangs the popover off it with a fixed GAP
+/// (no height estimate, so the gap is always exactly one step); below
+/// stacks it under the line the same way.
+pub fn popover_anchor(
+    above: bool,
+    left: Pixels,
+    line_rel: f32,
+    line_h: f32,
+    priority: usize,
+    content: AnyElement,
+) -> AnyElement {
+    const GAP: f32 = 8.;
+    if above {
+        deferred(
+            div().absolute().left(left).top(px(line_rel)).child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .bottom(px(GAP))
+                    .occlude()
+                    .child(content),
+            ),
+        )
+        .with_priority(priority)
+        .into_any_element()
+    } else {
+        deferred(
+            div()
+                .absolute()
+                .left(left)
+                .top(px(line_rel + line_h + GAP))
+                .occlude()
+                .child(content),
+        )
+        .with_priority(priority)
+        .into_any_element()
+    }
+}
+
+pub fn link_hint_layer(hits: Vec<Hit>, links: Vec<Range<usize>>, p: &Palette) -> gpui::AnyElement {
+    LinkHintLayer {
+        hits,
+        links,
+        chip: div()
+            .px(px(6.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .bg(p.background_panel)
+            .border_1()
+            .border_color(p.border)
+            .text_size(px(11.))
+            .text_color(p.text)
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("⌘-click"),
+            )
+            .child(" open")
+            .into_any_element(),
+    }
+    .into_any_element()
+}
+
+impl IntoElement for LinkHintLayer {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for LinkHintLayer {
+    type RequestLayoutState = ();
+    type PrepaintState = bool;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        // Absolute fill: own bounds are irrelevant (the chip paints at an
+        // explicit window-space origin), it just must not disturb flow.
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.).into();
+        style.size.height = gpui::relative(1.).into();
+        style.position = gpui::Position::Absolute;
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if self.links.is_empty() {
+            return false;
+        }
+        let mouse = window.mouse_position();
+        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.is_over_link(mouse)
+        }))
+        .unwrap_or(false);
+        if !over {
+            // Instant hide: forget the hover start so the next hover
+            // pays the full show delay again.
+            LINK_HOVER_START.with(|s| *s.borrow_mut() = None);
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = LINK_HOVER_START.with(|s| {
+            let mut s = s.borrow_mut();
+            match *s {
+                Some(t) => now.saturating_duration_since(t),
+                None => {
+                    *s = Some(now);
+                    std::time::Duration::ZERO
+                }
+            }
+        });
+        if elapsed < LINK_HINT_SHOW_DELAY {
+            // Still in the show delay: drive another frame so the hint
+            // appears even with the mouse parked (follow frames otherwise
+            // only come from `on_mouse_move → refresh`).
+            window.refresh();
+            return false;
+        }
+        let size = self
+            .chip
+            .layout_as_root(AvailableSpace::min_size(), window, cx);
+        let origin = chip_origin_near_cursor(mouse, size, window.viewport_size());
+        self.chip.prepaint_at(origin, window, cx);
+        true
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        visible: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Gated: `chip.paint` reuses prepaint bounds, so painting a
+        // non-prepainted (hidden) frame would draw a one-frame-stale ghost.
+        if *visible {
+            self.chip.paint(window, cx);
+        }
+    }
+}
+
+impl LinkHintLayer {
+    /// True when `mouse` lands on a link range. Every layout call is
+    /// individually guarded; unmeasured layouts are skipped.
+    fn is_over_link(&self, mouse: Point<Pixels>) -> bool {
+        for hit in &self.hits {
+            let inside =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hit.layout.bounds().contains(&mouse)
+                }))
+                .unwrap_or(false);
+            if !inside {
+                continue;
+            }
+            let ix = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hit.layout.index_for_position(mouse).unwrap_or_else(|e| e)
+            }));
+            let Ok(ix) = ix else {
+                continue;
+            };
+            let d = hit.display_start + ix.min(hit.doc_len);
+            if self.links.iter().any(|r| d >= r.start && d < r.end) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub fn highlights(
@@ -781,8 +1046,10 @@ fn edit_segmented<V: EntityInputHandler>(
     code_ranges: Vec<Range<usize>>,
     pill_color: Hsla,
     color: Hsla,
+    link_ranges: Vec<Range<usize>>,
     on_click: impl Fn(usize, bool, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_hover_link: impl Fn(Range<usize>, bool, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     // Merged code runs (text order) — one pill span each.
     let mut sorted = code_ranges;
@@ -799,6 +1066,7 @@ fn edit_segmented<V: EntityInputHandler>(
     }
     let on_click = std::rc::Rc::new(on_click);
     let on_drag = std::rc::Rc::new(on_drag);
+    let on_hover_link = std::rc::Rc::new(on_hover_link);
     let mut flow: Vec<gpui::AnyElement> = Vec::new();
     let mut run_frags: Vec<Vec<TextLayout>> = runs.iter().map(|_| Vec::new()).collect();
     let mut ri = 0usize;
@@ -868,16 +1136,56 @@ fn edit_segmented<V: EntityInputHandler>(
                     body_px.unwrap_or(code_px)
                 };
                 let fam = if is_code { code_family.clone() } else { None };
-                flow.push(
-                    div()
-                        .text_size(sz)
-                        .when_some(fam, |el, f| el.font_family(f))
-                        .whitespace_nowrap()
-                        .when(need_ml, |el| el.ml(px(3.)))
-                        .when(need_mr, |el| el.mr(px(3.)))
-                        .child(styled)
-                        .into_any_element(),
-                );
+                // Pointing-hand cursor on link words via the blessed GPUI
+                // `.cursor()` mechanism: the word div gets its own hitbox
+                // (`should_insert_hitbox` fires on `mouse_cursor`) and GPUI
+                // resolves the cursor against that same hitbox — no overlay.
+                // `on_mouse_move → refresh` drives `LinkHintLayer` follow
+                // frames (hover-gated: motion elsewhere costs nothing).
+                // The cursor itself gives hover-exit `notify`, which hides
+                // the hint — no extra state.
+                let is_link = link_ranges
+                    .iter()
+                    .any(|lr| r.start < lr.end && r.end > lr.start);
+                // NOTE: plain `Div` has no cursor/hover — link words get an
+                // id (stateful). Branched (no `.when`) because `.id()`
+                // changes the type from `Div` to `Stateful<Div>`.
+                if is_link {
+                    // Absolute link range for the hover card (re-resolved in
+                    // the editor, so stale renders can't pin a dead card).
+                    let abs_link = link_ranges
+                        .iter()
+                        .find(|lr| r.start < lr.end && r.end > lr.start)
+                        .map(|lr| display_start + lr.start..display_start + lr.end)
+                        .unwrap_or(display_start + r.start..display_start + r.end);
+                    let hover_cb = on_hover_link.clone();
+                    flow.push(
+                        div()
+                            .id(("link-word", display_start + r.start))
+                            .text_size(sz)
+                            .when_some(fam, |el, f| el.font_family(f))
+                            .whitespace_nowrap()
+                            .when(need_ml, |el| el.ml(px(3.)))
+                            .when(need_mr, |el| el.mr(px(3.)))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_hover(move |hovering: &bool, window, cx| {
+                                hover_cb(abs_link.clone(), *hovering, window, cx);
+                            })
+                            .child(styled)
+                            .into_any_element(),
+                    );
+                } else {
+                    flow.push(
+                        div()
+                            .text_size(sz)
+                            .when_some(fam, |el, f| el.font_family(f))
+                            .whitespace_nowrap()
+                            .when(need_ml, |el| el.ml(px(3.)))
+                            .when(need_mr, |el| el.mr(px(3.)))
+                            .child(styled)
+                            .into_any_element(),
+                    );
+                }
             }
         }
     }
@@ -958,6 +1266,7 @@ fn edit_segmented<V: EntityInputHandler>(
     root.into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn edit_text<V: EntityInputHandler>(
     view: Entity<V>,
     focus: FocusHandle,
@@ -977,8 +1286,10 @@ pub fn edit_text<V: EntityInputHandler>(
     heading: bool,
     code_font: Option<(gpui::SharedString, Vec<Range<usize>>)>,
     code_px: Option<gpui::Pixels>,
+    link_ranges: Vec<Range<usize>>,
     on_click: impl Fn(usize, bool, bool, usize, &mut Window, &mut App) + 'static,
     on_drag: impl Fn(usize, &mut Window, &mut App) + 'static,
+    on_hover_link: impl Fn(Range<usize>, bool, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     let text = text.into();
     let empty = text.is_empty();
@@ -1074,7 +1385,10 @@ pub fn edit_text<V: EntityInputHandler>(
         .background_element
         .blend(p.markdown_text.opacity(wash_opacity));
     // Segmented (mixed-size) path: inline code at 85% needs word-sized flow
-    // items — one uniform layout cannot carry two sizes.
+    // items — one uniform layout cannot carry two sizes. Link-bearing
+    // blocks also go segmented so every link word gets its own hitbox with
+    // a pointing-hand cursor (single-layout blocks have no per-range
+    // cursor mechanism).
     if !empty {
         if let Some(cpx) = code_px {
             if !code_ranges.is_empty() {
@@ -1099,10 +1413,41 @@ pub fn edit_text<V: EntityInputHandler>(
                     code_ranges,
                     pill_color,
                     color,
+                    link_ranges,
                     on_click,
                     on_drag,
+                    on_hover_link,
                 );
             }
+        }
+        if !link_ranges.is_empty() {
+            // No pills on this path — `code_px` only backs `body_px=None`,
+            // which never happens (callers always pass a body size).
+            return edit_segmented(
+                view,
+                focus,
+                hits,
+                display_start,
+                shown.clone(),
+                hs,
+                caret_local,
+                block_caret,
+                inverted,
+                ime,
+                p,
+                font_family,
+                font_px,
+                None,
+                font_px.unwrap_or(px(14.)),
+                heading,
+                Vec::new(),
+                pill_color,
+                color,
+                link_ranges,
+                on_click,
+                on_drag,
+                on_hover_link,
+            );
         }
     }
     let mut styled = StyledText::new(shown.clone()).with_highlights(hs);
@@ -1157,6 +1502,8 @@ pub fn edit_text<V: EntityInputHandler>(
             focus,
             ime,
         })
+        // NOTE: link-bearing blocks render on the segmented path (see the
+        // routing above), where link words carry `.cursor(PointingHand)`.
         .on_mouse_down(MouseButton::Left, {
             let layout = layout.clone();
             move |ev: &MouseDownEvent, window, cx| {
@@ -1191,6 +1538,50 @@ pub fn edit_text<V: EntityInputHandler>(
                 on_drag(display_start + idx, window, cx);
             }
         })
+        .into_any_element()
+}
+
+/// Compact single-line field with a real overlay caret — for chrome outside
+/// the display string (property keys) where `edit_text` can't go (it pushes
+/// a `Hit` that would corrupt display-space hit-testing).
+///
+/// Same 2px `primary` bar caret as body text in insert mode: painted as an
+/// overlay quad, so the text never shifts when the caret moves — unlike a
+/// `│`/`▌` text glyph, which takes up space and paints in the text color.
+/// Always a bar (never block): rename is line editing, not modal navigation.
+pub fn field_text<V: EntityInputHandler>(
+    view: Entity<V>,
+    focus: FocusHandle,
+    id: impl Into<ElementId>,
+    text: gpui::SharedString,
+    caret_byte: usize,
+    caret_color: Hsla,
+    on_click_caret: impl Fn(usize, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    let styled = StyledText::new(text);
+    let layout = styled.layout().clone();
+    let click_layout = layout.clone();
+    div()
+        .id(id)
+        .relative()
+        .child(styled)
+        .child(CaretLayer {
+            layout,
+            local_caret: Some(caret_byte),
+            block: false,
+            skip_block: false,
+            color: caret_color,
+            view,
+            focus,
+            ime: false,
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            move |ev: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                on_click_caret(index_for_click(&click_layout, ev.position), window, cx);
+            },
+        )
         .into_any_element()
 }
 

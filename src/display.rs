@@ -168,6 +168,9 @@ pub enum BlockExtra {
     Details { summary: String, open: bool },
     /// `</details>` close tag: renders as zero-height chrome.
     DetailsClose,
+    /// Frontmatter property row. The full `key: value` line is the display
+    /// (navigable text, rendered small); the editor mutes the key prefix.
+    Property,
 }
 
 impl BlockExtra {
@@ -191,6 +194,13 @@ pub struct Projection {
     pub blocks: Vec<ProjBlock>,
     pub links: Vec<String>,
     pub source_len: usize,
+}
+
+/// Normalize a `#anchor` slug and heading text the same way:
+/// lowercase, dashes/underscores → spaces, trimmed. Shared by
+/// [`Projection::heading_at_slug`] and link-follow jumps.
+pub fn slugify(s: &str) -> String {
+    s.to_ascii_lowercase().replace(['-', '_'], " ").trim().to_string()
 }
 
 impl Projection {
@@ -218,6 +228,26 @@ impl Projection {
                     .rev()
                     .find(|b| s >= b.source.start && s <= b.source.end)
             })
+    }
+
+    /// First heading whose visible text contains `slug` (dashes/underscores
+    /// treated as spaces, case-insensitive). Used by `#anchor` jumps.
+    pub fn heading_at_slug(&self, slug: &str) -> Option<usize> {
+        let slug = slugify(slug);
+        if slug.is_empty() {
+            return None;
+        }
+        for b in &self.blocks {
+            if !matches!(b.kind, BlockKind::Heading(_)) {
+                continue;
+            }
+            if let Some(text) = self.display.get(b.display.clone()) {
+                if slugify(text).contains(&slug) {
+                    return Some(b.display.start);
+                }
+            }
+        }
+        None
     }
 
     pub fn link_at(&self, d: usize) -> Option<(Range<usize>, &str)> {
@@ -1792,6 +1822,14 @@ mod tests {
         assert_eq!(p.display, "Hello there   #");
         let p = project("# Hello there#");
         assert_eq!(p.display, "Hello there#");
+    }
+
+    #[test]
+    fn heading_at_slug_matches_anchor() {
+        let p = project("# Hello World\n\n## Other\n");
+        assert_eq!(p.heading_at_slug("hello-world"), Some(0));
+        assert!(p.heading_at_slug("other").is_some());
+        assert!(p.heading_at_slug("missing").is_none());
     }
 
     #[test]

@@ -108,6 +108,16 @@ pub enum NodeKind {
     },
     /// `</details>` close — zero-height chrome, preserved on save.
     DetailsClose,
+    /// Frontmatter property: leading `---` YAML block, one node per key.
+    /// Stores the full `key: value` line as plain inlines, so the row is
+    /// just smaller navigable text — caret, insert mode, motions, visual
+    /// selection, undo, and search all work with no special cases.
+    /// Serializes back into the leading `---` block (see `to_gfm`); a
+    /// `Property` dragged out of the leading run falls back to a
+    /// plain `key: value` line.
+    Property {
+        inlines: Vec<Inline>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +152,25 @@ impl Doc {
     }
 
     pub fn from_gfm(src: &str) -> Self {
+        // Leading `---` YAML block becomes leading `Property` nodes (one per
+        // key), never body. Strip before the GFM projection so it doesn't
+        // render as `---` rules + a fake paragraph.
+        let (fm_props, body) = match crate::frontmatter::parse(src) {
+            Some((fm, start)) => (fm.props, &src[start..]),
+            None => (Vec::new(), src),
+        };
+        let mut prop_nodes: Vec<Node> = fm_props
+            .into_iter()
+            .map(|p| {
+                let line = crate::frontmatter::line_for_prop(&p.key, &p.value);
+                Node {
+                    id: next_id(),
+                    kind: NodeKind::Property {
+                        inlines: crate::frontmatter::plain_inlines(&line),
+                    },
+                }
+            })
+            .collect();
         if src.trim().is_empty() {
             // Match GFM projection: `""`/`"\n"` → 1 empty, `"\n\n"` → 2, `"\n\n\n"` → 3.
             let newlines = src.as_bytes().iter().filter(|&&b| b == b'\n').count();
@@ -156,15 +185,24 @@ impl Doc {
                     kind: NodeKind::Paragraph { inlines: vec![] },
                 });
             }
+            if prop_nodes.is_empty() {
+                return Self {
+                    nodes,
+                    links: Vec::new(),
+                };
+            }
+            // FM-only doc: properties are the document (an empty value row
+            // already carries a caret home — no filler paragraphs).
             return Self {
-                nodes,
+                nodes: prop_nodes,
                 links: Vec::new(),
             };
         }
-        let p = project_gfm(src);
-        let mut nodes = Vec::with_capacity(p.blocks.len());
+        let p = project_gfm(body);
+        let mut nodes = Vec::with_capacity(prop_nodes.len() + p.blocks.len());
+        nodes.append(&mut prop_nodes);
         for b in &p.blocks {
-            nodes.push(node_from_proj(&p, b, src));
+            nodes.push(node_from_proj(&p, b, body));
         }
         if nodes.is_empty() {
             return Self::empty();
@@ -180,11 +218,38 @@ impl Doc {
     }
 
     pub fn to_gfm(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for n in &self.nodes {
-            parts.push(node_to_gfm(n, &self.links));
+        // Leading run of `Property` nodes serializes as the `---` YAML block;
+        // the rest is body. A `Property` outside the leading run falls back
+        // to a plain `key: value` line (see `node_to_gfm`).
+        let lead = self
+            .nodes
+            .iter()
+            .take_while(|n| matches!(n.kind, NodeKind::Property { .. }))
+            .count();
+        if lead == 0 {
+            let parts: Vec<String> =
+                self.nodes.iter().map(|n| node_to_gfm(n, &self.links)).collect();
+            return join_gfm(&self.nodes, &parts);
         }
-        join_gfm(&self.nodes, &parts)
+        let rows: Vec<String> = self.nodes[..lead]
+            .iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Property { inlines } => Some(inlines_text(inlines)),
+                _ => None,
+            })
+            .collect();
+        let out = crate::frontmatter::serialize_block(&rows);
+        if lead >= self.nodes.len() {
+            return out;
+        }
+        let rest = &self.nodes[lead..];
+        let parts: Vec<String> = rest.iter().map(|n| node_to_gfm(n, &self.links)).collect();
+        let body = join_gfm(rest, &parts);
+        if body.trim().is_empty() {
+            out
+        } else {
+            format!("{out}\n{}", body.trim_start_matches('\n'))
+        }
     }
 
     pub fn gfm_range(&self, range: Range<usize>) -> String {
@@ -315,7 +380,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => {
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => {
                 let len = inlines_len(inlines);
                 let full = start.offset == 0 && end.offset >= len;
                 let sliced = slice_inlines(inlines, start.offset, end.offset);
@@ -514,7 +580,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => *inlines = left,
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => *inlines = left,
             _ => return,
         }
         self.nodes.insert(
@@ -571,7 +638,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines,
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines,
             _ => return,
         };
         match &mut self.nodes[keep].kind {
@@ -580,7 +648,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines.extend(right),
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines.extend(right),
             NodeKind::List { items, .. } => {
                 if let Some(last) = items.last_mut() {
                     last.inlines.extend(right);
@@ -603,7 +672,8 @@ impl Doc {
             | Some(NodeKind::HtmlHeading { inlines, .. })
             | Some(NodeKind::Details { inlines, .. })
             | Some(NodeKind::Quote { inlines })
-            | Some(NodeKind::Alert { inlines, .. }) => inlines_len(inlines),
+            | Some(NodeKind::Alert { inlines, .. })
+            | Some(NodeKind::Property { inlines }) => inlines_len(inlines),
             _ => 0,
         }
     }
@@ -1269,7 +1339,9 @@ impl Doc {
                     return self.caret_after(loc.node + 1, None, None, 0);
                 }
             }
-            NodeKind::Paragraph { inlines } => *inlines = left,
+            NodeKind::Paragraph { inlines } | NodeKind::Property { inlines } => {
+                *inlines = left
+            }
             _ => {}
         }
         // Convert heading/quote at end-enter into a following paragraph.
@@ -1292,11 +1364,18 @@ impl Doc {
                 return self.caret_after(ni, None, None, 0);
             }
         }
+        // A split property stays a property on both halves so the leading
+        // run (and its `---` serialization) survives Enter mid-row.
+        let right_kind = if matches!(self.nodes[ni].kind, NodeKind::Property { .. }) {
+            NodeKind::Property { inlines: right }
+        } else {
+            NodeKind::Paragraph { inlines: right }
+        };
         self.nodes.insert(
             ni + 1,
             Node {
                 id: next_id(),
-                kind: NodeKind::Paragraph { inlines: right },
+                kind: right_kind,
             },
         );
         self.caret_after(ni + 1, None, None, 0)
@@ -1513,7 +1592,9 @@ impl Doc {
                 self.nodes[loc.node].kind = NodeKind::Paragraph { inlines };
                 return Some(self.caret_after(loc.node, None, None, 0));
             }
-            NodeKind::Paragraph { inlines } => {
+            // Properties are plain text rows: backspace merges/deletes like
+            // paragraphs, no unwrapping step.
+            NodeKind::Paragraph { inlines } | NodeKind::Property { inlines } => {
                 if inlines_len(inlines) == 0 {
                     if loc.node == 0 {
                         return Some(0);
@@ -2457,7 +2538,8 @@ impl Doc {
             | Some(NodeKind::HtmlHeading { inlines, .. })
             | Some(NodeKind::Details { inlines, .. })
             | Some(NodeKind::Quote { inlines })
-            | Some(NodeKind::Alert { inlines, .. }) => inlines,
+            | Some(NodeKind::Alert { inlines, .. })
+            | Some(NodeKind::Property { inlines }) => inlines,
             Some(NodeKind::List { items, .. }) => items
                 .get(loc.item.unwrap_or(0))
                 .map(|i| i.inlines.as_slice())
@@ -2486,6 +2568,7 @@ impl Doc {
                 | NodeKind::Details { .. }
                 | NodeKind::Quote { .. }
                 | NodeKind::Alert { .. }
+                | NodeKind::Property { .. }
                 | NodeKind::List { .. }
                 | NodeKind::Table { .. }
         );
@@ -2498,7 +2581,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines,
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines,
             NodeKind::List { items, .. } => {
                 let i = loc.item.unwrap_or(0).min(items.len().saturating_sub(1));
                 &mut items[i].inlines
@@ -2579,7 +2663,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines_len(inlines),
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines_len(inlines),
             _ => 0,
         }
     }
@@ -2612,7 +2697,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines.clone(),
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines.clone(),
             NodeKind::Code { text, .. } => vec![Inline {
                 text: text.clone(),
                 marks: Marks::default(),
@@ -2625,7 +2711,8 @@ impl Doc {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines.extend(right),
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines.extend(right),
             NodeKind::Code { text, .. } => text.push_str(&inlines_text(&right)),
             NodeKind::List { items, .. } => {
                 if let Some(last) = items.last_mut() {
@@ -2812,6 +2899,7 @@ fn slice_kind_keep(kind: &NodeKind, inlines: Vec<Inline>, full: bool) -> NodeKin
             kind: *kind,
             inlines,
         },
+        NodeKind::Property { .. } => NodeKind::Property { inlines },
         _ => NodeKind::Paragraph { inlines },
     }
 }
@@ -2834,7 +2922,8 @@ fn remap_node_links(node: &mut Node, dest: &mut Vec<String>, src: &[String]) {
         | NodeKind::HtmlHeading { inlines, .. }
         | NodeKind::Details { inlines, .. }
         | NodeKind::Quote { inlines }
-        | NodeKind::Alert { inlines, .. } => remap_inlines_links(inlines, dest, src),
+        | NodeKind::Alert { inlines, .. }
+        | NodeKind::Property { inlines } => remap_inlines_links(inlines, dest, src),
         NodeKind::List { items, .. } => {
             for it in items {
                 remap_inlines_links(&mut it.inlines, dest, src);
@@ -2863,7 +2952,8 @@ fn node_is_empty(n: &Node) -> bool {
         | NodeKind::HtmlHeading { inlines, .. }
         | NodeKind::Details { inlines, .. }
         | NodeKind::Quote { inlines }
-        | NodeKind::Alert { inlines, .. } => inlines_len(inlines) == 0,
+        | NodeKind::Alert { inlines, .. }
+        | NodeKind::Property { inlines } => inlines_len(inlines) == 0,
         NodeKind::List { items, .. } => {
             items.is_empty() || items.iter().all(|i| inlines_len(&i.inlines) == 0)
         }
@@ -2891,7 +2981,8 @@ fn nodes_plain_text(nodes: &[Node]) -> String {
             | NodeKind::HtmlHeading { inlines, .. }
             | NodeKind::Details { inlines, .. }
             | NodeKind::Quote { inlines }
-            | NodeKind::Alert { inlines, .. } => inlines_text(inlines),
+            | NodeKind::Alert { inlines, .. }
+            | NodeKind::Property { inlines } => inlines_text(inlines),
             NodeKind::List { items, .. } => items
                 .iter()
                 .map(|i| inlines_text(&i.inlines))
@@ -2944,7 +3035,8 @@ fn node_content_len(n: &Node) -> usize {
         | NodeKind::HtmlHeading { inlines, .. }
         | NodeKind::Details { inlines, .. }
         | NodeKind::Quote { inlines }
-        | NodeKind::Alert { inlines, .. } => inlines_len(inlines),
+        | NodeKind::Alert { inlines, .. }
+        | NodeKind::Property { inlines } => inlines_len(inlines),
         _ => 0,
     }
 }
@@ -3032,6 +3124,11 @@ fn node_from_proj(p: &Projection, b: &ProjBlock, src: &str) -> Node {
         },
         BlockExtra::DetailsClose => NodeKind::DetailsClose,
         BlockExtra::Text => NodeKind::Paragraph {
+            inlines: inlines_in(p, b.display.clone()),
+        },
+        // Unreachable from GFM source (display projections never emit it),
+        // but round-trip safe if a tree projection is ever re-imported.
+        BlockExtra::Property => NodeKind::Property {
             inlines: inlines_in(p, b.display.clone()),
         },
     };
@@ -3430,6 +3527,9 @@ fn node_to_gfm(n: &Node, links: &[String]) -> String {
         NodeKind::Rule => "---".into(),
         NodeKind::Image { alt, src } => format!("![{alt}]({src})"),
         NodeKind::Html { raw } => raw.clone(),
+        // Single (possibly dragged-out) property: the raw `key: value` line.
+        // The leading run is wrapped in `---` by `to_gfm` instead.
+        NodeKind::Property { inlines } => inlines_to_gfm(inlines, links),
         NodeKind::HtmlHeading { level, inlines } => {
             format!("<h{level}>{}</h{level}>", inlines_to_gfm(inlines, links))
         }
@@ -3597,6 +3697,10 @@ fn emit_node(
         NodeKind::Paragraph { inlines } => {
             emit_inlines(inlines, display, segments, links);
             (BlockExtra::Text, BlockKind::Paragraph)
+        }
+        NodeKind::Property { inlines } => {
+            emit_inlines(inlines, display, segments, links);
+            (BlockExtra::Property, BlockKind::Paragraph)
         }
         NodeKind::Heading { level, inlines } => {
             emit_inlines(inlines, display, segments, links);
@@ -3853,6 +3957,85 @@ fn emit_inlines_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_roundtrip() {
+        let src = "---\ntitle: Terminal Keymaps\ndescription: Line jumps\ntags:\n  - a\n  - b\n---\n\n# Body\n";
+        let doc = Doc::from_gfm(src);
+        // 3 properties + heading — no `---` rule nodes leak into the body.
+        assert_eq!(doc.nodes.len(), 4);
+        assert!(matches!(
+            &doc.nodes[0].kind,
+            NodeKind::Property { inlines } if inlines_text(inlines).starts_with("title:")
+        ));
+        let out = doc.to_gfm();
+        assert!(out.starts_with("---\ntitle: Terminal Keymaps\n"));
+        assert!(out.contains("tags: a, b"));
+        assert!(out.contains("# Body"));
+        let doc2 = Doc::from_gfm(&out);
+        let kinds = |d: &Doc| d.nodes.iter().map(|n| n.kind.clone()).collect::<Vec<_>>();
+        assert_eq!(kinds(&doc), kinds(&doc2));
+    }
+
+    #[test]
+    fn property_value_edits_like_body() {
+        let mut doc = Doc::from_gfm("---\ntitle: Hi\n---\n\nBody\n");
+        let p = doc.project();
+        assert_eq!(&p.display[..p.blocks[0].display.end], "title: Hi");
+        let at = p.blocks[0].display.end;
+        doc.insert_text(at, None, "!", Marks::default());
+        assert_eq!(doc.to_gfm(), "---\ntitle: Hi!\n---\n\nBody");
+    }
+
+    #[test]
+    fn property_key_edits_like_body() {
+        // The key is plain text in the row — editing it edits the key.
+        let mut doc = Doc::from_gfm("---\ntitle: Hi\n---\n\nBody\n");
+        let p = doc.project();
+        let at = p.blocks[0].display.start + "title".len();
+        doc.insert_text(at, None, "s", Marks::default());
+        assert_eq!(doc.to_gfm(), "---\ntitles: Hi\n---\n\nBody");
+    }
+
+    #[test]
+    fn property_enter_splits_row() {
+        // Enter mid-row splits into two property rows; the leading run
+        // (and its `---` serialization) survives.
+        let mut doc = Doc::from_gfm("---\na: 1\nb: 2\n---\n\nBody\n");
+        let p = doc.project();
+        let end_a = p.blocks[0].display.end;
+        let c = doc.enter(end_a, false);
+        assert_eq!(doc.nodes.len(), 4);
+        assert!(matches!(
+            &doc.nodes[0].kind,
+            NodeKind::Property { .. }
+        ));
+        assert!(matches!(
+            &doc.nodes[1].kind,
+            NodeKind::Property { .. }
+        ));
+        let p2 = doc.project();
+        assert_eq!(c, p2.blocks[1].display.start);
+        assert!(doc.to_gfm().starts_with("---\n"));
+    }
+
+    #[test]
+    fn property_backspace_merges_like_body() {
+        // Backspace at row start merges into the row above — plain text,
+        // no unwrapping step.
+        let mut doc = Doc::from_gfm("---\ntitle: Hi\n---\n\nBody\n");
+        assert!(doc.nodes.len() == 2);
+        // Non-first row merges upward.
+        let mut doc2 = Doc::from_gfm("---\na: 1\nb: 2\n---\n\nBody\n");
+        let p = doc2.project();
+        let at = p.blocks[1].display.start;
+        let c = doc2.backspace(at).expect("merges");
+        assert_eq!(doc2.nodes.len(), 2);
+        let p2 = doc2.project();
+        assert_eq!(&p2.display[..p2.blocks[0].display.end], "a: 1b: 2");
+        assert_eq!(c, p2.blocks[0].display.start + "a: 1".len());
+        let _ = doc;
+    }
 
     #[test]
     fn hash_space_converts() {        let mut d = Doc::empty();
