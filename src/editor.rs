@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     actions, canvas, deferred, div, img, point, prelude::FluentBuilder as _, px, relative, rgb,
@@ -253,6 +253,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-enter", InsertHardBreak, Some("Workspace")),
         KeyBinding::new("tab", IndentTab, Some("Workspace")),
         KeyBinding::new("shift-tab", OutdentTab, Some("Workspace")),
+        // Link editor uses the `LinkEdit` context (not Workspace) so doc
+        // indent/newline/marks don't fire. Root still binds Tab for focus
+        // cycling — these inner bindings outrank it and switch URL/title.
+        KeyBinding::new("tab", IndentTab, Some("LinkEdit")),
+        KeyBinding::new("shift-tab", OutdentTab, Some("LinkEdit")),
         KeyBinding::new("cmd-b", ToggleBold, Some("Workspace")),
         KeyBinding::new("ctrl-b", ToggleBold, Some("Workspace")),
         KeyBinding::new("cmd-i", ToggleItalic, Some("Workspace")),
@@ -521,6 +526,8 @@ pub struct Workspace {
     link_label_draft: LineField,
     /// False = URL field focused, true = label field focused. Tab toggles.
     link_focus_label: bool,
+    /// Copy-button flash on the link hover card (check for ~1.2s).
+    link_copied: Option<Instant>,
     /// Notion-style hover card: display-absolute range + URL under the mouse.
     /// `on_link` = cursor on link text, `on_card` = cursor on the card itself.
     /// The card stays visible while either is true; clearing is delayed (grace
@@ -682,6 +689,7 @@ impl Workspace {
             link_draft: LineField::new(),
             link_label_draft: LineField::new(),
             link_focus_label: false,
+            link_copied: None,
             link_hover_range: None,
             link_hover_url: None,
             link_hover_on_link: false,
@@ -777,12 +785,13 @@ impl Workspace {
         // Keep "Workspace" out of the context so Workspace-scoped bindings
         // (notably enter → InsertNewline) do not fire while the find/command
         // bar owns the keyboard. Capture handlers still see every key.
-        if self.command.is_some()
-            || self.search.is_some()
-            || self.cmd_palette.is_some()
-            || self.link_open
-        {
+        if self.command.is_some() || self.search.is_some() || self.cmd_palette.is_some() {
             return "Command";
+        }
+        // Dedicated context so Tab/Shift-Tab outrank Root's focus-cycle
+        // bindings without also stealing Tab from search/palette.
+        if self.link_open {
+            return "LinkEdit";
         }
         match (self.config.editor, self.mode) {
             (EditorKind::Notion, _) => "Workspace Notion",
@@ -4367,18 +4376,16 @@ impl Workspace {
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
 
-        // Link URL field owns the keyboard: context is `Command` so motions
+        // Link fields own the keyboard: context is `LinkEdit` so motions
         // / italic / enter-newline do not steal keys. Capture still types
         // into the draft (and handles paste, since Workspace paste is unbound).
         if self.link_open {
             window.prevent_default();
-            // Tab / Shift-Tab switch fields here (capture runs before
-            // keymap dispatch and stops propagation, so the indent
-            // actions never fire while the popover is open — the
-            // link_open guards there are just a backstop).
+            // Tab / Shift-Tab: LinkEdit keymap outranks Root's focus-cycle
+            // Tab and toggles in on_indent_tab. This is the unbound-key
+            // backstop (does not run when a binding matches).
             if key == "tab" && !mods.platform && !mods.control && !mods.alt {
-                self.link_focus_label = !self.link_focus_label;
-                cx.notify();
+                self.toggle_link_field(cx);
                 return true;
             }
             if (key == "z" || key == "Z")
@@ -8681,36 +8688,42 @@ impl Workspace {
         let focus = self.focus.clone();
         let caret_color = p.primary;
         let field = |id: &'static str,
+                     is_label: bool,
                      focused: bool,
                      text: String,
                      caret: usize,
                      color: gpui::Hsla| {
             let view = view.clone();
             let focus = focus.clone();
-            let content: AnyElement = if focused {
-                let click_view = view.clone();
-                surface::field_text(
-                    view.clone(),
-                    focus,
-                    id,
-                    text.into(),
-                    caret,
-                    caret_color,
-                    move |at, window, cx| {
-                        click_view.update(cx, |this, cx| {
-                            this.link_field_set_caret(at, window, cx);
-                        });
-                    },
-                )
+            let click_view = view.clone();
+            // Always hit-test with field_text so the first click on the
+            // unfocused field both focuses it and places the caret. Hide the
+            // bar on the inactive field with a transparent color.
+            let caret_paint = if focused {
+                caret_color
             } else {
-                div().child(text).into_any_element()
+                caret_color.opacity(0.)
             };
+            let content = surface::field_text(
+                view.clone(),
+                focus,
+                id,
+                text.into(),
+                caret,
+                caret_paint,
+                move |at, window, cx| {
+                    click_view.update(cx, |this, cx| {
+                        this.link_focus_label = is_label;
+                        this.link_field_set_caret(at, window, cx);
+                    });
+                },
+            );
             div()
                 .px_2()
                 .py_1()
                 .rounded(px(6.))
                 .border_1()
-                .border_color(p.border)
+                .border_color(if focused { p.primary } else { p.border })
                 .bg(p.background_element.opacity(0.5))
                 .text_sm()
                 .text_color(color)
@@ -8718,32 +8731,54 @@ impl Workspace {
                 .cursor_text()
                 .on_mouse_down(
                     MouseButton::Left,
-                    move |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                    move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                         cx.stop_propagation();
                         view.update(cx, |this, cx| {
-                            this.link_focus_label = focused;
+                            this.link_focus_label = is_label;
+                            window.focus(&this.focus, cx);
                             cx.notify();
                         });
                     },
                 )
                 .child(content)
         };
+        let caption = |label: bool, text: &'static str| {
+            let view = view.clone();
+            div()
+                .text_xs()
+                .text_color(p.text_muted)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                        view.update(cx, |this, cx| {
+                            this.link_focus_label = label;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        });
+                    },
+                )
+                .child(text)
+        };
         v_flex()
             .gap_2()
             .p_2()
             .min_w(px(300.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().text_xs().text_color(p.text_muted).child("Page or URL"))
+            .child(caption(false, "Page or URL"))
             .child(field(
                 "link-url-field",
+                false,
                 !label_active,
                 url_text,
                 url_caret,
                 url_color,
             ))
-            .child(div().text_xs().text_color(p.text_muted).child("Link title"))
+            .child(caption(true, "Link title"))
             .child(field(
                 "link-label-field",
+                true,
                 label_active,
                 label_text,
                 label_caret,
@@ -8784,7 +8819,7 @@ impl Workspace {
                 div()
                     .text_xs()
                     .text_color(p.text_muted)
-                    .child("Enter ↵ save · Esc cancel"),
+                    .child("Tab switch · Enter ↵ save · Esc cancel"),
             )
             .into_any_element()
     }
@@ -8802,6 +8837,10 @@ impl Workspace {
         } else {
             url
         };
+        let copied = self
+            .link_copied
+            .map(|t| t.elapsed() < Duration::from_millis(1500))
+            .unwrap_or(false);
         let view = cx.entity();
         h_flex()
             .id("link-hover-card")
@@ -8837,7 +8876,11 @@ impl Workspace {
                         Button::new("link-card-copy")
                             .ghost()
                             .xsmall()
-                            .icon(icon_el("copy", p.text_muted))
+                            .icon(icon_el(
+                                if copied { "check" } else { "copy" },
+                                if copied { p.success } else { p.text_muted },
+                            ))
+                            .tooltip(if copied { "Copied!" } else { "Copy link" })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.copy_hover_link(window, cx);
                             })),
@@ -9138,11 +9181,11 @@ impl Workspace {
         self.insert_newline(true, window, cx);
     }
     fn on_indent_tab(&mut self, _: &IndentTab, window: &mut Window, cx: &mut Context<Self>) {
-        // Backstop only: capture already toggles label/URL focus and stops
-        // propagation, so reaching here means capture was bypassed — just
-        // swallow Tab instead of indenting. Do NOT toggle here (double-flip).
+        // LinkEdit context: Tab is bound here so Root's focus-cycle Tab
+        // never runs. Keymap dispatch happens before capture_key_down.
         if self.link_open {
             window.prevent_default();
+            self.toggle_link_field(cx);
             return;
         }
         if self.overlay_input_focused(window, cx) {
@@ -9189,9 +9232,9 @@ impl Workspace {
         }
     }
     fn on_outdent_tab(&mut self, _: &OutdentTab, window: &mut Window, cx: &mut Context<Self>) {
-        // Backstop only (see `on_indent_tab`): swallow, don't toggle.
         if self.link_open {
             window.prevent_default();
+            self.toggle_link_field(cx);
             return;
         }
         if self.overlay_input_focused(window, cx) {
@@ -9406,12 +9449,29 @@ impl Workspace {
         .detach();
     }
 
-    fn copy_hover_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_hover_link(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(url) = self.link_hover_url.clone() else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(url));
-        self.show_toast(ToastKind::Info, "Copied to clipboard", window, cx);
+        let stamp = Instant::now();
+        self.link_copied = Some(stamp);
+        cx.notify();
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            let _ = cx.update(|cx| {
+                view.update(cx, |this, cx| {
+                    if this.link_copied == Some(stamp) {
+                        this.link_copied = None;
+                        cx.notify();
+                    }
+                })
+            });
+        })
+        .detach();
     }
 
     /// Open the Edit Link popover anchored on the hovered link.
@@ -9448,6 +9508,11 @@ impl Workspace {
             self.link_label_draft.insert_str(&label);
         }
         self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_link_field(&mut self, cx: &mut Context<Self>) {
+        self.link_focus_label = !self.link_focus_label;
         cx.notify();
     }
 
