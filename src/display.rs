@@ -1117,6 +1117,54 @@ fn emit_plain(
     });
 }
 
+/// Inline HTML formatting (`<strong>`, `<b>`, `<em>`, `<i>`, `<s>`, `<u>`,
+/// `<code>`). True when `tag` is a known formatting tag (marks updated, tag
+/// hidden). False for anything else (`<leader>`, `<kbd>`, …) so callers emit
+/// it literally and `<leader>gg` stays visible.
+fn apply_inline_html_tag(tag: &str, marks: &mut Marks) -> bool {
+    let t = tag.trim();
+    if !(t.starts_with('<') && t.ends_with('>')) {
+        return false;
+    }
+    let mut inner = t[1..t.len() - 1].trim();
+    // Self-closing `<br/>` style: trailing `/` belongs to the tag, not name.
+    if let Some(stripped) = inner.strip_suffix('/') {
+        inner = stripped.trim_end();
+    }
+    let closing = inner.starts_with('/');
+    if closing {
+        inner = inner[1..].trim_start();
+    }
+    let name_end = inner
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(inner.len());
+    let name = inner[..name_end].to_ascii_lowercase();
+    // Attributes (`<strong class="x">`) still count as the bare tag.
+    match name.as_str() {
+        "strong" | "b" => {
+            marks.bold = !closing;
+            true
+        }
+        "em" | "i" => {
+            marks.italic = !closing;
+            true
+        }
+        "s" | "strike" | "del" => {
+            marks.strike = !closing;
+            true
+        }
+        "u" => {
+            marks.underline = !closing;
+            true
+        }
+        "code" => {
+            marks.code = !closing;
+            true
+        }
+        _ => false,
+    }
+}
+
 struct OpenListItem {
     index: usize,
     d0: usize,
@@ -1324,14 +1372,8 @@ fn project_inlines(
                 });
             }
             Event::InlineHtml(t) | Event::Html(t) => {
-                let tag = t.as_ref().trim();
-                let lower = tag.to_ascii_lowercase();
-                if lower == "<u>" || lower == "<u/>" {
-                    marks.underline = true;
-                } else if lower == "</u>" {
-                    marks.underline = false;
-                } else {
-                    emit_plain(display, segments, abs, t.as_ref(), Marks::default());
+                if !apply_inline_html_tag(t.as_ref(), &mut marks) {
+                    emit_plain(display, segments, abs, t.as_ref(), marks);
                 }
             }
             _ => {}
@@ -1499,6 +1541,10 @@ fn project_table(
                 let lower = t.as_ref().trim().to_ascii_lowercase();
                 if matches!(lower.as_str(), "<br>" | "<br/>" | "<br />") {
                     emit_plain(display, segments, abs, "\u{001e}", Marks::default());
+                } else if !apply_inline_html_tag(t.as_ref(), &mut marks) {
+                    // Unknown tags (`<leader>`) stay visible instead of vanishing.
+                    let text = flatten_table_cell_text(t.as_ref());
+                    emit_plain(display, segments, abs, text.as_ref(), marks);
                 }
             }
             Event::End(TagEnd::TableCell) => {
@@ -1906,6 +1952,41 @@ mod tests {
         assert_eq!(last.display.start, last.display.end);
         let (a, b) = details_block_range(&p, 0).unwrap();
         assert_eq!((a, b), (0, p.blocks.len() - 1));
+    }
+
+    #[test]
+    fn strong_html_hides_tags_and_bolds() {
+        let p = project("<strong>bold</strong>");
+        assert_eq!(p.display, "bold", "{:?}", p.display);
+        assert!(p.marks_at(0, Affinity::Inside).bold);
+        let p = project("a <b>b</b> c");
+        assert_eq!(p.display, "a b c", "{:?}", p.display);
+        assert!(p.marks_at(2, Affinity::Inside).bold);
+        assert!(!p.marks_at(0, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn leader_code_and_bare_tag_stay_visible() {
+        let p = project("`<leader>gg`");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        assert!(p.marks_at(1, Affinity::Inside).code);
+        // Bare `<leader>gg` (no backticks) is inline HTML + text: keep it literal.
+        let p = project("<leader>gg");
+        assert!(p.display.contains("<leader>gg"), "{:?}", p.display);
+        // Strong-wrapped leader keeps the literal and the bold mark.
+        let p = project("<strong><leader>gg</strong>");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        assert!(p.marks_at(1, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn leader_in_table_cell_stays_visible() {
+        let src = "| A |\n| --- |\n| `<leader>gg` |";
+        let p = project(src);
+        assert!(p.display.contains("<leader>gg"), "{:?}", p.display);
+        let src = "| A |\n| --- |\n| <leader>gg |";
+        let p = project(src);
+        assert!(p.display.contains("<leader>"), "{:?}", p.display);
     }
 }
 

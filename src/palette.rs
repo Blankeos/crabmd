@@ -369,6 +369,7 @@ pub enum PaletteAction {
     ToggleFullWidth,
     ToggleSource,
     OpenSettings,
+    CopyAbsolutePath,
     SetTheme(&'static str),
     SetEditor(EditorKind),
 }
@@ -432,6 +433,12 @@ pub fn root_commands(view_source: bool) -> Vec<PaletteItem> {
             hint: "preferences",
             shortcut: Some("⌘,"),
             action: PaletteAction::OpenSettings,
+        },
+        PaletteItem {
+            label: "Copy Absolute Path",
+            hint: "path file reveal",
+            shortcut: None,
+            action: PaletteAction::CopyAbsolutePath,
         },
     ]
 }
@@ -502,5 +509,14 @@ mod tests {
     fn source_label_flips() {
         assert_eq!(root_commands(false)[3].label, "Show Markdown Source");
         assert_eq!(root_commands(true)[3].label, "Show Rendered");
+    }
+
+    #[test]
+    fn copy_absolute_path_is_findable() {
+        let items = root_commands(false);
+        let hit = filter_items(&items, "absolute path");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].action, PaletteAction::CopyAbsolutePath);
+        assert!(filter_items(&items, "copy").iter().any(|i| i.action == PaletteAction::CopyAbsolutePath));
     }
 }

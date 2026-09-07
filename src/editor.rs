@@ -3859,6 +3859,10 @@ impl Workspace {
                 self.close_palette(window, cx);
                 self.set_editor(kind, window, cx);
             }
+            PaletteAction::CopyAbsolutePath => {
+                self.close_palette(window, cx);
+                self.copy_absolute_path(cx);
+            }
         }
     }
     fn set_editor(&mut self, editor: EditorKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -3872,6 +3876,15 @@ impl Workspace {
         } else if was_notion {
             self.leave_insert(window, cx);
         }
+        cx.notify();
+    }
+    /// Copy the current file's absolute path (`cmd-shift-p` → Copy Absolute Path).
+    fn copy_absolute_path(&mut self, cx: &mut Context<Self>) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let abs = absolute_path_for(&self.path, &cwd);
+        let s = abs.to_string_lossy().to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
+        self.status = format!("copied {s}").into();
         cx.notify();
     }
     fn set_wrap_motions(&mut self, wrap: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -11635,6 +11648,19 @@ pub fn window_title(path: &Path, dirty: bool) -> String {
         format!("• {name} — crabmd")
     } else {
         format!("{name} — crabmd")
+    }
+}
+
+/// Absolute path for `Copy Absolute Path`: canonicalize when the file exists,
+/// otherwise join a relative path onto the cwd without touching the fs.
+pub fn absolute_path_for(path: &Path, cwd: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
     }
 }
 
