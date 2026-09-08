@@ -159,6 +159,9 @@ pub enum BlockExtra {
         src: String,
     },
     Html,
+    /// `<!-- … -->` block: hidden chrome (generator markers etc.).
+    /// Raw source survives round-trip via the block's source range.
+    Comment,
     /// Single-line `<h1>…</h1>` … `<h6>…</h6>`: renders as a heading,
     /// edits map back into the inner text.
     HtmlHeading(u8),
@@ -646,6 +649,7 @@ fn project_html_block(
     r: &PaintRange,
     display: &mut String,
     segments: &mut Vec<Segment>,
+    links: &mut Vec<String>,
 ) -> Option<BlockExtra> {
     let slice = r.slice(src);
     let lead = slice.len() - slice.trim_start().len();
@@ -654,6 +658,16 @@ fn project_html_block(
         return None;
     }
     let lower = t.to_ascii_lowercase();
+    // `<!-- … -->` markers are hidden chrome (GitHub parity). Only when the
+    // whole block is the comment — `<!-- x --> text` stays a visible card.
+    if lower.starts_with("<!--") {
+        if let Some(end) = lower.find("-->") {
+            if lower[end + 3..].trim().is_empty() {
+                return Some(BlockExtra::Comment);
+            }
+        }
+        return None;
+    }
     // `<h1>text</h1>` (attributes allowed on the open tag).
     if let Some(level) = html_heading_level(&lower) {
         let gt = t.find('>')?;
@@ -673,6 +687,37 @@ fn project_html_block(
     // An empty `<summary></summary>` projects as empty text so the editor
     // can show a "Summary" placeholder instead of baked-in content.
     if lower.starts_with("<details") && lower.as_bytes().get(8).is_some_and(|b| matches!(b, b'>' | b' ' | b'\t' | b'\n')) {
+        let open = html_details_open(t, &lower);
+        // Rich summary: project the `<summary>…</summary>` inner fragment so
+        // `<strong>`, `<code>`, entities etc. render instead of raw tags.
+        if let Some((s, e)) = html_summary_range(t, &lower) {
+            let mut rs = r.range.start + lead + s;
+            let mut re = r.range.start + lead + e;
+            let inner = src.get(rs..re).unwrap_or("");
+            let ls = inner.len() - inner.trim_start().len();
+            let le = inner.len() - inner.trim_end().len();
+            rs += ls;
+            re = re.saturating_sub(le).max(rs);
+            let core = src.get(rs..re).unwrap_or("");
+            if core.is_empty() {
+                // Zero-width anchor inside the summary tags so the caret
+                // lands there and typing fills the summary.
+                let pos = rs.min(src.len());
+                segments.push(Segment {
+                    display: display.len()..display.len(),
+                    source: pos..pos,
+                    marks: Marks::default(),
+                });
+                return Some(BlockExtra::Details { summary: String::new(), open });
+            }
+            if !core.contains('\n') {
+                let d0 = display.len();
+                let fake = PaintRange { kind: BlockKind::Paragraph, range: rs..re };
+                project_inlines(src, &fake, display, segments, links);
+                let summary = display.get(d0..).unwrap_or("").to_string();
+                return Some(BlockExtra::Details { summary, open });
+            }
+        }
         let summary = html_summary_text(t, &lower).unwrap_or_default();
         let range = html_summary_range(t, &lower)
             .map(|(s, e)| r.range.start + lead + s..r.range.start + lead + e);
@@ -764,7 +809,7 @@ pub fn details_block_range(p: &Projection, ix: usize) -> Option<(usize, usize)> 
 }
 
 /// Byte range of the summary inner text within `t` (`lower` mirrors `t`).
-fn html_summary_range(t: &str, lower: &str) -> Option<(usize, usize)> {
+fn html_summary_range(_t: &str, lower: &str) -> Option<(usize, usize)> {
     let open = lower.find("<summary")?;
     let after = open + "<summary".len();
     // Skip attributes on `<summary …>`.
@@ -836,7 +881,7 @@ fn project_block(
     match r.kind {
         BlockKind::Rule => BlockExtra::Rule,
         BlockKind::Html | BlockKind::Raw => {
-            if let Some(extra) = project_html_block(src, r, display, segments) {
+            if let Some(extra) = project_html_block(src, r, display, segments, links) {
                 extra
             } else {
                 emit_plain(display, segments, r.range.clone(), slice, Marks::default());
@@ -1117,6 +1162,116 @@ fn emit_plain(
     });
 }
 
+/// Decode HTML entities pulldown leaves raw inside backtick spans
+/// (`` `&lt;` `` → `<`). Text events arrive decoded already; code spans
+/// don't, so `` `&lt;leader&gt;` `` would show `&lt;leader&gt;` literally.
+fn decode_html_entities(s: &str) -> Cow<'_, str> {
+    if !s.contains('&') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(ix) = rest.find('&') {
+        out.push_str(&rest[..ix]);
+        let tail = &rest[ix..];
+        let semi = tail.find(';').filter(|&e| e <= 12).map(|e| ix + e);
+        let Some(semi) = semi else {
+            out.push('&');
+            rest = &rest[ix + 1..];
+            continue;
+        };
+        if let Some(ch) = decode_entity(&rest[ix + 1..semi]) {
+            out.push(ch);
+            rest = &rest[semi + 1..];
+        } else {
+            out.push('&');
+            rest = &rest[ix + 1..];
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// One entity body (no `&…;` wrapper): `#65`, `#x42`, `lt`, …
+fn decode_entity(body: &str) -> Option<char> {
+    if let Some(num) = body.strip_prefix('#') {
+        let n = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            num.parse::<u32>().ok()?
+        };
+        if n == 0 {
+            return None;
+        }
+        char::from_u32(n)
+    } else {
+        Some(match body {
+            "lt" => '<',
+            "gt" => '>',
+            "amp" => '&',
+            "quot" => '"',
+            "apos" => '\'',
+            "nbsp" => '\u{00A0}',
+            "ndash" => '–',
+            "mdash" => '—',
+            "hellip" => '…',
+            "laquo" => '«',
+            "raquo" => '»',
+            "copy" => '©',
+            "reg" => '®',
+            _ => return None,
+        })
+    }
+}
+
+/// Inline HTML formatting (`<strong>`, `<b>`, `<em>`, `<i>`, `<s>`, `<u>`,
+/// `<code>`). True when `tag` is a known formatting tag (marks updated, tag
+/// hidden). False for anything else (`<leader>`, `<kbd>`, …) so callers emit
+/// it literally and `<leader>gg` stays visible.
+fn apply_inline_html_tag(tag: &str, marks: &mut Marks) -> bool {
+    let t = tag.trim();
+    if !(t.starts_with('<') && t.ends_with('>')) {
+        return false;
+    }
+    let mut inner = t[1..t.len() - 1].trim();
+    // Self-closing `<br/>` style: trailing `/` belongs to the tag, not name.
+    if let Some(stripped) = inner.strip_suffix('/') {
+        inner = stripped.trim_end();
+    }
+    let closing = inner.starts_with('/');
+    if closing {
+        inner = inner[1..].trim_start();
+    }
+    let name_end = inner
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(inner.len());
+    let name = inner[..name_end].to_ascii_lowercase();
+    // Attributes (`<strong class="x">`) still count as the bare tag.
+    match name.as_str() {
+        "strong" | "b" => {
+            marks.bold = !closing;
+            true
+        }
+        "em" | "i" => {
+            marks.italic = !closing;
+            true
+        }
+        "s" | "strike" | "del" => {
+            marks.strike = !closing;
+            true
+        }
+        "u" => {
+            marks.underline = !closing;
+            true
+        }
+        "code" => {
+            marks.code = !closing;
+            true
+        }
+        _ => false,
+    }
+}
+
 struct OpenListItem {
     index: usize,
     d0: usize,
@@ -1289,8 +1444,9 @@ fn project_inlines(
                     continue;
                 }
                 skip_alert_label = false;
-                let text = &slice[range.start.min(slice.len())..range.end.min(slice.len())];
-                emit_plain(display, segments, abs, text, marks);
+                // Decoded event text (not the source slice) so entities
+                // (`&lt;`) render as their chars, GitHub-style.
+                emit_plain(display, segments, abs, t.as_ref(), marks);
             }
             Event::Code(t) => {
                 let text = t.as_ref();
@@ -1299,11 +1455,14 @@ fn project_inlines(
                 } else {
                     abs.clone()
                 };
+                // Backtick spans keep entities raw (`&lt;`); decode so
+                // `` `&lt;leader&gt;` `` shows `<leader>`.
+                let decoded = decode_html_entities(text);
                 emit_plain(
                     display,
                     segments,
                     inner,
-                    text,
+                    decoded.as_ref(),
                     Marks {
                         code: true,
                         ..marks
@@ -1324,14 +1483,8 @@ fn project_inlines(
                 });
             }
             Event::InlineHtml(t) | Event::Html(t) => {
-                let tag = t.as_ref().trim();
-                let lower = tag.to_ascii_lowercase();
-                if lower == "<u>" || lower == "<u/>" {
-                    marks.underline = true;
-                } else if lower == "</u>" {
-                    marks.underline = false;
-                } else {
-                    emit_plain(display, segments, abs, t.as_ref(), Marks::default());
+                if !apply_inline_html_tag(t.as_ref(), &mut marks) {
+                    emit_plain(display, segments, abs, t.as_ref(), marks);
                 }
             }
             _ => {}
@@ -1470,7 +1623,8 @@ fn project_table(
             }
             Event::End(TagEnd::Link) => marks.link = None,
             Event::Code(t) => {
-                let text = flatten_table_cell_text(t.as_ref());
+                let decoded = decode_html_entities(t.as_ref());
+                let text = flatten_table_cell_text(decoded.as_ref());
                 if !text.trim().is_empty() || !t.is_empty() {
                     emit_plain(
                         display,
@@ -1485,8 +1639,7 @@ fn project_table(
                 }
             }
             Event::Text(t) => {
-                let text = &slice[range.start.min(slice.len())..range.end.min(slice.len())];
-                let text = flatten_table_cell_text(text);
+                let text = flatten_table_cell_text(t.as_ref());
                 if !text.trim().is_empty() || !t.is_empty() {
                     emit_plain(display, segments, abs, text.as_ref(), marks);
                 }
@@ -1499,6 +1652,10 @@ fn project_table(
                 let lower = t.as_ref().trim().to_ascii_lowercase();
                 if matches!(lower.as_str(), "<br>" | "<br/>" | "<br />") {
                     emit_plain(display, segments, abs, "\u{001e}", Marks::default());
+                } else if !apply_inline_html_tag(t.as_ref(), &mut marks) {
+                    // Unknown tags (`<leader>`) stay visible instead of vanishing.
+                    let text = flatten_table_cell_text(t.as_ref());
+                    emit_plain(display, segments, abs, text.as_ref(), marks);
                 }
             }
             Event::End(TagEnd::TableCell) => {
@@ -1853,6 +2010,44 @@ mod tests {
     }
 
     #[test]
+    fn details_summary_parses_strong_code_entities() {
+        let src = "<details>\n<summary><strong>Neovim</strong> — <code>&lt;leader&gt;gg</code> to open</summary>\n\nbody\n\n</details>\n";
+        let p = project(src);
+        let BlockExtra::Details { summary, open } = &p.blocks[0].extra else {
+            panic!("{:?}", p.blocks[0].extra);
+        };
+        assert!(!open);
+        assert_eq!(summary, "Neovim — <leader>gg to open", "{summary:?}");
+        assert_eq!(&p.display[p.blocks[0].display.clone()], "Neovim — <leader>gg to open");
+        let n = p.display.find("Neovim").unwrap();
+        assert!(p.marks_at(n, Affinity::Inside).bold);
+        let l = p.display.find("<leader>").unwrap();
+        assert!(p.marks_at(l, Affinity::Inside).code);
+    }
+
+    #[test]
+    fn html_comment_block_is_hidden_chrome() {
+        let src = "<!-- GEN_BENCHMARKS_START -->\n\ntext\n\n<!-- GEN_BENCHMARKS_END -->\n";
+        let p = project(src);
+        assert!(!p.display.contains("GEN_BENCHMARKS"), "{:?}", p.display);
+        assert!(p.display.contains("text"), "{:?}", p.display);
+        assert!(matches!(p.blocks[0].extra, BlockExtra::Comment));
+        assert!(matches!(p.blocks[2].extra, BlockExtra::Comment));
+    }
+
+    #[test]
+    fn backtick_span_decodes_entities() {
+        let p = project("`<leader>gg`");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        assert!(p.marks_at(1, Affinity::Inside).code);
+        let p = project("`&lt;leader&gt;gg`");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        // Unknown entities stay literal.
+        let p = project("`a &unknown; b`");
+        assert_eq!(p.display, "a &unknown; b", "{:?}", p.display);
+    }
+
+    #[test]
     fn nested_fence_in_list_splits_to_code_block() {
         let src = "- Install [Brew](https://brew.sh/)\n\n  ```sh\n  /bin/bash hi\n  ```\n";
         let p = project(src);
@@ -1895,6 +2090,10 @@ mod tests {
         assert!(matches!(p.blocks[0].extra, BlockExtra::HtmlHeading(2)));
     }
 
+
+
+
+
     #[test]
     fn details_open_close_project() {
         let src = "<details>\n  <summary>\n    ⭐️ MacOS Improvements\n  </summary>\n\n- [x] Better drag\n\n</details>\n";
@@ -1906,6 +2105,41 @@ mod tests {
         assert_eq!(last.display.start, last.display.end);
         let (a, b) = details_block_range(&p, 0).unwrap();
         assert_eq!((a, b), (0, p.blocks.len() - 1));
+    }
+
+    #[test]
+    fn strong_html_hides_tags_and_bolds() {
+        let p = project("<strong>bold</strong>");
+        assert_eq!(p.display, "bold", "{:?}", p.display);
+        assert!(p.marks_at(0, Affinity::Inside).bold);
+        let p = project("a <b>b</b> c");
+        assert_eq!(p.display, "a b c", "{:?}", p.display);
+        assert!(p.marks_at(2, Affinity::Inside).bold);
+        assert!(!p.marks_at(0, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn leader_code_and_bare_tag_stay_visible() {
+        let p = project("`<leader>gg`");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        assert!(p.marks_at(1, Affinity::Inside).code);
+        // Bare `<leader>gg` (no backticks) is inline HTML + text: keep it literal.
+        let p = project("<leader>gg");
+        assert!(p.display.contains("<leader>gg"), "{:?}", p.display);
+        // Strong-wrapped leader keeps the literal and the bold mark.
+        let p = project("<strong><leader>gg</strong>");
+        assert_eq!(p.display, "<leader>gg", "{:?}", p.display);
+        assert!(p.marks_at(1, Affinity::Inside).bold);
+    }
+
+    #[test]
+    fn leader_in_table_cell_stays_visible() {
+        let src = "| A |\n| --- |\n| `<leader>gg` |";
+        let p = project(src);
+        assert!(p.display.contains("<leader>gg"), "{:?}", p.display);
+        let src = "| A |\n| --- |\n| <leader>gg |";
+        let p = project(src);
+        assert!(p.display.contains("<leader>"), "{:?}", p.display);
     }
 }
 

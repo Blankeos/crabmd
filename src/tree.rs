@@ -108,6 +108,10 @@ pub enum NodeKind {
     },
     /// `</details>` close — zero-height chrome, preserved on save.
     DetailsClose,
+    /// `<!-- … -->` block — zero-height chrome, preserved on save.
+    Comment {
+        raw: String,
+    },
     /// Frontmatter property: leading `---` YAML block, one node per key.
     /// Stores the full `key: value` line as plain inlines, so the row is
     /// just smaller navigable text — caret, insert mode, motions, visual
@@ -391,6 +395,7 @@ impl Doc {
             | NodeKind::Rule
             | NodeKind::Image { .. }
             | NodeKind::DetailsClose
+            | NodeKind::Comment { .. }
             | NodeKind::Html { .. } => self.nodes[start.node].kind.clone(),
         };
         Some(Node {
@@ -754,6 +759,12 @@ impl Doc {
         };
         if text.contains('`') {
             offset = self.maybe_close_backtick_code(node_ix, item, offset);
+        }
+        if text.contains('*') || text.contains('~') {
+            offset = self.maybe_close_emphasis(node_ix, item, offset);
+        }
+        if text.contains('>') {
+            offset = self.maybe_close_html_tag(node_ix, item, offset);
         }
         self.caret_after(node_ix, item, loc.cell, offset)
     }
@@ -1611,7 +1622,7 @@ impl Doc {
                 }
                 return Some(self.merge_nodes(loc.node - 1, loc.node));
             }
-            NodeKind::Rule | NodeKind::Image { .. } | NodeKind::Html { .. } | NodeKind::DetailsClose => {
+            NodeKind::Rule | NodeKind::Image { .. } | NodeKind::Html { .. } | NodeKind::DetailsClose | NodeKind::Comment { .. } => {
                 if loc.node == 0 {
                     self.nodes[0].kind = NodeKind::Paragraph { inlines: vec![] };
                     return Some(0);
@@ -2477,6 +2488,211 @@ impl Doc {
         open + content.len()
     }
 
+    /// After typing a closing `*`, `**` or `~~`, wrap the span between the
+    /// matching opener into italic/bold/strike and drop both delimiters
+    /// (Notion-style live formatting; mirrors `maybe_close_backtick_code`).
+    /// `**hi there*` + `*` → bold `hi there`, `*hi*` → italic, `~~hi~~` →
+    /// strike. No opener / empty inner / newline inside → literal.
+    fn maybe_close_emphasis(
+        &mut self,
+        node: usize,
+        item: Option<usize>,
+        caret: usize,
+    ) -> usize {
+        let inlines = match (&mut self.nodes[node].kind, item) {
+            (NodeKind::Paragraph { inlines }, None)
+            | (NodeKind::Heading { inlines, .. }, None)
+            | (NodeKind::HtmlHeading { inlines, .. }, None)
+            | (NodeKind::Details { inlines, .. }, None)
+            | (NodeKind::Quote { inlines }, None)
+            | (NodeKind::Alert { inlines, .. }, None) => inlines,
+            (NodeKind::List { items, .. }, Some(i)) => match items.get_mut(i) {
+                Some(it) => &mut it.inlines,
+                None => return caret,
+            },
+            _ => return caret,
+        };
+        let text = inlines_text(inlines);
+        if caret == 0 || caret > text.len() {
+            return caret;
+        }
+        // Longest closer first: `**` (bold) > `~~` (strike) > `*` (italic).
+        let (delim, is_bold, is_strike) = if text[..caret].ends_with("**") {
+            ("**", true, false)
+        } else if text[..caret].ends_with("~~") {
+            ("~~", false, true)
+        } else if text[..caret].ends_with('*') {
+            ("*", false, false)
+        } else {
+            return caret;
+        };
+        let close = caret - delim.len();
+        // Opener: nearest `delim` before `close` that isn't glued to the
+        // same char on either side (`***` / `~~~` stay literal).
+        let mut open = None;
+        let mut from = text[..close].rfind(delim);
+        while let Some(i) = from {
+            let prev_ok = i == 0 || text[..i].chars().next_back().is_some_and(|c| c != delim_char(delim));
+            let after = i + delim.len();
+            let next_ok = text[after..].chars().next().is_none_or(|c| c != delim_char(delim));
+            if prev_ok && next_ok {
+                open = Some(i);
+                break;
+            }
+            from = text[..i].rfind(delim);
+        }
+        let Some(open) = open else { return caret; };
+        let inner = open + delim.len()..close;
+        if inner.start >= inner.end {
+            return caret;
+        }
+        let body = &text[inner.clone()];
+        if body.contains('\n') || body.contains(delim) {
+            return caret;
+        }
+        // cmark flanking lite: opener follows start/space, closer ends the
+        // run or faces space/punct (no `a*b*c` math accidents), and the
+        // inner edges aren't spaces.
+        if open > 0 && !text[..open].chars().next_back().is_some_and(flank_before) {
+            return caret;
+        }
+        if !text[caret..].chars().next().is_none_or(flank_after) {
+            return caret;
+        }
+        if body.starts_with(char::is_whitespace) || body.ends_with(char::is_whitespace) {
+            return caret;
+        }
+        // Opener must not already sit inside the same mark.
+        let mut at = 0usize;
+        for run in inlines.iter() {
+            let end = at + run.text.len();
+            if open >= at && open < end {
+                let marked = if is_bold {
+                    run.marks.bold
+                } else if is_strike {
+                    run.marks.strike
+                } else {
+                    run.marks.italic
+                };
+                if marked {
+                    return caret;
+                }
+                break;
+            }
+            at = end;
+        }
+        let content = body.to_string();
+        delete_inlines(inlines, open, caret);
+        let mut marks = Marks::default();
+        marks.bold = is_bold;
+        marks.strike = is_strike;
+        marks.italic = !is_bold && !is_strike;
+        insert_inlines(inlines, open, &content, marks);
+        *inlines = merge_inlines(std::mem::take(inlines));
+        open + content.len()
+    }
+
+    /// After typing `>` that completes a known closing tag (`</strong>`,
+    /// `</em>`, `</u>`, `</code>`, …), strip the tag pair and mark the
+    /// inner text — typing `<strong>hello</strong>` live parses on `>`.
+    /// Unknown tags (`<leader>`) stay literal.
+    fn maybe_close_html_tag(
+        &mut self,
+        node: usize,
+        item: Option<usize>,
+        caret: usize,
+    ) -> usize {
+        let inlines = match (&mut self.nodes[node].kind, item) {
+            (NodeKind::Paragraph { inlines }, None)
+            | (NodeKind::Heading { inlines, .. }, None)
+            | (NodeKind::HtmlHeading { inlines, .. }, None)
+            | (NodeKind::Details { inlines, .. }, None)
+            | (NodeKind::Quote { inlines }, None)
+            | (NodeKind::Alert { inlines, .. }, None) => inlines,
+            (NodeKind::List { items, .. }, Some(i)) => match items.get_mut(i) {
+                Some(it) => &mut it.inlines,
+                None => return caret,
+            },
+            _ => return caret,
+        };
+        let text = inlines_text(inlines);
+        if caret == 0 || caret > text.len() || !text[..caret].ends_with('>') {
+            return caret;
+        }
+        let Some(lt) = text[..caret].rfind('<') else {
+            return caret;
+        };
+        let tag = &text[lt..caret];
+        // Closer only: `</name>` with no attributes.
+        let name = tag
+            .strip_prefix("</")
+            .and_then(|s| s.strip_suffix('>'))
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic()));
+        let Some(name) = name else { return caret };
+        let set: fn(&mut Marks) = match name.to_ascii_lowercase().as_str() {
+            "strong" | "b" => |m: &mut Marks| m.bold = true,
+            "em" | "i" => |m: &mut Marks| m.italic = true,
+            "s" | "strike" | "del" => |m: &mut Marks| m.strike = true,
+            "u" => |m: &mut Marks| m.underline = true,
+            "code" => |m: &mut Marks| m.code = true,
+            _ => return caret,
+        };
+        // Matching opener: last `<name…>` before the closer (attrs allowed).
+        let mut open = None;
+        let mut search = text[..lt].rfind('<');
+        while let Some(i) = search {
+            let rest = &text[i + 1..];
+            if !rest.starts_with('/') && rest.len() >= name.len() {
+                let (head, tail) = rest.split_at(name.len());
+                if head.eq_ignore_ascii_case(name)
+                    && tail.chars().next().is_some_and(|c| c == '>' || c.is_whitespace())
+                {
+                    open = Some((i, i + 1 + name.len()));
+                    break;
+                }
+            }
+            search = text[..i].rfind('<');
+        }
+        let Some((open, open_end)) = open else {
+            return caret;
+        };
+        // Skip to the opener's own `>` (attributes).
+        let after = text[open_end..lt].find('>').map(|o| open_end + o + 1);
+        let Some(inner_start) = after else {
+            return caret;
+        };
+        let body = &text[inner_start..lt];
+        if body.trim().is_empty() || body.contains(['<', '>', '\n']) {
+            return caret;
+        }
+        // Opener must not already sit inside the same mark.
+        let mut probe = Marks::default();
+        set(&mut probe);
+        let mut at = 0usize;
+        for run in inlines.iter() {
+            let end = at + run.text.len();
+            if open >= at && open < end {
+                if (probe.bold && run.marks.bold)
+                    || (probe.italic && run.marks.italic)
+                    || (probe.strike && run.marks.strike)
+                    || (probe.underline && run.marks.underline)
+                    || (probe.code && run.marks.code)
+                {
+                    return caret;
+                }
+                break;
+            }
+            at = end;
+        }
+        let content = body.to_string();
+        delete_inlines(inlines, open, caret);
+        let mut marks = Marks::default();
+        set(&mut marks);
+        insert_inlines(inlines, open, &content, marks);
+        *inlines = merge_inlines(std::mem::take(inlines));
+        open + content.len()
+    }
+
     fn loc(&self, d: usize) -> Loc {
         let p = self.project();
         let d = d.min(p.display.len());
@@ -2960,6 +3176,7 @@ fn node_is_empty(n: &Node) -> bool {
         NodeKind::Code { text, .. } => text.is_empty(),
         NodeKind::Html { raw } => raw.is_empty(),
         NodeKind::DetailsClose => false,
+        NodeKind::Comment { .. } => false,
         NodeKind::Table { headers, rows } => {
             headers.iter().all(|c| inlines_len(c) == 0) && rows.is_empty()
         }
@@ -2974,6 +3191,7 @@ fn nodes_plain_text(nodes: &[Node]) -> String {
             NodeKind::Code { text, .. } => text.clone(),
             NodeKind::Html { raw } => raw.clone(),
             NodeKind::DetailsClose => "</details>".to_string(),
+            NodeKind::Comment { raw } => raw.clone(),
             NodeKind::Paragraph { inlines }
             | NodeKind::Heading { inlines, .. }
             | NodeKind::HtmlHeading { inlines, .. }
@@ -3123,6 +3341,9 @@ fn node_from_proj(p: &Projection, b: &ProjBlock, src: &str) -> Node {
             open: *open,
         },
         BlockExtra::DetailsClose => NodeKind::DetailsClose,
+        BlockExtra::Comment => NodeKind::Comment {
+            raw: src.get(b.source.clone()).unwrap_or("").to_string(),
+        },
         BlockExtra::Text => NodeKind::Paragraph {
             inlines: inlines_in(p, b.display.clone()),
         },
@@ -3195,6 +3416,23 @@ fn inlines_text(inlines: &[Inline]) -> String {
 
 fn inlines_len(inlines: &[Inline]) -> usize {
     inlines.iter().map(|i| i.text.len()).sum()
+}
+
+/// Delimiter char of a closer run (`**` → `*`, `~~` → `~`).
+fn delim_char(delim: &str) -> char {
+    delim.chars().next().unwrap_or('*')
+}
+
+/// Char allowed right before an emphasis opener (cmark flanking lite):
+/// whitespace or opening punctuation.
+fn flank_before(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | '[' | '{' | '"' | '\'')
+}
+
+/// Char allowed right after an emphasis closer: anything but a word char
+/// (keeps `a*b*c` math and `*hi*there` literal).
+fn flank_after(c: char) -> bool {
+    !(c.is_alphanumeric() || c == '_')
 }
 
 fn insert_inlines(inlines: &mut Vec<Inline>, offset: usize, text: &str, marks: Marks) {
@@ -3538,6 +3776,7 @@ fn node_to_gfm(n: &Node, links: &[String]) -> String {
             format!("{tag}\n<summary>{}</summary>", inlines_to_gfm(inlines, links))
         }
         NodeKind::DetailsClose => "</details>".into(),
+        NodeKind::Comment { raw } => raw.clone(),
     }
 }
 
@@ -3725,6 +3964,15 @@ fn emit_node(
                 });
             }
             (BlockExtra::DetailsClose, BlockKind::Html)
+        }
+        NodeKind::Comment { .. } => {
+            let d0 = display.len();
+            segments.push(Segment {
+                display: d0..d0,
+                source: d0..d0,
+                marks: Marks::default(),
+            });
+            (BlockExtra::Comment, BlockKind::Html)
         }
         NodeKind::Quote { inlines } => {
             emit_inlines(inlines, display, segments, links);
@@ -4645,6 +4893,101 @@ mod feature_tests {
         assert!(p.marks_at(0, crate::display::Affinity::Inside).code);
         assert!(d.to_gfm().contains("`code`"), "{}", d.to_gfm());
         let _ = c;
+    }
+
+    /// Type `ch` per char (live path) and return final caret.
+    fn type_chars(d: &mut Doc, mut c: usize, s: &str) -> usize {
+        for ch in s.chars() {
+            let mut buf = [0u8; 4];
+            c = d.insert_text(c, None, ch.encode_utf8(&mut buf), Marks::default());
+        }
+        c
+    }
+
+    #[test]
+    fn closing_star_pair_bolds_italicizes_strikes() {
+        // `**hi there*` + `*` → bold.
+        let mut d = Doc::empty();
+        let c = type_chars(&mut d, 0, "**hi there*");
+        let _ = type_chars(&mut d, c, "*");
+        let p = d.project();
+        assert_eq!(p.display, "hi there", "{:?}", p.display);
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).bold);
+        assert!(d.to_gfm().contains("**hi there**"), "{}", d.to_gfm());
+        // `*hi*` → italic.
+        let mut d = Doc::empty();
+        let c = type_chars(&mut d, 0, "*hi");
+        let _ = type_chars(&mut d, c, "*");
+        let p = d.project();
+        assert_eq!(p.display, "hi", "{:?}", p.display);
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).italic);
+        // `~~hi~~` → strike.
+        let mut d = Doc::empty();
+        let c = type_chars(&mut d, 0, "~~hi~");
+        let _ = type_chars(&mut d, c, "~");
+        let p = d.project();
+        assert_eq!(p.display, "hi", "{:?}", p.display);
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).strike);
+    }
+
+    #[test]
+    fn lone_stars_stay_literal() {
+        // Math-ish text and unclosed openers never format.
+        let mut d = Doc::empty();
+        let _ = type_chars(&mut d, 0, "2 * 3 * 4");
+        let p = d.project();
+        assert_eq!(p.display, "2 * 3 * 4", "{:?}", p.display);
+        assert!(!p.marks_at(2, crate::display::Affinity::Inside).italic);
+        let mut d = Doc::empty();
+        let _ = type_chars(&mut d, 0, "*never closed");
+        let p = d.project();
+        assert!(p.display.contains('*'), "{:?}", p.display);
+    }
+
+    #[test]
+    fn closing_html_tag_marks_live() {
+        // Typing the final `>` of `</strong>` parses immediately.
+        let mut d = Doc::empty();
+        let c = type_chars(&mut d, 0, "<strong>hello</strong");
+        let _ = type_chars(&mut d, c, ">");
+        let p = d.project();
+        assert_eq!(p.display, "hello", "{:?}", p.display);
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).bold);
+        assert!(d.to_gfm().contains("**hello**"), "{}", d.to_gfm());
+        // `<u>` → underline.
+        let mut d = Doc::empty();
+        let c = type_chars(&mut d, 0, "<u>hi</u");
+        let _ = type_chars(&mut d, c, ">");
+        let p = d.project();
+        assert_eq!(p.display, "hi", "{:?}", p.display);
+        assert!(p.marks_at(0, crate::display::Affinity::Inside).underline);
+        // Unknown tags stay literal.
+        let mut d = Doc::empty();
+        let _ = type_chars(&mut d, 0, "<leader>gg");
+        let p = d.project();
+        assert!(p.display.contains("<leader>gg"), "{:?}", p.display);
+    }
+
+    #[test]
+    fn comment_block_roundtrips_hidden() {
+        let src = "<!-- GEN_START -->\n\ntext\n\n<!-- GEN_END -->\n";
+        let d = Doc::from_gfm(src);
+        let p = d.project();
+        assert!(!p.display.contains("GEN_"), "{:?}", p.display);
+        assert!(p.display.contains("text"), "{:?}", p.display);
+        let gfm = d.to_gfm();
+        assert!(gfm.contains("<!-- GEN_START -->"), "{gfm:?}");
+        assert!(gfm.contains("<!-- GEN_END -->"), "{gfm:?}");
+    }
+
+    #[test]
+    fn details_summary_marks_roundtrip() {
+        let src = "<details>\n<summary><strong>Nvim</strong> — <code>e</code></summary>\n\nbody\n\n</details>\n";
+        let d = Doc::from_gfm(src);
+        let p = d.project();
+        assert_eq!(&p.display[p.blocks[0].display.clone()], "Nvim — e", "{:?}", p.display);
+        let gfm = d.to_gfm();
+        assert!(gfm.contains("<summary>**Nvim** — `e`</summary>"), "{gfm:?}");
     }
 
     #[test]

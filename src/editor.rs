@@ -3859,6 +3859,10 @@ impl Workspace {
                 self.close_palette(window, cx);
                 self.set_editor(kind, window, cx);
             }
+            PaletteAction::CopyAbsolutePath => {
+                self.close_palette(window, cx);
+                self.copy_absolute_path(cx);
+            }
         }
     }
     fn set_editor(&mut self, editor: EditorKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -3872,6 +3876,15 @@ impl Workspace {
         } else if was_notion {
             self.leave_insert(window, cx);
         }
+        cx.notify();
+    }
+    /// Copy the current file's absolute path (`cmd-shift-p` → Copy Absolute Path).
+    fn copy_absolute_path(&mut self, cx: &mut Context<Self>) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let abs = absolute_path_for(&self.path, &cwd);
+        let s = abs.to_string_lossy().to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
+        self.status = format!("copied {s}").into();
         cx.notify();
     }
     fn set_wrap_motions(&mut self, wrap: bool, _window: &mut Window, cx: &mut Context<Self>) {
@@ -6265,6 +6278,8 @@ impl Workspace {
             }
             BlockExtra::Details { .. } => self.render_details_row(ix, body, slash, cx),
             BlockExtra::DetailsClose => div().into_any_element(),
+            // Hidden `<!-- … -->` chrome: zero-height like `</details>`.
+            BlockExtra::Comment => div().into_any_element(),
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Text | BlockExtra::Html => {
@@ -8652,7 +8667,7 @@ impl Workspace {
         div()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                Button::new(("mk", label.len()))
+                Button::new(("mk", mark as usize))
                     .ghost()
                     .xsmall()
                     .label(label)
@@ -11635,6 +11650,19 @@ pub fn window_title(path: &Path, dirty: bool) -> String {
         format!("• {name} — crabmd")
     } else {
         format!("{name} — crabmd")
+    }
+}
+
+/// Absolute path for `Copy Absolute Path`: canonicalize when the file exists,
+/// otherwise join a relative path onto the cwd without touching the fs.
+pub fn absolute_path_for(path: &Path, cwd: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
     }
 }
 
