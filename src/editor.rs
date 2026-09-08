@@ -6278,6 +6278,8 @@ impl Workspace {
             }
             BlockExtra::Details { .. } => self.render_details_row(ix, body, slash, cx),
             BlockExtra::DetailsClose => div().into_any_element(),
+            // Hidden `<!-- … -->` chrome: zero-height like `</details>`.
+            BlockExtra::Comment => div().into_any_element(),
             BlockExtra::List { items, ordered } => self.render_list(ix, items, *ordered, body, cx),
             BlockExtra::Table { .. } => self.render_table_block(ix, cx),
             BlockExtra::Text | BlockExtra::Html => {
