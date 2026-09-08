@@ -741,8 +741,21 @@ impl Doc {
             );
             return self.caret_after(ix + 1, None, None, text.len());
         }
+        // Typing strictly inside a marked run (bold/link/underline/…) must
+        // inherit that run's marks. Otherwise a plain `sticky` splits
+        // `**hello**` into `**he**` + `llo` + `**lo**` (two spans).
+        // Boundary offsets keep `sticky` so Right-at-end-of-mark (affinity
+        // Outside) still leaves the mark.
+        let eff = {
+            let cur = self.inlines_at(loc);
+            if !sticky.any() && sticky.link.is_none() {
+                strict_marks_at(cur, loc.offset).unwrap_or(sticky)
+            } else {
+                sticky
+            }
+        };
         let inlines = self.inlines_at_mut(loc);
-        insert_inlines(inlines, loc.offset, text, sticky);
+        insert_inlines(inlines, loc.offset, text, eff);
         let node_ix = loc.node;
         let item = loc.item;
         self.maybe_shortcut(node_ix, item);
@@ -1646,11 +1659,32 @@ impl Doc {
             return 0;
         };
         let ix = loc.item.unwrap_or(0);
-        if items[ix].indent > 0 {
-            items[ix].indent -= 1;
-            return self.caret_after(loc.node, Some(ix), None, 0);
+        // Notion: backspace at the start of an indented item strips the
+        // bullet (unlike shift-tab which outdents). Keep the block as an
+        // (empty when the item was empty) paragraph that stays indented via
+        // leading spaces so typing continues at the same level as plain text.
+        let indented = items[ix].indent > 0;
+        let mut inlines = items[ix].inlines.clone();
+        let mut caret_pad = 0usize;
+        if indented {
+            let pad = "  ".repeat(items[ix].indent);
+            caret_pad = pad.len();
+            if inlines.is_empty() {
+                inlines = vec![Inline {
+                    text: pad,
+                    marks: Marks::default(),
+                }];
+            } else {
+                inlines.insert(
+                    0,
+                    Inline {
+                        text: pad,
+                        marks: Marks::default(),
+                    },
+                );
+                inlines = merge_inlines(inlines);
+            }
         }
-        let inlines = items[ix].inlines.clone();
         let following: Vec<ListItem> = items.drain(ix + 1..).collect();
         items.remove(ix);
         let ordered = *ordered;
@@ -1669,7 +1703,7 @@ impl Doc {
                     },
                 );
             }
-            return self.caret_after(ni, None, None, 0);
+            return self.caret_after(ni, None, None, caret_pad);
         }
         self.nodes.insert(
             ni + 1,
@@ -1690,7 +1724,7 @@ impl Doc {
                 },
             );
         }
-        self.caret_after(ni + 1, None, None, 0)
+        self.caret_after(ni + 1, None, None, caret_pad)
     }
 
     pub fn toggle_mark(&mut self, sel: Range<usize>, mark: Mark) -> Option<Range<usize>> {
@@ -3433,6 +3467,21 @@ fn flank_before(c: char) -> bool {
 /// (keeps `a*b*c` math and `*hi*there` literal).
 fn flank_after(c: char) -> bool {
     !(c.is_alphanumeric() || c == '_')
+}
+
+/// Marks of the run strictly containing `offset` (`at < offset < at+len`).
+/// `None` at run boundaries / empty runs so boundary typing keeps `sticky`
+/// (affinity Outside leaves the mark, Inside extends it via `sticky`).
+fn strict_marks_at(inlines: &[Inline], offset: usize) -> Option<Marks> {
+    let mut at = 0usize;
+    for run in inlines {
+        let len = run.text.len();
+        if offset > at && offset < at + len {
+            return Some(run.marks);
+        }
+        at += len;
+    }
+    None
 }
 
 fn insert_inlines(inlines: &mut Vec<Inline>, offset: usize, text: &str, marks: Marks) {

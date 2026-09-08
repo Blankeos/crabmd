@@ -56,3 +56,5 @@
 - [x] In helix, when during insert mode, I can't type Shift-U, it's not typing it. I think the keybinds are eating it. Same with most vim keybinds actually that should only be in normal mode. i.e. shift-v.
 - [x] Bug: Btw sometimes the footer of the window disappears. It only reappears when I type 'enter', disappears again when I type stuff or press escape.
 - [x] bug: shift-4 shift-6 should only be on vim. (for getting to line and end of line). on helix it's either 'gl' - line end. 'gs' - line start that isnt blank (idk this doesnt usually happen tho) and 'gh' - line start always.
+- [x] bug: when typing "inside" an inline formatted text i.e. link, bold, underline, etc. It breaks it into two.
+- [x] bug: when i backspace on an indented list-item i.e. a bulletpoint, it just behaves the same as shift-tab, instead of the expected which is to remove the list item formatting (not the block), and make it empty (but still indented). Like Notion
