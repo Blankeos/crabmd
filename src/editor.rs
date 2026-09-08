@@ -8665,7 +8665,7 @@ impl Workspace {
         div()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
-                Button::new(("mk", label.len()))
+                Button::new(("mk", mark as usize))
                     .ghost()
                     .xsmall()
                     .label(label)
