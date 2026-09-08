@@ -12,13 +12,23 @@ If `path.md` does not exist, crabmd creates an empty markdown file and opens it.
 
 ## Install
 
+## Install
+
 ```sh
-brew install blankeos/tap/crabmd
+brew install --cask blankeos/tap/crabmd
 npm install -g crabmd
 bun install -g crabmd
 cargo install --git https://github.com/Blankeos/crabmd --locked
 curl --proto "=https" --tlsv1.2 -LsSf https://github.com/Blankeos/crabmd/releases/latest/download/crabmd-installer.sh | sh
 ```
+
+Every install gives you both `crabmd` on PATH and the registered app
+(Spotlight, Dock, Open With). The cask ships `/Applications/CrabMD.app`;
+other installs register a user-level app on first launch
+(`~/Applications/CrabMD.app` on macOS, a `.desktop` entry on Linux).
+`crabmd --install-desktop` does that without opening a window. Bun skips
+npm `postinstall`; the first `crabmd` command downloads the binary and
+registers the app.
 
 ## What it is
 
@@ -242,7 +252,8 @@ is in `docs/keymap-parity.md`. Refresh later with the crabcode command
 ## App icon
 
 `assets/app-icon.png` is the source of truth. `just dev` (`cargo r`) also
-sets the macOS Dock icon at runtime. A bundled `.app` uses `assets/AppIcon.icns`.
+sets the macOS Dock icon at runtime. A bundled `.app` uses `assets/AppIcon.icns`
+(`just macos-app`, or `brew install --cask blankeos/tap/crabmd`).
 
 The window uses a Zed-style custom titlebar (transparent native chrome, real
 macOS traffic lights, filename + dirty dot). Drag the bar to move; double-click

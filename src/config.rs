@@ -166,8 +166,7 @@ impl From<RawConfig> for Config {
 }
 
 pub fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/crabmd"))
+    Some(crate::desktop::home_dir().ok()?.join(".config/crabmd"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -188,7 +187,7 @@ pub fn load() -> Config {
 
 pub fn save(config: &Config) -> anyhow::Result<()> {
     let Some(dir) = config_dir() else {
-        anyhow::bail!("HOME is not set");
+        anyhow::bail!("HOME / USERPROFILE is not set");
     };
     fs::create_dir_all(&dir)?;
     let path = dir.join("config.toml");

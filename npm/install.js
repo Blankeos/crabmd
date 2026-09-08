@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { execSync } = require("child_process");
+const { execSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -77,11 +77,29 @@ async function downloadFile(url, dest) {
   });
 }
 
-function extractArchive(archivePath, extractDir, platformInfo) {
+function extractArchive(archivePath, extractDir) {
   console.log("Extracting binary...");
+  execSync(`tar -xf "${archivePath}" -C "${extractDir}"`, { stdio: "inherit" });
+}
 
-  const cmd = `tar -xf "${archivePath}" -C "${extractDir}"`;
-  execSync(cmd, { stdio: "inherit" });
+function registerDesktopApp(binaryPath) {
+  try {
+    const result = spawnSync(binaryPath, ["--install-desktop"], {
+      stdio: "inherit",
+      timeout: 20000,
+    });
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.status !== 0) {
+      throw new Error(`exit ${result.status}`);
+    }
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`desktop app not registered: ${message}`);
+    return false;
+  }
 }
 
 function logInstallFailure(error) {
@@ -103,7 +121,7 @@ async function install({ exitOnComplete = false } = {}) {
     if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
 
     await downloadFile(platformInfo.url, archivePath);
-    extractArchive(archivePath, __dirname, platformInfo);
+    extractArchive(archivePath, __dirname);
 
     const extractedBinaryPath = path.join(__dirname, platformInfo.binaryName);
     if (fs.existsSync(extractedBinaryPath)) {
@@ -120,6 +138,7 @@ async function install({ exitOnComplete = false } = {}) {
 
     fs.chmodSync(binaryPath, 0o755);
     fs.unlinkSync(archivePath);
+    ensureDesktopApp(binaryPath);
     console.log(`crabmd v${VERSION} installed successfully!`);
 
     if (exitOnComplete) {
@@ -145,4 +164,32 @@ if (require.main === module) {
   install({ exitOnComplete: true });
 }
 
-module.exports = { getPlatformInfo, install };
+function binaryPath() {
+  return path.join(__dirname, "bin", BINARY_NAME);
+}
+
+function desktopMarkerPath() {
+  return path.join(__dirname, "bin", ".desktop");
+}
+
+function ensureDesktopApp(bin) {
+  const marker = desktopMarkerPath();
+  try {
+    if (fs.existsSync(marker) && fs.readFileSync(marker, "utf8").trim() === VERSION) {
+      return;
+    }
+  } catch {
+    // rewrite below
+  }
+  if (!registerDesktopApp(bin)) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, VERSION);
+  } catch {
+    // launcher still works without the marker
+  }
+}
+
+module.exports = { getPlatformInfo, install, binaryPath, ensureDesktopApp };

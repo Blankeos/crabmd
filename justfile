@@ -22,6 +22,22 @@ dpreview *args:
 preview *args:
     ./target/release/crabmd -w {{args}}
 
+[doc('Wrap the release binary in target/release/CrabMD.app')]
+macos-app:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != Darwin ]]; then
+        echo "macos-app is macOS-only" >&2
+        exit 1
+    fi
+    cargo build --release
+    version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+    ./scripts/macos-app.sh \
+        --bin target/release/crabmd \
+        --version "$version" \
+        --out target/release/CrabMD.app
+    echo "→ target/release/CrabMD.app"
+
 sync_readme:
     cp README.md npm/README.md
 

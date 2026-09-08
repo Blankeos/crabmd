@@ -1,7 +1,10 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod assets;
 mod config;
 mod coords;
 mod daemon;
+mod desktop;
 mod display;
 mod document;
 mod editor;
@@ -23,7 +26,8 @@ mod undo;
 mod video;
 mod wysiwyg;
 
-use std::path::PathBuf;
+use std::io::IsTerminal as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use gpui::{
@@ -47,41 +51,50 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse()?;
     if args.help {
+        attach_stdio();
         print_help();
         return Ok(());
     }
     if args.list_themes {
+        attach_stdio();
         for name in theme::list_theme_names() {
             println!("{name}");
         }
         return Ok(());
     }
-    // Require a path first so a missing arg fails in the foreground.
-    let raw_path = args
-        .path
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("missing file path\n\n{HELP}"))?;
-    if !args.wait {
+    if args.install_desktop {
+        attach_stdio();
+        let path = desktop::install()?;
+        println!("installed {}", path.display());
+        return Ok(());
+    }
+    if args.uninstall_desktop {
+        attach_stdio();
+        desktop::uninstall()?;
+        println!("removed desktop app");
+        return Ok(());
+    }
+    // Spotlight / Dock / Finder: stay in this process (don't detach).
+    // Terminal `crabmd file.md` still returns immediately unless `-w`.
+    let wait = args.wait || stay_attached();
+    if !wait {
         // Fast path: a live daemon opens a tab (~ms) and we exit. No file
         // I/O here so the shell returns immediately. Otherwise spawn the
         // daemon (detached child) which owns the socket from here on.
-        let abs = absolutize(&raw_path);
-        if daemon::try_forward(
-            &abs.to_string_lossy(),
-            args.line,
-            args.col,
-            args.behavior.as_str(),
-        ) {
+        let forward = args
+            .path
+            .as_deref()
+            .map(absolutize)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if daemon::try_forward(&forward, args.line, args.col, args.behavior.as_str()) {
             return Ok(());
         }
         detach_and_reexec()?;
         return Ok(());
     }
-    let path = args
-        .path
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("missing file path\n\n{}", HELP))?;
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    // Copy + codesign belongs in the GUI process, not the CLI parent.
+    desktop::ensure_installed();
     let mut config = config::load();
     let palette = if args.theme_from_cli {
         theme::load_named(&args.theme)?
@@ -94,15 +107,59 @@ fn run() -> Result<()> {
     if args.theme_from_cli {
         config.theme = palette.name.clone();
     }
-    ensure_file(&path)?;
-    let source =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let initial = match (args.line, args.col) {
-        (Some(line), col) => Some((line, col.unwrap_or(1))),
-        (None, _) => None,
-    };
-    launch(path, source, palette, config, initial);
+    let (path, source, initial) = load_open_target(args.path.clone(), args.line, args.col)?;
+    // Finder "Open With" may arrive via Apple Events after launch, not argv.
+    let delay_untitled = args.path.is_none() && stay_attached();
+    launch(path, source, palette, config, initial, delay_untitled);
     Ok(())
+}
+
+/// True when LaunchServices started this `.app` (Spotlight, Dock, Finder).
+/// The same binary on PATH from a cask still detaches in a real terminal.
+fn launched_from_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+fn stay_attached() -> bool {
+    launched_from_app_bundle() && !std::io::stdin().is_terminal()
+}
+
+/// GUI subsystem binaries have no console. Re-attach for `--help` / install.
+fn attach_stdio() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+fn load_open_target(
+    path: Option<PathBuf>,
+    line: Option<usize>,
+    col: Option<usize>,
+) -> Result<(PathBuf, String, Option<(usize, usize)>)> {
+    match path {
+        None => Ok((crate::tabs::untitled_path(), String::new(), None)),
+        Some(path) => {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            ensure_file(&path)?;
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let initial = match (line, col) {
+                (Some(line), col) => Some((line, col.unwrap_or(1))),
+                (None, _) => None,
+            };
+            Ok((path, source, initial))
+        }
+    }
 }
 
 /// Spawn a detached `-w` child with the same args, then let the parent exit.
@@ -149,50 +206,162 @@ fn ensure_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn launch(path: PathBuf, source: String, palette: Palette, config: Config, initial: Option<(usize, usize)>) {
-    gpui_platform::application()
+fn launch(
+    path: PathBuf,
+    source: String,
+    palette: Palette,
+    config: Config,
+    initial: Option<(usize, usize)>,
+    delay_untitled: bool,
+) {
+    let app = gpui_platform::application()
         .with_assets(crate::assets::Assets)
         // Stay alive with zero windows (daemon) so the next `crabmd file`
         // forwards over the socket instead of cold-booting. cmd-q quits.
-        .with_quit_mode(QuitMode::Explicit)
-        .run(move |cx| {
-            gpui_component::init(cx);
-            crate::assets::load_bundled_fonts(cx);
-            bind_keys(cx);
-            bind_tab_keys(cx);
-            // Remote `http(s)` images (`img(SharedUri)`) download through
-            // this client — without it GPUI uses a null client and every
-            // remote photo silently never loads (same setup as GPUI's own
-            // image example).
-            if let Ok(client) = reqwest_client::ReqwestClient::user_agent("crabmd") {
-                cx.set_http_client(std::sync::Arc::new(client));
-            }
-            crate::assets::apply_dock_icon();
-            crate::editor::apply_palette(&palette, cx);
+        .with_quit_mode(QuitMode::Explicit);
 
-            cx.set_global(ShellRegistry { shells: Vec::new() });
-            // Single-instance socket. `--wait` skips listening (blocking
-            // one-shot); a lost race just opens without registering.
-            let ipc_rx = daemon::start_listener();
-            open_editor_window(path, source, palette, config, initial, cx);
-            if let Some(rx) = ipc_rx {
-                cx.spawn(async move |cx| {
-                    loop {
-                        while let Ok(req) = rx.try_recv() {
-                            let _ = cx.update(|cx| handle_open(cx, req));
-                        }
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(50))
-                            .await;
-                    }
-                })
-                .detach();
-            }
-            // cmd-q cleanup; a crash leaves a stale file, which the next
-            // launch detects (connect fails) and replaces.
-            let _quit_sub = cx.on_app_quit(|_| async { daemon::cleanup() });
-            std::mem::forget(_quit_sub);
+    // Finder / Dock drop files via `application:openURLs:` — often after
+    // launch, and the callback has no `&mut App`. Queue until we settle
+    // the first window (argv vs Apple Event vs untitled).
+    let pending = std::rc::Rc::new(std::cell::RefCell::new(PendingOpens::default()));
+    let settled = std::rc::Rc::new(std::cell::Cell::new(false));
+
+    let pending_cb = pending.clone();
+    let settled_cb = settled.clone();
+    app.on_open_urls(move |urls| {
+        pending_cb.borrow_mut().urls.extend(urls);
+        if !settled_cb.get() {
+            return;
+        }
+        let Some(async_app) = pending_cb.borrow().async_app.clone() else {
+            return;
+        };
+        let urls = std::mem::take(&mut pending_cb.borrow_mut().urls);
+        let _ = async_app.update(|cx| open_urls(cx, urls));
+    });
+    let settled_reopen = settled.clone();
+    app.on_reopen(move |cx| {
+        if !settled_reopen.get() {
+            return;
+        }
+        let empty = cx.update_global::<ShellRegistry, _>(|reg, _| {
+            reg.shells.retain(|(w, _)| w.upgrade().is_some());
+            reg.shells.is_empty()
         });
+        if empty {
+            let config = config::load();
+            let Ok(palette) = theme::load_named(&config.theme)
+                .or_else(|_| theme::load_named(theme::DEFAULT_THEME))
+            else {
+                return;
+            };
+            open_editor_window(
+                crate::tabs::untitled_path(),
+                String::new(),
+                palette,
+                config,
+                None,
+                cx,
+            );
+        } else {
+            if let Some(handle) = cx.active_window() {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            }
+            cx.activate(true);
+        }
+    });
+
+    app.run(move |cx| {
+        pending.borrow_mut().async_app = Some(cx.to_async());
+        gpui_component::init(cx);
+        crate::assets::load_bundled_fonts(cx);
+        bind_keys(cx);
+        bind_tab_keys(cx);
+        // Remote `http(s)` images (`img(SharedUri)`) download through
+        // this client — without it GPUI uses a null client and every
+        // remote photo silently never loads (same setup as GPUI's own
+        // image example).
+        if let Ok(client) = reqwest_client::ReqwestClient::user_agent("crabmd") {
+            cx.set_http_client(std::sync::Arc::new(client));
+        }
+        crate::assets::apply_dock_icon();
+        crate::editor::apply_palette(&palette, cx);
+
+        cx.set_global(ShellRegistry { shells: Vec::new() });
+        // Single-instance socket. `--wait` skips listening (blocking
+        // one-shot); a lost race just opens without registering.
+        let ipc_rx = daemon::start_listener();
+        if delay_untitled {
+            let palette = palette.clone();
+            let config = config.clone();
+            let pending = pending.clone();
+            let settled = settled.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let urls = std::mem::take(&mut pending.borrow_mut().urls);
+                    if urls.is_empty() {
+                        open_editor_window(
+                            crate::tabs::untitled_path(),
+                            String::new(),
+                            palette,
+                            config,
+                            None,
+                            cx,
+                        );
+                    } else {
+                        open_urls(cx, urls);
+                    }
+                    settled.set(true);
+                });
+            })
+            .detach();
+        } else {
+            open_editor_window(path, source, palette, config, initial, cx);
+            let urls = std::mem::take(&mut pending.borrow_mut().urls);
+            open_urls(cx, urls);
+            settled.set(true);
+        }
+        if let Some(rx) = ipc_rx {
+            cx.spawn(async move |cx| loop {
+                while let Ok(req) = rx.try_recv() {
+                    let _ = cx.update(|cx| handle_open(cx, req));
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            })
+            .detach();
+        }
+        // cmd-q cleanup; a crash leaves a stale file, which the next
+        // launch detects (connect fails) and replaces.
+        let _quit_sub = cx.on_app_quit(|_| async { daemon::cleanup() });
+        std::mem::forget(_quit_sub);
+    });
+}
+
+#[derive(Default)]
+struct PendingOpens {
+    async_app: Option<gpui::AsyncApp>,
+    urls: Vec<String>,
+}
+
+fn open_urls(cx: &mut App, urls: Vec<String>) {
+    for url in urls {
+        if let Some(path) = path_from_open_url(&url) {
+            handle_open(
+                cx,
+                daemon::OpenRequest {
+                    path: path.to_string_lossy().into_owned(),
+                    line: None,
+                    col: None,
+                    behavior: "existing".into(),
+                },
+            );
+        }
+    }
 }
 
 /// Live shells + their windows for single-instance routing.
@@ -204,29 +373,31 @@ impl Global for ShellRegistry {}
 
 /// Route one forwarded `crabmd <file:line:col>` into this process.
 fn handle_open(cx: &mut App, req: daemon::OpenRequest) {
-    let mut path = PathBuf::from(&req.path);
-    path = std::fs::canonicalize(&path).unwrap_or(path);
-    if ensure_file(&path).is_err() {
-        return;
-    }
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        return;
+    let (path, source, initial) = if req.path.is_empty() {
+        (crate::tabs::untitled_path(), String::new(), None)
+    } else {
+        let mut path = PathBuf::from(&req.path);
+        path = std::fs::canonicalize(&path).unwrap_or(path);
+        if ensure_file(&path).is_err() {
+            return;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let initial = match (req.line, req.col) {
+            (Some(line), col) => Some((line, col.unwrap_or(1))),
+            (None, _) => None,
+        };
+        (path, source, initial)
     };
-    let initial = match (req.line, req.col) {
-        (Some(line), col) => Some((line, col.unwrap_or(1))),
-        (None, _) => None,
-    };
-    let live: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)> =
-        cx.update_global::<ShellRegistry, _>(|reg, _| {
+    let live: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)> = cx
+        .update_global::<ShellRegistry, _>(|reg, _| {
             reg.shells.retain(|(w, _)| w.upgrade().is_some());
             reg.shells.clone()
         });
     let target: Option<(Entity<WorkspaceShell>, AnyWindowHandle)> = cx
         .active_window()
-        .and_then(|a| {
-            live.iter()
-                .find(|(_, h)| h.window_id() == a.window_id())
-        })
+        .and_then(|a| live.iter().find(|(_, h)| h.window_id() == a.window_id()))
         .or_else(|| live.first())
         .and_then(|(w, h)| w.upgrade().map(|s| (s, *h)));
     match target {
@@ -296,6 +467,8 @@ pub(crate) fn open_editor_window(
 struct Args {
     help: bool,
     list_themes: bool,
+    install_desktop: bool,
+    uninstall_desktop: bool,
     theme: String,
     theme_from_cli: bool,
     wait: bool,
@@ -333,6 +506,8 @@ impl Args {
     fn parse() -> Result<Self> {
         let mut help = false;
         let mut list_themes = false;
+        let mut install_desktop = false;
+        let mut uninstall_desktop = false;
         let mut theme = theme::DEFAULT_THEME.to_string();
         let mut theme_from_cli = false;
         let mut wait = false;
@@ -345,6 +520,8 @@ impl Args {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
                 "--list-themes" => list_themes = true,
+                "--install-desktop" => install_desktop = true,
+                "--uninstall-desktop" => uninstall_desktop = true,
                 "-w" | "--wait" => wait = true,
                 "-n" | "--new" => behavior = OpenBehavior::New,
                 "-e" | "--existing" => behavior = OpenBehavior::Existing,
@@ -377,6 +554,8 @@ impl Args {
         Ok(Self {
             help,
             list_themes,
+            install_desktop,
+            uninstall_desktop,
             theme,
             theme_from_cli,
             wait,
@@ -432,17 +611,72 @@ fn split_file_position(arg: &str) -> (String, Option<usize>, Option<usize>) {
     }
 }
 
+/// Finder / LaunchServices pass `file:///Users/me/notes.md` (sometimes
+/// `file://localhost/Users/...`). Bare absolute paths are accepted too.
+fn path_from_open_url(raw: &str) -> Option<PathBuf> {
+    let decoded = if let Some(rest) = raw.strip_prefix("file:") {
+        let rest = rest.trim_start_matches("//");
+        let path = if let Some(p) = rest.strip_prefix("localhost") {
+            p
+        } else if rest.starts_with('/') {
+            rest
+        } else {
+            rest.find('/').map(|i| &rest[i..]).unwrap_or(rest)
+        };
+        percent_decode(path)
+    } else if Path::new(raw).is_absolute() {
+        raw.to_string()
+    } else {
+        return None;
+    };
+    Some(windows_file_url_path(decoded))
+}
+
+/// `file:///C:/notes.md` becomes `/C:/notes.md` after slash-stripping.
+fn windows_file_url_path(path: String) -> PathBuf {
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        PathBuf::from(&path[1..])
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 const HELP: &str = "\
 crabmd — a fast native markdown writer
 
 Usage:
+  crabmd
   crabmd <file.md>
   crabmd <file.md>:<line>[:<col>]   (zed-style jump; hidden markup picks nearest)
   crabmd --theme <name> <file.md>
   crabmd -w <file.md>
   crabmd --list-themes
+  crabmd --install-desktop
+  crabmd --uninstall-desktop
 
-If <file.md> does not exist, an empty markdown file is created.
+No path opens an untitled buffer (same as cmd-t). If <file.md> does not
+exist, an empty markdown file is created.
 
 Single instance (zed-style): the first call owns the process (one dock
 icon); later calls forward over a socket and exit in ~ms. Default opens a
@@ -455,6 +689,8 @@ Flags:
   -e, --existing Open a tab in the existing window (default)
   -a, --add      Same as -e (tab in the focused window)
   -r, --reuse    Same as -e (reuses the window, no new process)
+  --install-desktop    Add CrabMD to Spotlight / Start Menu / app grid
+  --uninstall-desktop  Remove the user-level desktop entry (not the brew cask)
   -h, --help     Show this help
 
 Themes (OpenCode JSON, default: from ~/.config/crabmd/config.toml or opencode):
@@ -500,7 +736,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::split_file_position;
+    use super::{path_from_open_url, split_file_position};
+    use std::path::PathBuf;
 
     #[test]
     fn zed_style_positions() {
@@ -524,6 +761,31 @@ mod tests {
         assert_eq!(
             split_file_position("notes.md:abc"),
             ("notes.md:abc".to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn file_urls_from_finder() {
+        assert_eq!(
+            path_from_open_url("file:///Users/me/notes.md"),
+            Some(PathBuf::from("/Users/me/notes.md"))
+        );
+        assert_eq!(
+            path_from_open_url("file://localhost/Users/me/notes.md"),
+            Some(PathBuf::from("/Users/me/notes.md"))
+        );
+        assert_eq!(
+            path_from_open_url("file:///Users/me/My%20Notes.md"),
+            Some(PathBuf::from("/Users/me/My Notes.md"))
+        );
+        assert_eq!(
+            path_from_open_url("/Users/me/notes.md"),
+            Some(PathBuf::from("/Users/me/notes.md"))
+        );
+        assert_eq!(path_from_open_url("notes.md"), None);
+        assert_eq!(
+            path_from_open_url("file:///C:/notes.md"),
+            Some(PathBuf::from("C:/notes.md"))
         );
     }
 }

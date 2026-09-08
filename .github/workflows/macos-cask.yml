@@ -1,0 +1,153 @@
+# Wrap cargo-dist macOS binaries in CrabMD.app, upload zips to the GitHub
+# release, and publish Casks/crabmd.rb to blankeos/homebrew-tap.
+#
+# cargo-dist still publishes the CLI formula. This is the Spotlight / Dock
+# path (same idea as tinycast's cask).
+
+name: macOS cask
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag (for example, v0.0.2)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: macos-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      sha_arm: ${{ steps.pack.outputs.sha_arm }}
+      sha_intel: ${{ steps.pack.outputs.sha_intel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          if [[ -z "$TAG" ]]; then
+            echo "No release tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download macOS binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for attempt in {1..60}; do
+            gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern 'crabmd-*-apple-darwin.tar.xz' \
+              --dir dist \
+              --clobber || true
+            if [[ -f dist/crabmd-aarch64-apple-darwin.tar.xz \
+               && -f dist/crabmd-x86_64-apple-darwin.tar.xz ]]; then
+              exit 0
+            fi
+            echo "waiting for macOS release assets (attempt $attempt)"
+            sleep 10
+          done
+          echo "timed out waiting for crabmd-*-apple-darwin.tar.xz" >&2
+          exit 1
+      - id: pack
+        name: Wrap CrabMD.app and upload zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          chmod +x scripts/macos-app.sh
+
+          wrap() {
+            local triple="$1"
+            local work="dist/work-${triple}"
+            rm -rf "$work" dist/CrabMD.app
+            mkdir -p "$work"
+            tar -xJf "dist/crabmd-${triple}.tar.xz" -C "$work"
+            local bin
+            bin="$(find "$work" -type f -name crabmd -print -quit)"
+            if [[ -z "$bin" ]]; then
+              echo "no crabmd binary in crabmd-${triple}.tar.xz" >&2
+              exit 1
+            fi
+            chmod +x "$bin"
+            ./scripts/macos-app.sh \
+              --bin "$bin" \
+              --version "$VERSION" \
+              --out "dist/CrabMD.app"
+            ditto -c -k --keepParent dist/CrabMD.app "dist/CrabMD-${triple}.zip"
+            rm -rf "$work" dist/CrabMD.app
+          }
+
+          wrap aarch64-apple-darwin
+          wrap x86_64-apple-darwin
+
+          echo "sha_arm=$(shasum -a 256 dist/CrabMD-aarch64-apple-darwin.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "sha_intel=$(shasum -a 256 dist/CrabMD-x86_64-apple-darwin.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+          gh release upload "$TAG" \
+            dist/CrabMD-aarch64-apple-darwin.zip \
+            dist/CrabMD-x86_64-apple-darwin.zip \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  publish-cask:
+    needs: package
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: crabmd
+      - uses: actions/checkout@v4
+        with:
+          repository: blankeos/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Write and push cask
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN missing; skipping tap publish"
+            exit 0
+          fi
+          chmod +x crabmd/scripts/write-cask.sh
+          mkdir -p homebrew-tap/Casks
+          crabmd/scripts/write-cask.sh \
+            --version "${{ needs.package.outputs.version }}" \
+            --sha-arm "${{ needs.package.outputs.sha_arm }}" \
+            --sha-intel "${{ needs.package.outputs.sha_intel }}" \
+            --out homebrew-tap/Casks/crabmd.rb
+          brew style --fix homebrew-tap/Casks/crabmd.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/crabmd.rb
+          if git diff --cached --quiet; then
+            echo "cask already up to date"
+            exit 0
+          fi
+          git commit -m "crabmd ${{ needs.package.outputs.version }} cask"
+          git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"
+          git push

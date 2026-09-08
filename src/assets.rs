@@ -35,6 +35,8 @@ pub fn path(name: &str) -> String {
 }
 
 pub const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
+#[cfg(target_os = "macos")]
+pub const APP_ICON_ICNS: &[u8] = include_bytes!("../assets/AppIcon.icns");
 
 /// Bundled text fonts (OFL): IBM Plex Sans (UI/prose) + JetBrains Mono
 /// (code). Registered via `cx.text_system().add_fonts` at startup so the
@@ -61,8 +63,7 @@ pub fn load_bundled_fonts(cx: &gpui::App) {
         &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf")[..],
         &include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-BoldItalic.ttf")[..],
     ];
-    let fonts: Vec<Cow<'static, [u8]>> =
-        fonts.into_iter().map(|b| Cow::Borrowed(b)).collect();
+    let fonts: Vec<Cow<'static, [u8]>> = fonts.into_iter().map(|b| Cow::Borrowed(b)).collect();
     if let Err(err) = cx.text_system().add_fonts(fonts) {
         eprintln!("crabmd: bundled fonts failed to load: {err:#}");
     }

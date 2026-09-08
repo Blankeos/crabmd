@@ -156,8 +156,7 @@ impl WorkspaceShell {
         });
         // Register for single-instance routing (`crabmd -r file` finds us).
         cx.update_global::<crate::ShellRegistry, _>(|reg, _| {
-            reg.shells
-                .push((shell.downgrade(), window.window_handle()));
+            reg.shells.push((shell.downgrade(), window.window_handle()));
         });
         // Single close guard per window (covers all tabs). Workspaces no
         // longer register their own hook, so exactly one prompt fires.
@@ -166,21 +165,6 @@ impl WorkspaceShell {
             closer.update(cx, |this, cx| this.request_window_close(window, cx))
         });
         shell
-    }
-
-    fn untitled_path() -> PathBuf {
-        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let first = base.join("untitled.md");
-        if !first.exists() {
-            return first;
-        }
-        for i in 1..100 {
-            let cand = base.join(format!("untitled-{i}.md"));
-            if !cand.exists() {
-                return cand;
-            }
-        }
-        first
     }
 
     /// Open `path` in a tab, or focus it (+ jump) if already open.
@@ -236,7 +220,12 @@ impl WorkspaceShell {
                 .to_string();
             if let Some(tab) = self.tabs.get(self.active).cloned() {
                 tab.update(cx, |ws, cx| {
-                    ws.show_toast(crate::toast::ToastKind::Error, format!("File not found: {label}"), window, cx)
+                    ws.show_toast(
+                        crate::toast::ToastKind::Error,
+                        format!("File not found: {label}"),
+                        window,
+                        cx,
+                    )
                 });
             }
             return;
@@ -322,13 +311,13 @@ impl WorkspaceShell {
     }
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_tab(Self::untitled_path(), String::new(), None, window, cx);
+        self.open_tab(untitled_path(), String::new(), None, window, cx);
     }
 
     fn new_window(&mut self, cx: &mut Context<Self>) {
         let palette = self.palette.clone();
         let config = self.config.clone();
-        crate::open_editor_window(Self::untitled_path(), String::new(), palette, config, None, cx);
+        crate::open_editor_window(untitled_path(), String::new(), palette, config, None, cx);
     }
 
     fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -471,12 +460,7 @@ impl WorkspaceShell {
 
     /// cmd-shift-w: close the current OS window. The should-close guard
     /// prompts first when any tab is dirty.
-    fn on_close_window(
-        &mut self,
-        _: &CloseWindow,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn on_close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {
         window.remove_window();
     }
 
@@ -559,7 +543,11 @@ impl WorkspaceShell {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(if active { p.markdown_text } else { p.text_muted })
+                            .text_color(if active {
+                                p.markdown_text
+                            } else {
+                                p.text_muted
+                            })
                             .child(title),
                     )
                     .when(dirty, |el| {
@@ -661,10 +649,7 @@ pub(crate) fn canonical_or_normalized(path: &Path) -> PathBuf {
 
 /// Same-file check that survives symlinks / `..` segments.
 pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
-    match (
-        std::fs::canonicalize(a),
-        std::fs::canonicalize(b),
-    ) {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
@@ -680,7 +665,10 @@ pub(crate) fn split_link_target(raw: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     // Strip `<...>` autolink brackets pulldown sometimes keeps.
-    let t = t.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(t);
+    let t = t
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(t);
     if t.is_empty() || t.contains(' ') || t.contains('\n') {
         return None;
     }
@@ -700,6 +688,40 @@ pub(crate) fn split_link_target(raw: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     Some((file.to_string(), anchor))
+}
+
+pub(crate) fn untitled_path() -> PathBuf {
+    untitled_path_in(&untitled_dir())
+}
+
+/// Directory for untitled buffers. Finder / Spotlight launches often have
+/// cwd `/` or `$HOME`; put those in Documents so we don't write `untitled.md`
+/// at the volume root.
+fn untitled_dir() -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    let home = crate::desktop::home_dir().ok();
+    let documents = home.as_ref().map(|h| h.join("Documents"));
+    match cwd {
+        Some(dir) if dir != Path::new("/") && home.as_ref() != Some(&dir) => dir,
+        _ => documents
+            .filter(|d| d.is_dir())
+            .or(home)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
+
+pub(crate) fn untitled_path_in(base: &Path) -> PathBuf {
+    let first = base.join("untitled.md");
+    if !first.exists() {
+        return first;
+    }
+    for i in 1..100 {
+        let cand = base.join(format!("untitled-{i}.md"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    first
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -752,5 +774,18 @@ mod tests {
     fn normalize_dot_segments() {
         let p = normalize_path(Path::new("/notes/./sub/../other.md"));
         assert_eq!(p, PathBuf::from("/notes/other.md"));
+    }
+
+    #[test]
+    fn untitled_path_picks_first_free() {
+        let dir = std::env::temp_dir().join(format!("crabmd-untitled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = untitled_path_in(&dir);
+        assert_eq!(first.file_name().unwrap(), "untitled.md");
+        std::fs::write(&first, "").unwrap();
+        let second = untitled_path_in(&dir);
+        assert_eq!(second.file_name().unwrap(), "untitled-1.md");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
