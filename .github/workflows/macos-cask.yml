@@ -111,21 +111,23 @@ jobs:
 
   publish-cask:
     needs: package
-    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    if: ${{ needs.package.result == 'success' }}
     runs-on: macos-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           path: crabmd
       - uses: actions/checkout@v4
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         with:
           repository: blankeos/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
       - name: Write and push cask
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         run: |
           set -euo pipefail
           if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
