@@ -17,16 +17,24 @@ use crate::assets::APP_ICON_PNG;
 const APP_NAME: &str = "CrabMD";
 const BUNDLE_ID: &str = "ai.blankeos.crabmd";
 
-/// Best-effort: skip cargo builds, never fail a GUI launch.
+/// Best-effort; never fail a GUI launch. macOS is a no-op (cask owns
+/// /Applications); Linux/Windows auto-install.
 pub fn ensure_installed() {
-    let Ok(exe) = current_exe() else {
-        return;
-    };
-    if is_dev_binary(&exe) {
+    #[cfg(target_os = "macos")]
+    {
         return;
     }
-    if let Err(err) = platform_install(&exe) {
-        eprintln!("crabmd: desktop app: {err:#}");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Ok(exe) = current_exe() else {
+            return;
+        };
+        if is_dev_binary(&exe) {
+            return;
+        }
+        if let Err(err) = platform_install(&exe) {
+            eprintln!("crabmd: desktop app: {err:#}");
+        }
     }
 }
 
@@ -167,15 +175,60 @@ fn platform_install(exe: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(home_app))
 }
 
-#[cfg(target_os = "macos")]
-fn exe_is_inside_app(exe: &Path) -> bool {
+/// True when `exe` is inside `*.app/Contents/MacOS/`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn exe_is_inside_app(exe: &Path) -> bool {
     exe.to_string_lossy().contains(".app/Contents/MacOS/")
 }
 
-#[cfg(target_os = "macos")]
-fn app_root_from_exe(exe: &Path) -> Option<PathBuf> {
-    // …/CrabMD.app/Contents/MacOS/crabmd
+/// `…/CrabMD.app/Contents/MacOS/crabmd` → `…/CrabMD.app`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn app_root_from_exe(exe: &Path) -> Option<PathBuf> {
     exe.parent()?.parent()?.parent().map(Path::to_path_buf)
+}
+
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn bundle_from_exe(exe: &Path) -> Option<PathBuf> {
+    if exe_is_inside_app(exe) {
+        app_root_from_exe(exe)
+    } else {
+        None
+    }
+}
+
+/// `Foo.app` with `Contents/Info.plist` (no plist parsing on fast path).
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn is_valid_app_bundle(bundle: &Path) -> bool {
+    bundle.extension().and_then(|e| e.to_str()) == Some("app")
+        && bundle.join("Contents/Info.plist").is_file()
+}
+
+/// First present candidate: exe bundle, then /Applications, then ~/Applications.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub(crate) fn pick_bundle_in_order(candidates: &[Option<PathBuf>]) -> Option<PathBuf> {
+    candidates.iter().filter_map(|c| c.clone()).next()
+}
+
+/// Bundle for `open` cold start: canonical exe bundle, /Applications, ~/Applications.
+#[cfg(target_os = "macos")]
+pub(crate) fn find_launch_app_bundle() -> Option<PathBuf> {
+    let exe_bundle = std::env::current_exe()
+        .ok()
+        .map(|p| fs::canonicalize(&p).unwrap_or(p))
+        .and_then(|exe| bundle_from_exe(&exe))
+        .filter(|b| is_valid_app_bundle(b));
+    let applications = PathBuf::from("/Applications").join(format!("{APP_NAME}.app"));
+    let applications = is_valid_app_bundle(&applications).then(|| applications);
+    let home_bundle = home_dir()
+        .ok()
+        .map(|h| h.join("Applications").join(format!("{APP_NAME}.app")))
+        .filter(|b| is_valid_app_bundle(b));
+    pick_bundle_in_order(&[exe_bundle, applications, home_bundle])
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn find_launch_app_bundle() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -500,5 +553,73 @@ mod tests {
         let body = linux_desktop(Path::new("/usr/bin/crabmd"));
         assert!(body.contains("Exec=/usr/bin/crabmd %F"));
         assert!(body.contains("StartupWMClass=ai.blankeos.crabmd"));
+    }
+
+    #[test]
+    fn exe_inside_app_detection() {
+        // Raw LS launch + resolved cask shim both count as inside-app.
+        assert!(exe_is_inside_app(Path::new(
+            "/Applications/CrabMD.app/Contents/MacOS/crabmd"
+        )));
+        assert!(exe_is_inside_app(Path::new(
+            "/Users/me/Applications/CrabMD.app/Contents/MacOS/crabmd"
+        )));
+        assert!(!exe_is_inside_app(Path::new("/opt/homebrew/bin/crabmd")));
+        assert!(!exe_is_inside_app(Path::new(
+            "/opt/homebrew/Cellar/crabmd/0.0.3/bin/crabmd"
+        )));
+        assert!(!exe_is_inside_app(Path::new("/usr/local/bin/crabmd")));
+    }
+
+    #[test]
+    fn bundle_root_from_exe() {
+        assert_eq!(
+            bundle_from_exe(Path::new("/Applications/CrabMD.app/Contents/MacOS/crabmd")),
+            Some(PathBuf::from("/Applications/CrabMD.app"))
+        );
+        assert_eq!(
+            app_root_from_exe(Path::new(
+                "/Users/me/Applications/CrabMD.app/Contents/MacOS/crabmd"
+            )),
+            Some(PathBuf::from("/Users/me/Applications/CrabMD.app"))
+        );
+        assert_eq!(bundle_from_exe(Path::new("/opt/homebrew/bin/crabmd")), None);
+    }
+
+    #[test]
+    fn bundle_priority_prefers_exe_identity() {
+        let exe = Some(PathBuf::from("/Applications/CrabMD.app"));
+        let sys = Some(PathBuf::from("/Applications/CrabMD.app"));
+        let home = Some(PathBuf::from("/Users/me/Applications/CrabMD.app"));
+        // Exe bundle wins even when system/home copies exist (same identity).
+        assert_eq!(
+            pick_bundle_in_order(&[exe.clone(), sys.clone(), home.clone()]),
+            exe
+        );
+        // No exe bundle → system before home.
+        assert_eq!(
+            pick_bundle_in_order(&[None, sys.clone(), home.clone()]),
+            sys
+        );
+        assert_eq!(pick_bundle_in_order(&[None, None, home.clone()]), home);
+        assert_eq!(pick_bundle_in_order(&[None, None, None]), None);
+    }
+
+    #[test]
+    fn valid_bundle_needs_info_plist() {
+        let dir = std::env::temp_dir().join(format!("crabmd-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("CrabMD.app");
+        let plist = bundle.join("Contents/Info.plist");
+        assert!(!is_valid_app_bundle(&bundle));
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"plist").unwrap();
+        assert!(is_valid_app_bundle(&bundle));
+        // Wrong extension never counts, even with a plist inside.
+        let not_app = dir.join("CrabMD");
+        std::fs::create_dir_all(not_app.join("Contents")).unwrap();
+        std::fs::write(not_app.join("Contents/Info.plist"), b"plist").unwrap();
+        assert!(!is_valid_app_bundle(&not_app));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,12 +7,18 @@ members = ["cargo:."]
 cargo-dist-version = "0.30.3"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["homebrew", "shell"]
-# Publish the Homebrew formula to blankeos/homebrew-tap
-tap = "blankeos/homebrew-tap"
-# Publish package-manager metadata after release assets are uploaded
-publish-jobs = ["homebrew"]
+# The installers to generate for each app.
+# macOS is distributed ONLY via the Homebrew cask (see
+# .github/workflows/macos-cask.yml + scripts/write-cask.sh), which wraps the
+# macOS cargo-dist archives in CrabMD.app. The cargo-dist "homebrew" formula
+# is intentionally disabled: it conflicts with the cask (same `crabmd` binary
+# name, two app identities) and confuses Spotlight/Dock/Open-With.
+# Linux uses the shell installer; `brew` formula distribution is retired.
+installers = ["shell"]
+# No cargo-dist tap publishing. The cask workflow is the sole writer to
+# blankeos/homebrew-tap (Casks/crabmd.rb) and also removes the legacy
+# Formula/crabmd.rb. Keeping `tap`/`publish-jobs` here would regenerate a
+# `publish-homebrew-formula` job in release.yml — do not re-add.
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
     "aarch64-apple-darwin",

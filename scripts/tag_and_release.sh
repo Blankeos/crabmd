@@ -63,13 +63,9 @@ echo "🦋 Updating Cargo.toml to version ${NEW}"
 sed -i.bak "s/^version *= *\"[^\"]*\"/version = \"${NEW}\"/" Cargo.toml
 rm Cargo.toml.bak
 
-if [ -f "npm/package.json" ]; then
-    echo "🦋 Updating npm/package.json to version ${NEW}"
-    sed -i.bak \
-        "s/\"version\":[[:space:]]*\"[^\"]*\"/\"version\": \"${NEW}\"/" \
-        npm/package.json
-    rm npm/package.json.bak
-fi
+# npm is retired (no new publishes): npm/package.json stays frozen at its
+# last published version. Do NOT bump it here; the retired
+# publish-registries workflow no longer checks version parity.
 
 echo "🦋 Updating Cargo.lock..."
 # NOTE: `cargo generate-lockfile` re-resolves EVERYTHING to latest,
@@ -83,9 +79,6 @@ git cliff --offline --tag "v${NEW}" -o CHANGELOG.md
 
 echo "🦋 Committing version bump ${NEW}..."
 git add Cargo.toml Cargo.lock CHANGELOG.md
-if [ -f "npm/package.json" ]; then
-    git add npm/package.json
-fi
 git commit -m "release: ${NAME} v${NEW}"
 
 echo "🦋 Creating git tag v${NEW}"

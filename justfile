@@ -38,8 +38,14 @@ macos-app:
         --out target/release/CrabMD.app
     echo "→ target/release/CrabMD.app"
 
+# npm is retired: npm/README.md is a standalone deprecation notice.
+# Do NOT overwrite it from the main README (would erase the banner).
+# Kept as a no-op with a warning so old muscle memory fails loudly.
 sync_readme:
-    cp README.md npm/README.md
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "sync_readme is retired: npm/README.md is a standalone deprecation notice, not a copy of README.md" >&2
+    exit 1
 
 [doc('Release: bump versions, commit, and tag from main (just tag [patch|minor|major])')]
 tag bump="":

@@ -12,23 +12,80 @@ If `path.md` does not exist, crabmd creates an empty markdown file and opens it.
 
 ## Install
 
-## Install
+### macOS (supported)
 
 ```sh
 brew install --cask blankeos/tap/crabmd
-npm install -g crabmd
-bun install -g crabmd
-cargo install --git https://github.com/Blankeos/crabmd --locked
+```
+
+The cask is the only supported macOS distribution. It ships
+`/Applications/CrabMD.app` plus a `crabmd` CLI shim, so Spotlight, Dock,
+and Open With work immediately after install (quarantine is stripped on
+install; no manual `xattr` needed).
+
+### Linux
+
+```sh
 curl --proto "=https" --tlsv1.2 -LsSf https://github.com/Blankeos/crabmd/releases/latest/download/crabmd-installer.sh | sh
 ```
 
-Every install gives you both `crabmd` on PATH and the registered app
-(Spotlight, Dock, Open With). The cask ships `/Applications/CrabMD.app`;
-other installs register a user-level app on first launch
-(`~/Applications/CrabMD.app` on macOS, a `.desktop` entry on Linux).
-`crabmd --install-desktop` does that without opening a window. Bun skips
-npm `postinstall`; the first `crabmd` command downloads the binary and
-registers the app.
+Registers a `.desktop` entry on first launch
+(`crabmd --install-desktop` does that without opening a window).
+
+### From source (any OS)
+
+```sh
+cargo install --git https://github.com/Blankeos/crabmd --locked
+```
+
+On macOS this gives you the CLI only; the app bundle still comes from the
+cask above.
+
+The Homebrew formula (`brew install blankeos/tap/crabmd` without `--cask`)
+and the npm package (`npm install -g crabmd` / `bun install -g crabmd`) are
+retired on macOS: they ship the same `crabmd` binary without the managed app
+bundle and fork app identity (two Dock icons, Spotlight reopen doing
+nothing). Do not use them on macOS.
+
+### Migrate to the cask (formula / npm)
+
+Settings in `~/.config/crabmd` are retained. Order matters: remove the
+legacy user app BEFORE removing the old binary, otherwise the old binary is
+gone and cannot clean up after itself.
+
+```sh
+crabmd --uninstall-desktop   # remove ~/Applications/CrabMD.app first
+brew uninstall crabmd        # only if you had the formula
+npm uninstall -g crabmd      # only if you had npm (bun: bun uninstall -g crabmd)
+brew install --cask blankeos/tap/crabmd
+```
+
+The cask installer also migrates automatically: if
+`~/Applications/CrabMD.app` is provably a legacy copy (bundle identifier
+`ai.blankeos.crabmd` plus the legacy `Contents/Resources/origin` marker, and
+not the managed `/Applications` copy), it is removed. A manually copied app
+without the marker, or an unrelated app that happens to share the filename,
+is left alone. If Spotlight still shows two CrabMD apps, verify before
+deleting:
+
+```sh
+ls ~/Applications/CrabMD.app ~/Applications/CrabMD.app/Contents/Resources/origin
+/usr/bin/defaults read ~/Applications/CrabMD.app/Contents/Info CFBundleIdentifier
+```
+
+Only remove `~/Applications/CrabMD.app` when the identifier reads
+`ai.blankeos.crabmd` and you recognise it as the old install.
+
+### Uninstall
+
+```sh
+brew uninstall --cask crabmd
+```
+
+Removes the managed `/Applications/CrabMD.app` and the `crabmd` CLI shim.
+Settings are kept; add `--zap` to discard `~/.config/crabmd` as well. The
+app no longer recreates `~/Applications/CrabMD.app` on launch, so there is
+no ghost copy after uninstall.
 
 ## What it is
 

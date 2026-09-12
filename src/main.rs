@@ -26,13 +26,15 @@ mod undo;
 mod video;
 mod wysiwyg;
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use gpui::{
     point, px, size, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Entity, Global,
-    QuitMode, Styled as _, TitlebarOptions, WeakEntity, WindowBounds, WindowOptions,
+    QuitMode, Styled as _, TitlebarOptions, WeakEntity, WindowBounds, WindowId, WindowOptions,
 };
 use gpui_component::{ActiveTheme as _, Root};
 
@@ -74,13 +76,10 @@ fn run() -> Result<()> {
         println!("removed desktop app");
         return Ok(());
     }
-    // Spotlight / Dock / Finder: stay in this process (don't detach).
-    // Terminal `crabmd file.md` still returns immediately unless `-w`.
+    // LS launches stay attached; terminal calls detach unless `-w`.
     let wait = args.wait || stay_attached();
     if !wait {
-        // Fast path: a live daemon opens a tab (~ms) and we exit. No file
-        // I/O here so the shell returns immediately. Otherwise spawn the
-        // daemon (detached child) which owns the socket from here on.
+        // Live daemon: forward and exit. Otherwise cold-start the daemon.
         let forward = args
             .path
             .as_deref()
@@ -90,10 +89,15 @@ fn run() -> Result<()> {
         if daemon::try_forward(&forward, args.line, args.col, args.behavior.as_str()) {
             return Ok(());
         }
+        #[cfg(target_os = "macos")]
+        if cold_start_via_open(&args, &forward) {
+            return Ok(());
+        }
         detach_and_reexec()?;
         return Ok(());
     }
-    // Copy + codesign belongs in the GUI process, not the CLI parent.
+    // macOS: cask owns /Applications; Linux/Windows auto-install.
+    #[cfg(not(target_os = "macos"))]
     desktop::ensure_installed();
     let mut config = config::load();
     let palette = if args.theme_from_cli {
@@ -108,18 +112,22 @@ fn run() -> Result<()> {
         config.theme = palette.name.clone();
     }
     let (path, source, initial) = load_open_target(args.path.clone(), args.line, args.col)?;
-    // Finder "Open With" may arrive via Apple Events after launch, not argv.
     let delay_untitled = args.path.is_none() && stay_attached();
     launch(path, source, palette, config, initial, delay_untitled);
     Ok(())
 }
 
-/// True when LaunchServices started this `.app` (Spotlight, Dock, Finder).
-/// The same binary on PATH from a cask still detaches in a real terminal.
+/// True when started from inside `*.app/Contents/MacOS` (LS launch or a
+/// resolved cask shim). Terminal launches still detach via `stay_attached`.
 fn launched_from_app_bundle() -> bool {
-    std::env::current_exe()
-        .ok()
-        .is_some_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    if desktop::exe_is_inside_app(&exe) {
+        return true;
+    }
+    let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
+    desktop::exe_is_inside_app(&canonical)
 }
 
 fn stay_attached() -> bool {
@@ -190,6 +198,142 @@ fn detach_and_reexec() -> Result<()> {
     Ok(())
 }
 
+/// `path[:line[:col]]` for `--args`. Caller must absolutize: an
+/// `open`-launched app starts with cwd `/`.
+pub(crate) fn format_open_file_arg(path: &Path, line: Option<usize>, col: Option<usize>) -> String {
+    let mut s = path.to_string_lossy().into_owned();
+    if let Some(line) = line {
+        s.push_str(&format!(":{line}"));
+        if let Some(col) = col {
+            s.push_str(&format!(":{col}"));
+        }
+    }
+    s
+}
+
+/// CLI argv for `open … --args` (abs path, behavior, theme, wait).
+pub(crate) fn build_bundle_open_argv(args: &Args) -> Vec<OsString> {
+    let mut out: Vec<OsString> = Vec::new();
+    match args.behavior {
+        OpenBehavior::New => out.push("-n".into()),
+        OpenBehavior::Existing => out.push("-e".into()),
+        OpenBehavior::Add => out.push("-a".into()),
+        OpenBehavior::Reuse => out.push("-r".into()),
+    }
+    if args.theme_from_cli {
+        out.push("--theme".into());
+        out.push(args.theme.clone().into());
+    }
+    if args.wait {
+        out.push("-w".into());
+    }
+    if let Some(path) = args.path.as_deref() {
+        let abs = absolutize(path);
+        out.push(format_open_file_arg(&abs, args.line, args.col).into());
+    }
+    out
+}
+
+/// Low-level `open <bundle> --args …`. No running-app check; prefer
+/// `cold_start_via_open`, which avoids ignored `--args` and drops.
+fn launch_bundle_via_open(bundle: &Path, args: &Args) -> bool {
+    let argv = build_bundle_open_argv(args);
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    cmd.arg(bundle).arg("--args").args(&argv);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// macOS cold start with delivery guarantees.
+///
+/// `open --args` is ignored when the app is already running, so a running
+/// but not-yet-listening app must be reached via the socket (wait + forward),
+/// not via `open`. Simultaneous starters elect one winner with the
+/// coldstart lock; losers wait-forward instead of issuing a second `open`
+/// whose `--args` would be dropped. The winner's `--args` is the single
+/// delivery (no duplicate forward); Finder events still arrive via
+/// `on_open_urls` and are drained in `launch`.
+#[cfg(target_os = "macos")]
+fn cold_start_via_open(args: &Args, forward: &str) -> bool {
+    use std::time::Duration;
+    const WAIT: Duration = Duration::from_secs(8);
+    let Some(bundle) = desktop::find_launch_app_bundle() else {
+        return false;
+    };
+    let lock_path = daemon::coldstart_lock_path();
+    if is_app_process_running() || lock_path.exists() {
+        if daemon::wait_and_forward(forward, args.line, args.col, args.behavior.as_str(), WAIT) {
+            return true;
+        }
+        if lock_path.exists() && !daemon::coldstart_lock_is_stale(Duration::from_secs(30)) && is_app_process_running() {
+            // Launching app never listened; detach fallback below opens the
+            // file in a new process rather than dropping it.
+            return false;
+        }
+        if lock_path.exists() && daemon::coldstart_lock_is_stale(Duration::from_secs(30)) {
+            daemon::clear_coldstart_lock();
+        } else if is_app_process_running() {
+            return false;
+        }
+    }
+    if !daemon::try_acquire_coldstart_lock() {
+        // Lost the election; the winner's daemon will listen shortly.
+        return daemon::wait_and_forward(forward, args.line, args.col, args.behavior.as_str(), WAIT);
+    }
+    if launch_bundle_via_open(&bundle, args) {
+        return true;
+    }
+    daemon::clear_coldstart_lock();
+    false
+}
+
+/// Best-effort: is another `crabmd` process alive (excluding self)?
+/// Used only to avoid `open --args` when it would be ignored.
+#[cfg(target_os = "macos")]
+fn is_app_process_running() -> bool {
+    let self_pid = std::process::id().to_string();
+    if let Ok(out) = std::process::Command::new("pgrep").args(["-x", "crabmd"]).output() {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if line.trim() != self_pid && !line.trim().is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    let Ok(out) = std::process::Command::new("ps").args(["-ax", "-o", "pid=,comm="]).output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pid), Some(comm)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        if comm.contains("crabmd") || comm.contains("CrabMD") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Test hook: pure decision for the cold-start path.
+#[cfg(test)]
+pub(crate) fn cold_start_decision(app_running: bool, lock_exists: bool) -> &'static str {
+    if app_running || lock_exists {
+        "wait-forward"
+    } else {
+        "elect-starter"
+    }
+}
+
 fn ensure_file(path: &std::path::Path) -> Result<()> {
     if path.exists() {
         anyhow::ensure!(path.is_file(), "{} is not a file", path.display());
@@ -244,30 +388,34 @@ fn launch(
         if !settled_reopen.get() {
             return;
         }
-        let empty = cx.update_global::<ShellRegistry, _>(|reg, _| {
-            reg.shells.retain(|(w, _)| w.upgrade().is_some());
-            reg.shells.is_empty()
-        });
-        if empty {
-            let config = config::load();
-            let Ok(palette) = theme::load_named(&config.theme)
-                .or_else(|_| theme::load_named(theme::DEFAULT_THEME))
-            else {
-                return;
-            };
-            open_editor_window(
-                crate::tabs::untitled_path(),
-                String::new(),
-                palette,
-                config,
-                None,
-                cx,
-            );
+        // Dock/Spotlight with no windows opens untitled; otherwise focus.
+        // Liveness needs weak + window-handle (weak can outlive the window).
+        // Verified: GPUI `activate_window` uses `makeKeyAndOrderFront:`,
+        // which deminiaturizes, so it restores minimized windows.
+        let live = live_shells(cx);
+        if live.is_empty() {
+            open_untitled_window(cx);
         } else {
-            if let Some(handle) = cx.active_window() {
-                let _ = handle.update(cx, |_, window, _| window.activate_window());
+            let ordered: Vec<WindowId> = live.iter().map(|(_, h)| h.window_id()).collect();
+            let active = cx.active_window().map(|h| h.window_id());
+            let target_id = pick_live_target(active, &ordered);
+            let target = target_id
+                .and_then(|id| live.iter().find(|(_, h)| h.window_id() == id))
+                .map(|(_, h)| *h)
+                .or_else(|| live.first().map(|(_, h)| *h));
+            if let Some(handle) = target {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_err()
+                {
+                    prune_shell_registry(cx);
+                    open_untitled_window(cx);
+                } else {
+                    cx.activate(true);
+                }
+            } else {
+                cx.activate(true);
             }
-            cx.activate(true);
         }
     });
 
@@ -288,9 +436,15 @@ fn launch(
         crate::editor::apply_palette(&palette, cx);
 
         cx.set_global(ShellRegistry { shells: Vec::new() });
-        // Single-instance socket. `--wait` skips listening (blocking
-        // one-shot); a lost race just opens without registering.
+        // Eagerly drop closed windows so a fast Spotlight reopen never
+        // observes a stale handle between `remove_window()` and the next
+        // prune-on-access.
+        let _closed_sub = cx.on_window_closed(|cx, _| prune_shell_registry(cx));
+        std::mem::forget(_closed_sub);
+        // Single-instance socket. A lost bind race just opens without
+        // registering; only the owner (Some) may delete the socket on quit.
         let ipc_rx = daemon::start_listener();
+        let ipc_owned = ipc_rx.is_some();
         if delay_untitled {
             let palette = palette.clone();
             let config = config.clone();
@@ -335,9 +489,15 @@ fn launch(
             })
             .detach();
         }
-        // cmd-q cleanup; a crash leaves a stale file, which the next
-        // launch detects (connect fails) and replaces.
-        let _quit_sub = cx.on_app_quit(|_| async { daemon::cleanup() });
+        // cmd-q cleanup by the socket owner only. Secondaries (`None`,
+        // e.g. `--wait` one-shots that lost the race) must never delete
+        // the live daemon's file. A crash leaves a stale file, which the
+        // next launch detects (connect fails) and replaces.
+        let _quit_sub = cx.on_app_quit(move |_| async move {
+            if ipc_owned {
+                daemon::cleanup();
+            }
+        });
         std::mem::forget(_quit_sub);
     });
 }
@@ -364,12 +524,73 @@ fn open_urls(cx: &mut App, urls: Vec<String>) {
     }
 }
 
-/// Live shells + their windows for single-instance routing.
+/// Live shells + windows for single-instance routing.
 pub(crate) struct ShellRegistry {
     pub(crate) shells: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)>,
 }
 
 impl Global for ShellRegistry {}
+
+/// Live when the weak upgrades AND the window id is in `cx.windows()`.
+pub(crate) fn is_shell_entry_live(
+    weak_alive: bool,
+    id: WindowId,
+    live_ids: &HashSet<WindowId>,
+) -> bool {
+    weak_alive && live_ids.contains(&id)
+}
+
+/// Prefer the active window when live, else the first live window.
+/// Minimized apps report `active_window() == None` but still have a live
+/// window to `activate_window()` + `activate(true)`.
+pub(crate) fn pick_live_target(
+    active: Option<WindowId>,
+    ordered_live: &[WindowId],
+) -> Option<WindowId> {
+    if let Some(active) = active {
+        if ordered_live.contains(&active) {
+            return Some(active);
+        }
+    }
+    ordered_live.first().copied()
+}
+
+fn prune_shell_registry(cx: &mut App) {
+    cx.update_global::<ShellRegistry, _>(|reg, cx| {
+        let live: HashSet<WindowId> = cx.windows().iter().map(|w| w.window_id()).collect();
+        reg.shells
+            .retain(|(w, h)| is_shell_entry_live(w.upgrade().is_some(), h.window_id(), &live));
+    });
+}
+
+fn live_shells(cx: &mut App) -> Vec<(Entity<WorkspaceShell>, AnyWindowHandle)> {
+    cx.update_global::<ShellRegistry, _>(|reg, cx| {
+        let live: HashSet<WindowId> = cx.windows().iter().map(|w| w.window_id()).collect();
+        reg.shells
+            .retain(|(w, h)| is_shell_entry_live(w.upgrade().is_some(), h.window_id(), &live));
+        reg.shells
+            .iter()
+            .filter_map(|(w, h)| w.upgrade().map(|s| (s, *h)))
+            .collect()
+    })
+}
+
+fn open_untitled_window(cx: &mut App) {
+    let config = config::load();
+    let Ok(palette) =
+        theme::load_named(&config.theme).or_else(|_| theme::load_named(theme::DEFAULT_THEME))
+    else {
+        return;
+    };
+    open_editor_window(
+        crate::tabs::untitled_path(),
+        String::new(),
+        palette,
+        config,
+        None,
+        cx,
+    );
+}
 
 /// Route one forwarded `crabmd <file:line:col>` into this process.
 fn handle_open(cx: &mut App, req: daemon::OpenRequest) {
@@ -390,27 +611,38 @@ fn handle_open(cx: &mut App, req: daemon::OpenRequest) {
         };
         (path, source, initial)
     };
-    let live: Vec<(WeakEntity<WorkspaceShell>, AnyWindowHandle)> = cx
-        .update_global::<ShellRegistry, _>(|reg, _| {
-            reg.shells.retain(|(w, _)| w.upgrade().is_some());
-            reg.shells.clone()
-        });
-    let target: Option<(Entity<WorkspaceShell>, AnyWindowHandle)> = cx
-        .active_window()
-        .and_then(|a| live.iter().find(|(_, h)| h.window_id() == a.window_id()))
-        .or_else(|| live.first())
-        .and_then(|(w, h)| w.upgrade().map(|s| (s, *h)));
+    let live = live_shells(cx);
+    let ordered: Vec<WindowId> = live.iter().map(|(_, h)| h.window_id()).collect();
+    let active = cx.active_window().map(|h| h.window_id());
+    let target: Option<(Entity<WorkspaceShell>, AnyWindowHandle)> =
+        pick_live_target(active, &ordered)
+            .and_then(|id| live.iter().find(|(_, h)| h.window_id() == id))
+            .map(|(w, h)| (w.clone(), *h));
     match target {
         Some((shell, handle)) if req.behavior != "new" => {
-            let _ = handle.update(cx, |_, window, cx| {
-                shell.update(cx, |s, cx| {
-                    s.open_tab(path, source, initial, window, cx);
-                });
-                window.activate_window();
-            });
-            cx.activate(true);
+            let opened = handle
+                .update(cx, |_, window, cx| {
+                    shell.update(cx, |s, cx| {
+                        s.open_tab(path.clone(), source.clone(), initial, window, cx);
+                    });
+                    window.activate_window();
+                })
+                .is_ok();
+            if opened {
+                cx.activate(true);
+            } else {
+                prune_shell_registry(cx);
+                let config = config::load();
+                let palette = match theme::load_named(&config.theme) {
+                    Ok(p) => p,
+                    Err(_) => match theme::load_named(theme::DEFAULT_THEME) {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    },
+                };
+                open_editor_window(path, source, palette, config, initial, cx);
+            }
         }
-        // `-n`, or no live window: new window, same process (no re-exec).
         _ => {
             let config = config::load();
             let palette = match theme::load_named(&config.theme) {
@@ -736,8 +968,13 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_from_open_url, split_file_position};
-    use std::path::PathBuf;
+    use super::{
+        build_bundle_open_argv, cold_start_decision, format_open_file_arg, is_shell_entry_live,
+        path_from_open_url, pick_live_target, split_file_position, Args, OpenBehavior,
+    };
+    use gpui::WindowId;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn zed_style_positions() {
@@ -753,7 +990,6 @@ mod tests {
             split_file_position("notes.md"),
             ("notes.md".to_string(), None, None)
         );
-        // Colons inside the path survive; only trailing numbers split off.
         assert_eq!(
             split_file_position("a:b.md:4"),
             ("a:b.md".to_string(), Some(4), None)
@@ -787,5 +1023,121 @@ mod tests {
             path_from_open_url("file:///C:/notes.md"),
             Some(PathBuf::from("C:/notes.md"))
         );
+    }
+
+    fn wid(n: u64) -> WindowId {
+        WindowId::from(n)
+    }
+
+    #[test]
+    fn shell_liveness_needs_weak_and_window() {
+        let live: HashSet<WindowId> = [wid(1), wid(2)].into_iter().collect();
+        assert!(is_shell_entry_live(true, wid(1), &live));
+        assert!(!is_shell_entry_live(true, wid(9), &live));
+        assert!(!is_shell_entry_live(false, wid(1), &live));
+        assert!(!is_shell_entry_live(false, wid(9), &live));
+        let empty: HashSet<WindowId> = HashSet::new();
+        assert!(!is_shell_entry_live(true, wid(1), &empty));
+    }
+
+    #[test]
+    fn reopen_target_prefers_active_else_first() {
+        assert_eq!(
+            pick_live_target(Some(wid(2)), &[wid(1), wid(2), wid(3)]),
+            Some(wid(2))
+        );
+        assert_eq!(pick_live_target(None, &[wid(7), wid(8)]), Some(wid(7)));
+        assert_eq!(
+            pick_live_target(Some(wid(99)), &[wid(1), wid(2)]),
+            Some(wid(1))
+        );
+        assert_eq!(pick_live_target(None, &[]), None);
+        assert_eq!(pick_live_target(Some(wid(1)), &[]), None);
+    }
+
+    #[test]
+    fn open_file_arg_formats_positions() {
+        assert_eq!(
+            format_open_file_arg(Path::new("/tmp/notes.md"), None, None),
+            "/tmp/notes.md"
+        );
+        assert_eq!(
+            format_open_file_arg(Path::new("/tmp/notes.md"), Some(10), None),
+            "/tmp/notes.md:10"
+        );
+        assert_eq!(
+            format_open_file_arg(Path::new("/tmp/notes.md"), Some(10), Some(3)),
+            "/tmp/notes.md:10:3"
+        );
+        let arg = format_open_file_arg(Path::new("/tmp/a b.md"), Some(4), Some(2));
+        assert_eq!(
+            split_file_position(&arg),
+            ("/tmp/a b.md".to_string(), Some(4), Some(2))
+        );
+    }
+
+    fn test_args(
+        path: Option<&str>,
+        line: Option<usize>,
+        col: Option<usize>,
+        behavior: OpenBehavior,
+        theme: Option<&str>,
+    ) -> Args {
+        Args {
+            help: false,
+            list_themes: false,
+            install_desktop: false,
+            uninstall_desktop: false,
+            theme: theme.unwrap_or("opencode").to_string(),
+            theme_from_cli: theme.is_some(),
+            wait: false,
+            behavior,
+            path: path.map(PathBuf::from),
+            line,
+            col,
+        }
+    }
+
+    #[test]
+    fn bundle_open_argv_preserves_cli_semantics() {
+        let argv = build_bundle_open_argv(&test_args(None, None, None, OpenBehavior::New, None));
+        assert!(argv.iter().any(|a| a == "-n"));
+        assert!(!argv.iter().any(|a| a.to_string_lossy().contains(".md")));
+        let argv = build_bundle_open_argv(&test_args(
+            Some("rel/notes.md"),
+            Some(10),
+            Some(3),
+            OpenBehavior::Existing,
+            Some("grokday"),
+        ));
+        let joined: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(joined.contains(&"-e".to_string()));
+        assert!(joined.contains(&"--theme".to_string()));
+        assert!(joined.contains(&"grokday".to_string()));
+        let file = joined.iter().find(|a| a.contains("notes.md")).unwrap();
+        assert!(file.ends_with(":10:3"), "file carries line:col: {file}");
+        assert!(
+            Path::new(file.trim_end_matches(":10:3")).is_absolute(),
+            "CLI paths must be absolutized: {file}"
+        );
+        let new_argv =
+            build_bundle_open_argv(&test_args(None, None, None, OpenBehavior::New, None));
+        let existing_argv =
+            build_bundle_open_argv(&test_args(None, None, None, OpenBehavior::Existing, None));
+        assert!(new_argv.iter().any(|a| a == "-n"));
+        assert!(existing_argv.iter().any(|a| a == "-e"));
+    }
+
+    #[test]
+    fn cold_start_routes_wait_vs_elect() {
+        // Running app or held lock: wait-forward (open --args would be ignored).
+        assert_eq!(cold_start_decision(true, false), "wait-forward");
+        assert_eq!(cold_start_decision(false, true), "wait-forward");
+        assert_eq!(cold_start_decision(true, true), "wait-forward");
+        // No app, no lock: single elected starter uses open --args once.
+        assert_eq!(cold_start_decision(false, false), "elect-starter");
     }
 }

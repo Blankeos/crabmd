@@ -1,26 +1,55 @@
 # Wrap cargo-dist macOS binaries in CrabMD.app, upload zips to the GitHub
 # release, and publish Casks/crabmd.rb to blankeos/homebrew-tap.
 #
-# cargo-dist still publishes the CLI formula. This is the Spotlight / Dock
-# path (same idea as tinycast's cask).
+# macOS distribution is cask-only. cargo-dist builds the raw CLI archives
+# (`crabmd-*-apple-darwin.tar.xz`); this workflow wraps each arch in a
+# signed CrabMD.app bundle (same CFBundleIdentifier `ai.blankeos.crabmd`,
+# same file associations) and publishes the cask. It is the SOLE writer to
+# blankeos/homebrew-tap for crabmd, and it deletes the retired
+# Formula/crabmd.rb so `brew install blankeos/tap/crabmd` (formula) stops
+# shadowing the cask. See README "Install" + "Migrate to the cask".
+#
+# Trigger notes:
+# - `release: published` covers manually published releases.
+# - `workflow_run: Release/completed` covers cargo-dist releases created with
+#   GITHUB_TOKEN (`gh release create` does NOT trigger `release` events).
+# - `workflow_dispatch` allows backfills for an existing tag.
+#
+# Race notes: release.yml no longer publishes any formula, so this is the
+# only tap writer. publish-cask still uses a global concurrency group plus a
+# pull --rebase retry loop so concurrent tags serialize instead of failing.
 
 name: macOS cask
+
 on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing GitHub release tag (for example, v0.0.2)
+        description: Existing GitHub release tag (for example, v0.0.3)
         required: true
         type: string
 
 permissions:
   contents: write
 
+# Same-tag runs (release + workflow_run double-fire) share a group so only
+# one proceeds per tag. Cross-tag tap pushes serialize via the
+# crabmd-homebrew-tap-publish job group below.
+concurrency:
+  group: macos-cask-${{ github.event.release.tag_name || inputs.tag || github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   package:
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    # workflow_run: only stable version tags (skip PR branches and prereleases;
+    # Release also runs on pull_request for plan checks). release: skip
+    # prereleases. dispatch: manual backfill (meta still validates the tag).
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && !github.event.release.prerelease) || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '-')) }}
     runs-on: macos-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -35,15 +64,54 @@ jobs:
         env:
           EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           TAG="${EVENT_TAG:-$INPUT_TAG}"
+          if [[ -z "$TAG" && -n "${RUN_BRANCH:-}" ]]; then
+            TAG="$RUN_BRANCH"
+          fi
+          if [[ "$TAG" != v* && -n "${RUN_SHA:-}" ]]; then
+            # head_branch can be a branch name for some Release events; the
+            # tag push SHA still points at the version tag.
+            git fetch --tags origin --depth 1 >/dev/null 2>&1 || true
+            RESOLVED="$(git tag --points-at "$RUN_SHA" | grep '^v' | head -n 1 || true)"
+            if [[ -n "$RESOLVED" ]]; then TAG="$RESOLVED"; fi
+          fi
           if [[ -z "$TAG" ]]; then
-            echo "No release tag" >&2
+            echo "No release tag (expected release tag, inputs.tag, or Release head_branch)" >&2
+            exit 1
+          fi
+          if [[ "$TAG" != v* ]]; then
+            echo "Expected a release tag like v0.0.3, got: $TAG" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Tag $TAG is not SemVer; refusing to publish cask" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Tag $TAG is a prerelease; cask publishes stable releases only" >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved $TAG (version $VERSION)"
+      - name: Verify tag version matches Cargo.toml
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$TAG" --depth 1
+          CARGO_VERSION="$(git show "$TAG:Cargo.toml" | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -n 1)"
+          if [[ "$CARGO_VERSION" != "$VERSION" ]]; then
+            echo "Version mismatch: tag=$VERSION Cargo.toml@$TAG=$CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "Cargo.toml@$TAG version $CARGO_VERSION matches"
       - name: Download macOS binaries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for attempt in {1..60}; do
+          for attempt in $(seq 1 60); do
             gh release download "$TAG" \
               --repo "${{ github.repository }}" \
               --pattern 'crabmd-*-apple-darwin.tar.xz' \
@@ -59,12 +127,15 @@ jobs:
               --clobber || true
             if [[ -f dist/crabmd-aarch64-apple-darwin.tar.xz \
                && -f dist/crabmd-x86_64-apple-darwin.tar.xz ]]; then
+              echo "macOS archives present"
+              ls -lh dist/
               exit 0
             fi
-            echo "waiting for macOS release assets (attempt $attempt)"
+            echo "waiting for macOS release assets (attempt $attempt/60)"
             sleep 10
           done
-          echo "timed out waiting for crabmd-*-apple-darwin.tar.xz" >&2
+          echo "timed out waiting for crabmd-*-apple-darwin.tar.xz on $TAG" >&2
+          echo "The Release workflow must finish first; re-run this workflow after artifacts exist." >&2
           exit 1
       - id: pack
         name: Wrap CrabMD.app and upload zips
@@ -93,6 +164,21 @@ jobs:
               --bin "$bin" \
               --version "$VERSION" \
               --out "dist/CrabMD.app"
+            # Sanity: cask bundles must carry the stable identity and must NOT
+            # carry the legacy `origin` marker (that marker identifies
+            # formula/npm self-installed ~/Applications copies).
+            if [[ ! -f "dist/CrabMD.app/Contents/Info.plist" ]]; then
+              echo "bundle missing Info.plist" >&2
+              exit 1
+            fi
+            if ! grep -q "ai.blankeos.crabmd" "dist/CrabMD.app/Contents/Info.plist"; then
+              echo "bundle identifier mismatch" >&2
+              exit 1
+            fi
+            if [[ -e "dist/CrabMD.app/Contents/Resources/origin" ]]; then
+              echo "cask bundle must not contain Contents/Resources/origin (legacy marker)" >&2
+              exit 1
+            fi
             ditto -c -k --keepParent dist/CrabMD.app "dist/CrabMD-${triple}.zip"
             rm -rf "$work" dist/CrabMD.app
           }
@@ -113,6 +199,10 @@ jobs:
     needs: package
     if: ${{ needs.package.result == 'success' }}
     runs-on: macos-latest
+    # Only one tap push at a time across concurrent cask runs.
+    concurrency:
+      group: crabmd-homebrew-tap-publish
+      cancel-in-progress: false
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
@@ -120,14 +210,19 @@ jobs:
         with:
           persist-credentials: false
           path: crabmd
+          ref: ${{ needs.package.outputs.tag }}
       - uses: actions/checkout@v4
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         with:
           repository: blankeos/homebrew-tap
           token: ${{ env.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
-      - name: Write and push cask
+      - name: Write cask and retire legacy formula, then push tap
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+          SHA_ARM: ${{ needs.package.outputs.sha_arm }}
+          SHA_INTEL: ${{ needs.package.outputs.sha_intel }}
         run: |
           set -euo pipefail
           if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
@@ -137,19 +232,48 @@ jobs:
           chmod +x crabmd/scripts/write-cask.sh
           mkdir -p homebrew-tap/Casks
           crabmd/scripts/write-cask.sh \
-            --version "${{ needs.package.outputs.version }}" \
-            --sha-arm "${{ needs.package.outputs.sha_arm }}" \
-            --sha-intel "${{ needs.package.outputs.sha_intel }}" \
+            --version "$VERSION" \
+            --sha-arm "$SHA_ARM" \
+            --sha-intel "$SHA_INTEL" \
             --out homebrew-tap/Casks/crabmd.rb
-          brew style --fix homebrew-tap/Casks/crabmd.rb
+          ruby -c homebrew-tap/Casks/crabmd.rb
+          brew style --fix homebrew-tap/Casks/crabmd.rb || true
+          # Retire the legacy formula: it shipped the same `crabmd` binary
+          # without the app bundle and conflicts with the cask. Remove ONLY
+          # Formula/crabmd.rb — never touch other formulae in the shared tap.
+          if [[ -f homebrew-tap/Formula/crabmd.rb ]]; then
+            echo "Removing retired Formula/crabmd.rb"
+            git -C homebrew-tap rm -f Formula/crabmd.rb
+          else
+            echo "No legacy Formula/crabmd.rb (already retired)"
+          fi
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/crabmd.rb
-          if git diff --cached --quiet; then
-            echo "cask already up to date"
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "tap already up to date"
             exit 0
           fi
-          git commit -m "crabmd ${{ needs.package.outputs.version }} cask"
-          git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"
-          git push
+          # `git rm` above already staged the deletion; include it in the
+          # same atomic commit as the cask update.
+          git add -A Casks/crabmd.rb Formula/crabmd.rb || true
+          if git diff --cached --quiet; then
+            echo "tap already up to date"
+            exit 0
+          fi
+          git commit -m "crabmd ${VERSION} cask (retire formula)"
+          # Race-safe push: serialize via the job concurrency group above,
+          # then rebase-retry in case the tap moved underneath us.
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          for attempt in 1 2 3 4 5; do
+            if git push origin "$BRANCH"; then
+              echo "tap push succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "tap push failed (attempt $attempt); rebasing and retrying"
+            git pull --rebase origin "$BRANCH" || sleep 5
+            sleep 2
+          done
+          echo "tap push failed after retries" >&2
+          exit 1
